@@ -15,6 +15,23 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+/* Portable git: `git -C "<dir>" <args>` with identity + non-interactive
+ * config injected via -c, so it needs no global config and no POSIX shell
+ * (runs under cmd.exe on Windows). Returns the git exit status. */
+static int wt_git(const char *dir, const char *args) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=t -c user.email=t@t.io "
+             "-c init.defaultBranch=master -c commit.gpgsign=false %s",
+             dir, args);
+    return system(cmd);
+}
+/* Build "<dir>/<rel>" into buf (forward slashes work on Windows + git). */
+static const char *wt_path(char *buf, size_t n, const char *dir, const char *rel) {
+    snprintf(buf, n, "%s/%s", dir, rel);
+    return buf;
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  ADAPTIVE INTERVAL
  * ══════════════════════════════════════════════════════════════════ */
@@ -235,16 +252,10 @@ TEST(watcher_detects_git_commit) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -257,12 +268,9 @@ TEST(watcher_detects_git_commit) {
     ASSERT_EQ(index_call_count, 0);
 
     /* Make a change: new commit */
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&echo 'world' >> file.txt && "
-             "git add file.txt && git commit -q -m 'add world'",
-             tmpdir);
-    system(cmd);
+    { char p[300]; th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "world\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m add-world");
 
     /* Touch to bypass interval, then poll */
     cbm_watcher_touch(w, "temp-repo");
@@ -288,16 +296,10 @@ TEST(watcher_detects_dirty_worktree) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -334,16 +336,10 @@ TEST(watcher_detects_new_file) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -381,16 +377,10 @@ TEST(watcher_no_change_no_reindex) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -425,24 +415,15 @@ TEST(watcher_multiple_projects) {
     if (!cbm_mkdtemp(tmpdirA) || !cbm_mkdtemp(tmpdirB))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'a' > a.txt && "
-             "git add a.txt && git commit -q -m 'init'",
-             tmpdirA);
-    if (system(cmd) != 0) {
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdirA, "init -q") != 0) { th_rmtree(tmpdirA); th_rmtree(tmpdirB); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdirA, "a.txt"), "a\n"); }
+    wt_git(tmpdirA, "add a.txt");
+    wt_git(tmpdirA, "commit -q -m init");
 
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'b' > b.txt && "
-             "git add b.txt && git commit -q -m 'init'",
-             tmpdirB);
-    if (system(cmd) != 0) {
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdirB, "init -q") != 0) { th_rmtree(tmpdirA); th_rmtree(tmpdirB); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdirB, "b.txt"), "b\n"); }
+    wt_git(tmpdirB, "add b.txt");
+    wt_git(tmpdirB, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -546,16 +527,10 @@ TEST(watcher_interval_blocks_repoll) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -622,16 +597,10 @@ TEST(watcher_git_removed_no_crash) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -669,16 +638,10 @@ TEST(watcher_continued_dirty) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -707,9 +670,8 @@ TEST(watcher_continued_dirty) {
     ASSERT_EQ(index_call_count, 2);
 
     /* Commit to clean up, then poll — should not trigger */
-    snprintf(cmd, sizeof(cmd), "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git add file.txt && git commit -q -m 'clean'", tmpdir);
-    system(cmd);
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m clean");
 
     /* HEAD changed → will trigger one more reindex */
     cbm_watcher_touch(w, "cont-repo");
@@ -740,16 +702,10 @@ TEST(watcher_baseline_dirty_repo) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
 
     /* Make dirty BEFORE baseline */
     {
@@ -786,16 +742,10 @@ TEST(watcher_unwatch_prunes_state) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -834,16 +784,10 @@ TEST(watcher_watch_after_unwatch) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -897,17 +841,11 @@ TEST(watcher_detects_file_delete) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "echo 'todelete' > todelete.go && "
-             "git add -A && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "todelete.go"), "todelete\n"); }
+    wt_git(tmpdir, "add -A");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -944,16 +882,10 @@ TEST(watcher_detects_subdir_file) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > main.go && "
-             "git add main.go && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "main.go"), "hello\n"); }
+    wt_git(tmpdir, "add main.go");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -1016,16 +948,10 @@ TEST(watcher_full_flow_new_file) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'package main' > main.go && "
-             "git add main.go && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "main.go"), "package main\n"); }
+    wt_git(tmpdir, "add main.go");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -1068,16 +994,10 @@ TEST(watcher_fallback_still_detects) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > main.go && "
-             "git add main.go && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "main.go"), "hello\n"); }
+    wt_git(tmpdir, "add main.go");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -1089,12 +1009,10 @@ TEST(watcher_fallback_still_detects) {
     ASSERT_EQ(index_call_count, 0);
 
     /* Remove .git and re-init (simulates strategy reset) */
-    snprintf(cmd, sizeof(cmd),
-             "rm -rf '%s/.git' && cd '%s' && git init -q && "
-             "git config user.email test@test && git config user.name test && "
-             "git add -A && git commit -q -m 'reinit'",
-             tmpdir, tmpdir);
-    system(cmd);
+    { char p[300]; th_rmtree(wt_path(p, sizeof(p), tmpdir, ".git")); }
+    wt_git(tmpdir, "init -q");
+    wt_git(tmpdir, "add -A");
+    wt_git(tmpdir, "commit -q -m reinit");
 
     /* Re-watch with fresh state */
     cbm_watcher_unwatch(w, "fb-repo");
@@ -1130,25 +1048,16 @@ TEST(watcher_poll_only_watched_projects) {
     if (!cbm_mkdtemp(tmpdirA) || !cbm_mkdtemp(tmpdirB))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
     /* Init both repos */
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'a' > a.txt && "
-             "git add a.txt && git commit -q -m 'init'",
-             tmpdirA);
-    if (system(cmd) != 0) {
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdirA, "init -q") != 0) { th_rmtree(tmpdirA); th_rmtree(tmpdirB); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdirA, "a.txt"), "a\n"); }
+    wt_git(tmpdirA, "add a.txt");
+    wt_git(tmpdirA, "commit -q -m init");
 
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'b' > b.txt && "
-             "git add b.txt && git commit -q -m 'init'",
-             tmpdirB);
-    if (system(cmd) != 0) {
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdirB, "init -q") != 0) { th_rmtree(tmpdirA); th_rmtree(tmpdirB); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdirB, "b.txt"), "b\n"); }
+    wt_git(tmpdirB, "add b.txt");
+    wt_git(tmpdirB, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -1195,16 +1104,10 @@ TEST(watcher_touch_resets_immediate) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -1247,16 +1150,10 @@ TEST(watcher_modify_tracked_file) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'package main' > main.go && "
-             "git add main.go && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "main.go"), "package main\n"); }
+    wt_git(tmpdir, "add main.go");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -1543,16 +1440,10 @@ TEST(watcher_callback_data_passed) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t "
-             "GIT_COMMITTER_EMAIL=t@t; cd '%s' &&git init -q &&echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        th_rmtree(tmpdir);
-        SKIP_PLATFORM("git not available (POSIX-shell git-setup unavailable here)");
-    }
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, capture_data_callback, &g_cbdata_value);
