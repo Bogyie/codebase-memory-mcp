@@ -215,8 +215,6 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
 
 static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     const char *bin = opts->bin;
-    const char *const default_argv[] = {bin, NULL};
-    const char *const *argv = opts->argv ? opts->argv : default_argv;
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -232,6 +230,8 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
          * threads plus mimalloc/sqlite/libgit2 global state), and a fork() copies
          * only the calling thread — a malloc between fork and exec could deadlock on
          * a lock another thread held at fork time. open/dup2/execv touch no heap. */
+        const char *const default_argv[] = {bin, NULL};
+        const char *const *argv = opts->argv ? opts->argv : default_argv;
         const char *target = opts->log_file ? opts->log_file : "/dev/null";
         int fd = open(target, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
