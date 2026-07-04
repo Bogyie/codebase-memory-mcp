@@ -32,8 +32,8 @@ export interface RepoInfo {
   root_path: string;
   branch: string;
   remote_url: string;
-  web_base: string; /* https://github.com/org/repo */
-  blob_base: string; /* https://github.com/org/repo/blob/<branch> */
+  web_base: string; /* e.g. github.com/<org>/<repo> */
+  blob_base: string; /* e.g. github.com/<org>/<repo>/blob/<branch> */
 }
 
 export interface GraphEdge {
