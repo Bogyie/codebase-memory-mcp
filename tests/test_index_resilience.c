@@ -651,10 +651,107 @@ TEST(index_not_indexed_by_design_reported) {
     PASS();
 }
 
+/* INV(relative-repo-path, #794): index_repository with repo_path "." must
+ * canonicalize to the absolute path BEFORE anything derives from it. On
+ * v0.8.1 the literal "." flowed through: the project was named "root", the
+ * projects table stored root_path="." verbatim, the post-dump integrity
+ * check flagged bad_root_path and AUTO-DELETED the whole DB — while the
+ * response still claimed status "indexed". The guard asserts the three
+ * things that failure mode breaks: a path-derived project name (not
+ * "root"), an absolute stored root_path, and a DB that persists and stays
+ * queryable after the run. */
+TEST(index_relative_repo_path_canonicalized) {
+    RProj lp;
+    memset(&lp, 0, sizeof(lp));
+    snprintf(lp.tmpdir, sizeof(lp.tmpdir), "/tmp/cbm_resil_XXXXXX");
+    if (!cbm_mkdtemp(lp.tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    rh_to_fwd_slashes(lp.tmpdir);
+    ri_write_text(lp.tmpdir, "good.py", "def alpha():\n    return 1\n");
+
+    /* Resolve the canonical form of tmpdir (macOS: /tmp -> /private/tmp) so
+     * the derived-name and stored-root assertions compare like with like. */
+    char canon[700];
+    if (!realpath(lp.tmpdir, canon)) {
+        snprintf(canon, sizeof(canon), "%s", lp.tmpdir);
+    }
+    lp.project = cbm_project_name_from_path(canon);
+    if (!lp.project) {
+        FAIL("project name derivation failed");
+    }
+
+    const char *home = getenv("HOME");
+    if (!home) {
+        home = "/tmp";
+    }
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+    cbm_mkdir(cache_dir);
+    snprintf(lp.dbpath, sizeof(lp.dbpath), "%s/%s.db", cache_dir, lp.project);
+    unlink(lp.dbpath);
+
+    lp.srv = cbm_mcp_server_new(NULL);
+    if (!lp.srv) {
+        FAIL("server alloc failed");
+    }
+
+    /* chdir into the repo and index "." — restore cwd immediately after. */
+    char oldcwd[700];
+    if (!getcwd(oldcwd, sizeof(oldcwd))) {
+        FAIL("getcwd failed");
+    }
+    if (chdir(lp.tmpdir) != 0) {
+        FAIL("chdir failed");
+    }
+    char *resp = cbm_mcp_handle_tool(lp.srv, "index_repository", "{\"repo_path\":\".\"}");
+    int rc_back = chdir(oldcwd);
+    if (rc_back != 0) {
+        free(resp);
+        FAIL("chdir back failed");
+    }
+    ASSERT_NOT_NULL(resp);
+
+    /* The response names the path-derived project, never the literal-dot
+     * artifact "root". */
+    ASSERT_NULL(strstr(resp, "\"project\":\"root\""));
+    ASSERT_NOT_NULL(strstr(resp, lp.project));
+    ASSERT_NOT_NULL(strstr(resp, "\"status\":\"indexed\""));
+    free(resp);
+
+    /* The DB survived the run (v0.8.1 auto-deleted it here)... */
+    cbm_store_t *store = cbm_store_open_path(lp.dbpath);
+    if (!store) {
+        FAIL("db missing after relative-path index (auto-clean regression)");
+    }
+
+    /* ...with an ABSOLUTE canonical root_path in the projects table... */
+    cbm_project_t info = {0};
+    ASSERT_EQ(cbm_store_get_project(store, lp.project, &info), CBM_STORE_OK);
+    ASSERT_NOT_NULL(info.root_path);
+    ASSERT_TRUE(info.root_path[0] == '/');
+    ASSERT_STR_EQ(info.root_path, canon);
+    free((char *)info.name);
+    free((char *)info.indexed_at);
+    free((char *)info.root_path);
+
+    /* ...and it stays queryable. */
+    cbm_node_t *hits = NULL;
+    int hit_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, lp.project, "alpha", &hits, &hit_count),
+              CBM_STORE_OK);
+    ASSERT_GTE(hit_count, 1);
+    cbm_store_free_nodes(hits, hit_count);
+
+    rh_cleanup(&lp, store);
+    PASS();
+}
+
 SUITE(index_resilience) {
     RUN_TEST(index_oversized_file_reported);
     RUN_TEST(index_clean_run_no_logfile);
     RUN_TEST(index_parse_partial_reported);
     RUN_TEST(index_parse_partial_clears_on_fix);
     RUN_TEST(index_not_indexed_by_design_reported);
+    RUN_TEST(index_relative_repo_path_canonicalized);
 }
