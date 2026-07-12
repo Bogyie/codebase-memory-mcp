@@ -1835,6 +1835,8 @@ TEST(tool_detect_changes_default) {
     ASSERT(resp_has_key(r, "changed_count"));
     ASSERT(resp_has_key(r, "impacted_symbols"));
     ASSERT(resp_has_key(r, "depth"));
+    ASSERT(resp_has_key(r, "global_memory_updated"));
+    ASSERT_NOT_NULL(strstr(r, "global_memory_updated"));
     free(r);
     PASS();
 }

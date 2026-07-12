@@ -158,39 +158,21 @@ static void *http_thread(void *arg) {
 
 /* ── Index callback for watcher ─────────────────────────────────── */
 
-/* Re-indexing means every symbolic CodeRef for the project must be reviewed.
- * Use a separate Global Memory handle because the watcher runs on its own
- * thread and memory handles are intentionally not thread-safe.  Failure is
- * non-fatal: repository indexing remains useful even when user-local memory is
- * unavailable, and memory_lint will surface unresolved references later. */
-static void watcher_mark_memory_dirty(const char *project_name) {
+/* Re-indexing may change symbolic CodeRef resolution. Use a separate Global
+ * Memory handle because the watcher runs on its own thread and memory handles
+ * are intentionally not thread-safe. Failure is non-fatal: repository
+ * indexing remains useful even when user-local memory is unavailable. */
+static void watcher_refresh_memory_code_refs(const char *project_name) {
     cbm_memory_t *memory = cbm_memory_open(NULL);
     if (!memory) {
         cbm_log_warn("memory.code_ref_dirty.err", "project", project_name);
         return;
     }
 
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
-    if (doc && root) {
-        yyjson_mut_doc_set_root(doc, root);
-        yyjson_mut_obj_add_str(doc, root, "project", project_name);
-        yyjson_mut_obj_add_str(doc, root, "reason", "watcher_reindex");
-        yyjson_mut_obj_add_bool(doc, root, "project_wide", true);
-        char *args = yyjson_mut_write(doc, 0, NULL);
-        if (args) {
-            char *result = cbm_memory_mark_code_changes_json(memory, args);
-            free(result);
-            free(args);
-        }
-    }
-    if (doc) {
-        yyjson_mut_doc_free(doc);
-    }
-
     /* Refresh symbolic resolution against the newly-written repository graph.
-     * A failed lookup marks review_required; code-store node IDs are never
-     * persisted in Global Memory. */
+     * Validation already performs a no-op when resolution is unchanged. Do
+     * not pre-mark every reference as changed: that would turn every watcher
+     * pass into a semantic epoch/revision change even for an identical graph. */
     if (cbm_validate_project_name(project_name)) {
         char db_path[CBM_SZ_2K];
         const char *cache = cbm_resolve_cache_dir();
@@ -252,7 +234,7 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
     cbm_pipeline_free(p);
     cbm_pipeline_unlock();
     if (rc == 0) {
-        watcher_mark_memory_dirty(project_name);
+        watcher_refresh_memory_code_refs(project_name);
     }
     return rc;
 }

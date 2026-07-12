@@ -563,7 +563,8 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
 
-    {"detect_changes", "Detect changes", "Detect code changes and their impact",
+    {"detect_changes", "Detect changes",
+     "Detect code changes and their impact without modifying Global Memory",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"scope\":{\"type\":"
      "\"string\"},\"depth\":{\"type\":\"integer\",\"default\":2},\"base_branch\":{\"type\":"
      "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
@@ -5274,8 +5275,8 @@ char *cbm_mcp_index_run_supervised_path(const char *root_path) {
 bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
 
 /* A successful explicit index has the same Global Memory semantics as a
- * watcher re-index: references remain symbolic, linked memory becomes review
- * required, and resolution is refreshed against the newly written code DB.
+ * watcher re-index: symbolic resolution is refreshed against the newly
+ * written code DB, and validation writes only when the result changed.
  * Failures are deliberately non-fatal to repository indexing. */
 static void memory_after_project_index(cbm_mcp_server_t *srv, const char *project) {
     if (!srv || !project || !cbm_validate_project_name(project)) {
@@ -5286,21 +5287,6 @@ static void memory_after_project_index(cbm_mcp_server_t *srv, const char *projec
         cbm_log_warn("memory.index_refresh.err", "project", project);
         return;
     }
-
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
-    if (doc && root) {
-        yyjson_mut_doc_set_root(doc, root);
-        yyjson_mut_obj_add_strcpy(doc, root, "project", project);
-        yyjson_mut_obj_add_str(doc, root, "reason", "index_repository");
-        char *args = yy_doc_to_str(doc);
-        if (args) {
-            char *marked = cbm_memory_mark_code_changes_json(memory, args);
-            free(marked);
-            free(args);
-        }
-    }
-    yyjson_mut_doc_free(doc);
 
     char path[CBM_SZ_2K];
     project_db_path(project, path, sizeof(path));
@@ -7143,9 +7129,6 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
     char line[CBM_SZ_1K];
     int file_count = 0;
-    char **changed_paths = NULL;
-    int changed_path_count = 0;
-    int changed_cap = 0;
 
     while (fgets(line, sizeof(line), fp)) {
         size_t len = strlen(line);
@@ -7177,21 +7160,6 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
         yyjson_mut_arr_add_strcpy(doc, changed, path_line);
         file_count++;
-        if (changed_path_count == changed_cap) {
-            int next_cap = changed_cap ? changed_cap * 2 : CBM_SZ_16;
-            char **next = realloc(changed_paths, (size_t)next_cap * sizeof(*next));
-            if (next) {
-                changed_paths = next;
-                changed_cap = next_cap;
-            }
-        }
-        if (changed_path_count < changed_cap) {
-            char *saved_path = heap_strdup(path_line);
-            if (saved_path) {
-                changed_paths[changed_path_count++] = saved_path;
-            }
-        }
-
         if (want_symbols) {
             detect_add_impacted_symbols(store, project, path_line, doc, impacted);
         }
@@ -7212,58 +7180,10 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_int(doc, root_obj, "changed_count", file_count);
     yyjson_mut_obj_add_val(doc, root_obj, "impacted_symbols", impacted);
     yyjson_mut_obj_add_int(doc, root_obj, "depth", depth);
-
-    /* A diff invalidates applicability assumptions; it does not automatically
-     * make a linked memory false. Persist review_required/dirty markers and
-     * expose the result alongside the ordinary impact response. */
-    if (file_count > 0 && changed_paths) {
-        yyjson_mut_doc *memory_doc = yyjson_mut_doc_new(NULL);
-        yyjson_mut_val *memory_root = memory_doc ? yyjson_mut_obj(memory_doc) : NULL;
-        if (memory_doc && memory_root) {
-            yyjson_mut_doc_set_root(memory_doc, memory_root);
-            yyjson_mut_obj_add_strcpy(memory_doc, memory_root, "project", project);
-            yyjson_mut_obj_add_str(memory_doc, memory_root, "reason", "detect_changes");
-            yyjson_mut_val *files = yyjson_mut_arr(memory_doc);
-            for (int i = 0; i < changed_path_count; i++) {
-                if (changed_paths[i]) {
-                    yyjson_mut_arr_add_strcpy(memory_doc, files, changed_paths[i]);
-                }
-            }
-            yyjson_mut_obj_add_val(memory_doc, memory_root, "files", files);
-            char *memory_args = yy_doc_to_str(memory_doc);
-            cbm_memory_t *memory = resolve_memory(srv);
-            char *memory_json = memory && memory_args
-                                    ? cbm_memory_mark_code_changes_json(memory, memory_args)
-                                    : NULL;
-            if (memory_json) {
-                yyjson_doc *result_doc = yyjson_read(memory_json, strlen(memory_json), 0);
-                if (result_doc && yyjson_is_obj(yyjson_doc_get_root(result_doc))) {
-                    yyjson_mut_val *copy =
-                        yyjson_val_mut_copy(doc, yyjson_doc_get_root(result_doc));
-                    yyjson_mut_obj_add_val(doc, root_obj, "global_memory", copy);
-                } else {
-                    yyjson_mut_obj_add_str(doc, root_obj, "memory_warning",
-                                           "Global Memory dirty result was invalid");
-                }
-                if (result_doc) {
-                    yyjson_doc_free(result_doc);
-                }
-            } else {
-                yyjson_mut_obj_add_str(doc, root_obj, "memory_warning",
-                                       "Global Memory was unavailable; code impact is unchanged");
-            }
-            free(memory_json);
-            free(memory_args);
-        }
-        if (memory_doc) {
-            yyjson_mut_doc_free(memory_doc);
-        }
-    }
-
-    for (int i = 0; i < changed_path_count; i++) {
-        free(changed_paths[i]);
-    }
-    free(changed_paths);
+    /* This tool is intentionally observational. CodeRef maintenance happens
+     * only after a successfully published repository index, where validation
+     * can compare against a complete graph snapshot. */
+    yyjson_mut_obj_add_bool(doc, root_obj, "global_memory_updated", false);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
