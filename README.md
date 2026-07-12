@@ -505,6 +505,10 @@ graph directly; unchanged resolution is a no-op and does not create a Memory epo
 Project graph readers switch generations only after hashes, coverage, and FTS have been published,
 and `index_status` exposes `snapshot_complete` plus the opaque `index_generation`.
 
+Projection rebuild timing is exposed through `memory_status`. The opt-in scaling gate and the
+current decision thresholds are documented in
+[Global Memory Performance](docs/GLOBAL_MEMORY_PERFORMANCE.md).
+
 | Tool | Description |
 |------|-------------|
 | `memory_ingest` | Deduplicate and retain an immutable raw source with provenance. |

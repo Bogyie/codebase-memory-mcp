@@ -110,6 +110,8 @@ export const messages = {
       memoryReview: "Open review",
       memoryRefs: "Unresolved refs",
       memoryProjection: "Projection",
+      memoryProjectionDetail: (strategy: string, ms: number, documents: number) =>
+        `${strategy} · last rebuild ${ms} ms · ${documents.toLocaleString()} documents`,
     },
     index: {
       newIndex: "New Index",
@@ -253,6 +255,8 @@ export const messages = {
       memoryReview: "待审查",
       memoryRefs: "未解析引用",
       memoryProjection: "投影视图",
+      memoryProjectionDetail: (strategy: string, ms: number, documents: number) =>
+        `${strategy} · 最近重建 ${ms} 毫秒 · ${documents.toLocaleString()} 个文档`,
     },
     index: {
       newIndex: "新建索引",

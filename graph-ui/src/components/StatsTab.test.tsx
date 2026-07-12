@@ -77,7 +77,7 @@ describe("StatsTab index modal", () => {
         snapshot_epoch: 7,
         entities: { total: 5 },
         maintenance: { open_dirty: 2, unresolved_code_refs: 1 },
-        projection: { strategy: "full_rebuild", documents: 4, nodes: 8, edges: 3 },
+        projection: { strategy: "full_rebuild", documents: 4, nodes: 8, edges: 3, runs_in_process: 1, last_rebuild_ms: 12, last_rebuild_documents: 4 },
       };
       return new Response(JSON.stringify({ result: { content: [{ text: JSON.stringify(payload) }] } }), {
         status: 200,
@@ -93,6 +93,7 @@ describe("StatsTab index modal", () => {
     expect(screen.getByText("7")).toBeInTheDocument();
     expect(screen.getByText("5")).toBeInTheDocument();
     expect(screen.getByText("2")).toBeInTheDocument();
+    expect(screen.getByText("full_rebuild · last rebuild 12 ms · 4 documents")).toBeInTheDocument();
   });
 
   it("submits a custom path and project name", async () => {

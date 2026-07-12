@@ -175,6 +175,10 @@ materialization, and conflicting proposals.
 Frequently reused or high-impact memory receives higher audit priority, never higher truth
 weight.
 
+Projection performance is measured rather than assumed. See
+[Global Memory Performance](GLOBAL_MEMORY_PERFORMANCE.md) for the opt-in scaling probe, current
+baseline, and the thresholds that would trigger an incremental-projection redesign.
+
 ## Sharing scope (Phase 5)
 
 Phase 5 implements only:

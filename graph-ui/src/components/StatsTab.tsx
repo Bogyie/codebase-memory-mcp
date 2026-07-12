@@ -13,7 +13,15 @@ interface MemoryStatus {
   snapshot_epoch: number;
   entities: { total: number };
   maintenance: { open_dirty: number; unresolved_code_refs: number };
-  projection: { strategy: string; documents: number; nodes: number; edges: number };
+  projection: {
+    strategy: string;
+    documents: number;
+    nodes: number;
+    edges: number;
+    runs_in_process: number;
+    last_rebuild_ms: number;
+    last_rebuild_documents: number;
+  };
 }
 
 /* ── Glowy health dot ───────────────────────────────────── */
@@ -557,7 +565,8 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
             </button>
           </div>
           {memoryStatus && (
-            <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+            <>
+              <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
               {[
                 [t.projects.memoryEpoch, memoryStatus.snapshot_epoch],
                 [t.projects.memoryEntities, memoryStatus.entities.total],
@@ -570,7 +579,15 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
                   <p className="mt-0.5 text-[14px] font-semibold tabular-nums text-foreground/65">{Number(value).toLocaleString()}</p>
                 </div>
               ))}
-            </div>
+              </div>
+              <p className="mt-2 text-[10px] text-foreground/25">
+                {t.projects.memoryProjectionDetail(
+                  memoryStatus.projection.strategy,
+                  memoryStatus.projection.last_rebuild_ms,
+                  memoryStatus.projection.last_rebuild_documents,
+                )}
+              </p>
+            </>
           )}
         </div>
         {projects.length > 0 && (
