@@ -319,6 +319,34 @@ import sys,re
 t=sys.stdin.read().replace("\\","").replace("\"","")
 m=re.findall(r"nodes\s*[:=]\s*(\d+)", t)
 print(max((int(x) for x in m), default=0))' 2>/dev/null)"
+    # The indexer canonicalizes the repository root before deriving its project
+    # name.  On macOS, for example, /var is resolved to /private/var, so deriving
+    # the name from the caller-visible path can address a different project.
+    # Prefer the authoritative name returned by index_repository and retain the
+    # path-derived fallback for compatibility with older binaries.
+    local indexed_project
+    indexed_project="$(printf '%s' "$CLI_OUT" | "$PY" -c '
+import json,sys
+for line in sys.stdin:
+    try:
+        doc=json.loads(line)
+    except Exception:
+        continue
+    project=(doc.get("structuredContent") or {}).get("project")
+    if not project:
+        for item in doc.get("content") or []:
+            if item.get("type") != "text":
+                continue
+            try:
+                project=json.loads(item.get("text") or "{}").get("project")
+            except Exception:
+                pass
+            if project:
+                break
+    if project:
+        print(project)
+        break' 2>/dev/null)"
+    [ -z "$indexed_project" ] || PROJ_NAME="$indexed_project"
     if [ "${nodes:-0}" -gt 0 ] 2>/dev/null; then
         pass "index-cli (nodes=$nodes, rc=$CLI_RC)"
     else
@@ -500,9 +528,9 @@ inv_mcp_initialize() {
 }
 
 # ── Invariant 4: tools/list returns all expected tools ─────────────────────
-# Cross-check against the canonical 14-tool list (TOOLS[] in src/mcp/mcp.c).
-EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_graph_schema get_architecture search_code list_projects delete_project index_status detect_changes manage_adr ingest_traces"
-EXPECTED_TOOL_COUNT=14
+# Cross-check against the canonical tool list (TOOLS[] in src/mcp/mcp.c).
+EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_graph_schema get_architecture get_design_context search_code list_projects delete_project index_status detect_changes manage_adr ingest_traces memory_ingest memory_query memory_status memory_propose memory_commit memory_lint memory_export memory_import memory_sync"
+EXPECTED_TOOL_COUNT=24
 inv_tools_list() {
     if ! mcp_alive; then
         fail "tools-list" "server not alive"
@@ -605,7 +633,7 @@ inv_every_tool() {
         return
     fi
 
-    # name|minimal-args (JSON object) for the remaining 13 tools.
+    # name|minimal-args (JSON object) for the remaining tools.
     # Args chosen to be minimally valid per TOOLS[] required fields.
     local p="$PROJ_NAME"
     local -a CALLS
@@ -616,12 +644,22 @@ inv_every_tool() {
         "get_code_snippet|{\"project\":\"$p\",\"qualified_name\":\"compute\"}"
         "get_graph_schema|{\"project\":\"$p\"}"
         "get_architecture|{\"project\":\"$p\"}"
+        "get_design_context|{\"project\":\"$p\",\"limit\":1}"
         "search_code|{\"project\":\"$p\",\"pattern\":\"def \"}"
         "list_projects|{}"
         "index_status|{\"project\":\"$p\"}"
         "detect_changes|{\"project\":\"$p\"}"
         "manage_adr|{\"project\":\"$p\",\"mode\":\"get\"}"
         "ingest_traces|{\"project\":\"$p\",\"traces\":[]}"
+        "memory_ingest|{}"
+        "memory_query|{\"query\":\"__cbm_smoke__\",\"limit\":1}"
+        "memory_status|{}"
+        "memory_propose|{\"operations\":[]}"
+        "memory_commit|{\"proposal_id\":\"__cbm_smoke__\",\"operation_id\":\"__cbm_smoke__\",\"user_approved\":false}"
+        "memory_lint|{\"limit\":1}"
+        "memory_export|{\"path\":\"$SCRATCH/forbidden-export\"}"
+        "memory_import|{\"path\":\"$SCRATCH/nonexistent-import\"}"
+        "memory_sync|{\"action\":\"status\"}"
         "delete_project|{\"project\":\"__cbm_smoke_nonexistent__\"}"
     )
 
