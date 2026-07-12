@@ -3163,6 +3163,74 @@ TEST(complexity_go_method_receiver_self_recursion) {
     PASS();
 }
 
+/* #876: the delegation/store bucket left open after #599 — same-named calls
+ * whose receiver is a CALL RESULT (_get_store().get), a module singleton
+ * (_default.check), or a local cursor inside a loop (cur.execute) are not
+ * self-recursion. All three are the reporter's exact v0.8.1 false positives;
+ * fixed by the receiver-aware narrowing (87091ed), guarded here so the
+ * bucket never regresses. */
+TEST(complexity_delegation_receivers_not_recursive_issue876) {
+    /* Store wrapper: _get_store().get() inside get — receiver is the call
+     * result, a different object. */
+    CBMFileResult *r = extract("def _get_store():\n"
+                               "    return object()\n"
+                               "\n"
+                               "def get(collection, record_id):\n"
+                               "    rec = _get_store().get(collection, record_id)\n"
+                               "    return rec\n",
+                               CBM_LANG_PYTHON, "t", "soil.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "get");
+    ASSERT_NOT_NULL(d);
+    ASSERT_FALSE(d->is_recursive); /* _get_store() result is not this fn */
+    ASSERT_FALSE(d->unguarded_recursion);
+    cbm_free_result(r);
+
+    /* Module-singleton delegation: _default.check() inside check. */
+    r = extract("class _Checker:\n"
+                "    def check(self, app_id, tool_name):\n"
+                "        return (True, \"ok\")\n"
+                "\n"
+                "_default = _Checker()\n"
+                "\n"
+                "def check(app_id, tool_name):\n"
+                "    return _default.check(app_id, tool_name)\n",
+                CBM_LANG_PYTHON, "t", "gleipnir.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* The module-level wrapper (not the method) must stay clean. */
+    d = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, "check") == 0 &&
+            strcmp(r->defs.items[i].label, "Function") == 0) {
+            d = &r->defs.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(d);
+    ASSERT_FALSE(d->is_recursive); /* _default is not this fn */
+    ASSERT_FALSE(d->unguarded_recursion);
+    cbm_free_result(r);
+
+    /* Same-named method on a local, called inside a loop (willow.nuke case):
+     * neither recursive nor recursion_in_loop. */
+    r = extract("def execute(conn, paths):\n"
+                "    for p in paths:\n"
+                "        cur = conn.cursor()\n"
+                "        cur.execute(\"DELETE FROM t WHERE p = %s\", (p,))\n"
+                "    return True\n",
+                CBM_LANG_PYTHON, "t", "nuke.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    d = find_def(r, "execute");
+    ASSERT_NOT_NULL(d);
+    ASSERT_FALSE(d->is_recursive); /* cur is not this fn */
+    ASSERT_FALSE(d->unguarded_recursion);
+    ASSERT_FALSE(d->recursion_in_loop);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Deep chained member access + parameter count structure smells. */
 TEST(complexity_access_depth_and_params) {
     CBMFileResult *r = extract("package p\n"
@@ -3365,6 +3433,64 @@ TEST(extract_js_member_call_flags_is_method) {
     }
     ASSERT_TRUE(member >= 1); /* o.commit() flagged */
     ASSERT_TRUE(bare >= 1);   /* helper() not flagged */
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #961: a C function whose body braces are split across #ifdef/#else
+ * branches (one open brace per branch, a single shared close) parses with
+ * an ERROR region on the raw source — both branches are present at once —
+ * and the defs walk silently dropped the function while its callers stayed
+ * (cbm_path_within_root, handle_process_kill). The preprocessed second
+ * pass (simplecpp picks one branch, same-file token lines stay aligned)
+ * must recover the definition with its original line. */
+TEST(extract_c_ifdef_split_brace_fn_recovered_issue961) {
+    CBMFileResult *r = extract("static int a(void) { return 1; }\n"
+                               "static int b(void) { return 2; }\n"
+                               "int split_brace_fn(int x) {\n"
+                               "#ifdef _WIN32\n"
+                               "    if (a() && b()) {\n"
+                               "#else\n"
+                               "    if (a() || b()) {\n"
+                               "#endif\n"
+                               "        x += 1;\n"
+                               "    }\n"
+                               "    return x;\n"
+                               "}\n"
+                               "int after_fn(int x) { return x; }\n",
+                               CBM_LANG_C, "t", "split.c");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = find_def(r, "split_brace_fn");
+    if (!d) {
+        fprintf(stderr, "  [961] FAIL split_brace_fn dropped (defs walk lost the "
+                        "#ifdef-split function)\n");
+    }
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ((int)d->start_line, 3);
+    /* Error recovery must stay localized: neighbours extract either way. */
+    ASSERT_NOT_NULL(find_def(r, "a"));
+    ASSERT_NOT_NULL(find_def(r, "after_fn"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #961 inverse guard: a clean C file must not gain duplicate or phantom
+ * defs from the recovery path (it only engages on raw-parse ERROR regions). */
+TEST(extract_c_clean_file_no_recovery_duplicates_issue961) {
+    CBMFileResult *r = extract("#ifdef _WIN32\n"
+                               "static int w(void) { return 1; }\n"
+                               "#else\n"
+                               "static int u(void) { return 2; }\n"
+                               "#endif\n"
+                               "int use(int x) { return x; }\n",
+                               CBM_LANG_C, "t", "clean.c");
+    ASSERT_NOT_NULL(r);
+    int use_count = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, "use") == 0)
+            use_count++;
+    }
+    ASSERT_EQ(use_count, 1);
     cbm_free_result(r);
     PASS();
 }
@@ -3785,7 +3911,10 @@ SUITE(extraction) {
     RUN_TEST(complexity_self_receiver_still_recursive);
     RUN_TEST(complexity_chained_receiver_not_self);
     RUN_TEST(complexity_go_method_receiver_self_recursion);
+    RUN_TEST(complexity_delegation_receivers_not_recursive_issue876);
     RUN_TEST(complexity_access_depth_and_params);
+    RUN_TEST(extract_c_ifdef_split_brace_fn_recovered_issue961);
+    RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
 
