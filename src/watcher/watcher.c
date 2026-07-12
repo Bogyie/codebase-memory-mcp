@@ -24,8 +24,11 @@
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
+#include "foundation/subprocess.h"
+#include "git/git_context.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,9 +41,9 @@
 typedef struct {
     char *project_name;
     char *root_path;
-    char last_head[CBM_SZ_64]; /* git HEAD hash */
-    bool is_git;               /* false → skip polling */
-    bool baseline_done;        /* true after first poll */
+    char last_head[CBM_SHA256_HEX_LEN + 1]; /* git HEAD hash (SHA-1 or SHA-256) */
+    bool is_git;                            /* false → skip polling */
+    bool baseline_done;                     /* true after first poll */
     int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
     uint64_t first_missing_ms; /* cbm_now_ms() of the streak's first miss (0 = no streak) */
     int file_count;            /* approximate, for interval calc */
@@ -96,142 +99,176 @@ static int64_t now_ns(void) {
 /* ── Adaptive interval ──────────────────────────────────────────── */
 
 int cbm_watcher_poll_interval_ms(int file_count) {
-    int ms = POLL_BASE_MS + ((file_count / POLL_FILE_STEP) * CBM_MSEC_PER_SEC);
-    if (ms > POLL_MAX_MS) {
-        ms = POLL_MAX_MS;
+    if (file_count <= 0) {
+        return POLL_BASE_MS;
     }
-    return ms;
+    int64_t ms =
+        (int64_t)POLL_BASE_MS + (((int64_t)file_count / POLL_FILE_STEP) * CBM_MSEC_PER_SEC);
+    return ms > POLL_MAX_MS ? POLL_MAX_MS : (int)ms;
 }
 
 /* ── Git helpers ────────────────────────────────────────────────── */
 
-/* Portable command pieces: cbm_popen runs through cmd.exe on Windows, which does
- * NOT strip single quotes (git would receive a literal-quoted path → "cannot find
- * the path") and has no /dev/null. Use double quotes (stripped by both cmd.exe and
- * POSIX sh) and the platform null device. */
-#if defined(_WIN32)
-#define WATCHER_NULDEV "NUL"
-#else
-#define WATCHER_NULDEV "/dev/null"
-#endif
+/* Every watcher git command is an argv-based child of a resolved absolute git
+ * executable. Repository paths therefore never pass through a command shell.
+ * The byte ceilings also keep a hostile/corrupt repository from forcing an
+ * unbounded capture allocation. */
+#define WATCHER_GIT_TIMEOUT_MS 30000
+#define WATCHER_GIT_META_MAX_BYTES (16U * 1024U)
+#define WATCHER_GIT_STATUS_MAX_BYTES (16U * 1024U * 1024U)
+#define WATCHER_GIT_FILES_MAX_BYTES (64U * 1024U * 1024U)
+#define WATCHER_GIT_MAX_ARGS 16
 
-static bool is_git_repo(const char *root_path) {
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse --git-dir 2>%s", root_path, WATCHER_NULDEV);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return false;
-    }
-    /* Drain output so pclose gets a clean exit status. */
-    char drain[CBM_SZ_128];
-    while (fgets(drain, (int)sizeof(drain), fp)) { /* discard */
-    }
-    int rc = cbm_pclose(fp);
-    return rc == 0;
-}
+typedef enum {
+    GIT_PROBE_ERROR = -1,
+    GIT_PROBE_NO = 0,
+    GIT_PROBE_YES = 1,
+} git_probe_t;
 
-static int git_head(const char *root_path, char *out, size_t out_size) {
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD 2>%s", root_path, WATCHER_NULDEV);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
+static int git_capture(const char *root_path, const char *const *args, size_t max_output_bytes,
+                       char **out_data, size_t *out_len, cbm_proc_result_t *out_process) {
+    if (out_data) {
+        *out_data = NULL;
+    }
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (out_process) {
+        out_process->outcome = CBM_PROC_SPAWN_FAILED;
+        out_process->exit_code = -1;
+        out_process->term_signal = 0;
+    }
+    if (!root_path || !args || !out_data || !out_len || !out_process || max_output_bytes == 0) {
         return CBM_NOT_FOUND;
     }
 
-    if (fgets(out, (int)out_size, fp)) {
-        size_t len = strlen(out);
-        while (len > 0 && (out[len - SKIP_ONE] == '\n' || out[len - SKIP_ONE] == '\r')) {
-            out[--len] = '\0';
-        }
-        cbm_pclose(fp);
-        return 0;
+    char git_binary[CBM_SZ_4K];
+    if (!cbm_git_resolve_binary(git_binary, sizeof(git_binary))) {
+        return CBM_NOT_FOUND;
     }
-    cbm_pclose(fp);
-    return CBM_NOT_FOUND;
+
+    const char *argv[WATCHER_GIT_MAX_ARGS];
+    size_t argc = 0;
+    argv[argc++] = git_binary;
+    argv[argc++] = "--no-optional-locks";
+    argv[argc++] = "-C";
+    argv[argc++] = root_path;
+    for (size_t i = 0; args[i]; i++) {
+        if (argc + 1U >= WATCHER_GIT_MAX_ARGS) {
+            return CBM_NOT_FOUND;
+        }
+        argv[argc++] = args[i];
+    }
+    argv[argc] = NULL;
+
+    cbm_proc_opts_t opts = {
+        .bin = git_binary,
+        .argv = argv,
+        .quiet_timeout_ms = WATCHER_GIT_TIMEOUT_MS,
+        .discard_stderr = true,
+    };
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    return cbm_subprocess_capture(&opts, max_output_bytes, out_data, out_len, digest, out_process);
 }
 
-/* Returns true if working tree has changes (modified, untracked, etc.).
- * Also checks submodules via `git submodule foreach` to detect uncommitted
- * changes inside submodules that `git status` alone would not report. */
+static git_probe_t is_git_repo(const char *root_path) {
+    const char *args[] = {"rev-parse", "--git-dir", NULL};
+    char *data = NULL;
+    size_t len = 0;
+    cbm_proc_result_t process;
+    int rc = git_capture(root_path, args, WATCHER_GIT_META_MAX_BYTES, &data, &len, &process);
+    if (rc == 0) {
+        bool valid = len > 0 && memchr(data, '\0', len) == NULL;
+        free(data);
+        return valid ? GIT_PROBE_YES : GIT_PROBE_ERROR;
+    }
+    free(data);
+    /* rev-parse uses a normal nonzero exit for a directory that simply is not
+     * a repository. Spawn, timeout, output-limit, and capture failures are
+     * transient/uncertain and must be retried rather than cached as non-git. */
+    return process.outcome == CBM_PROC_EXIT_NONZERO ? GIT_PROBE_NO : GIT_PROBE_ERROR;
+}
+
+static bool git_object_id(const char *data, size_t len) {
+    if (!data || (len != 40U && len != CBM_SHA256_HEX_LEN)) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        char ch = data[i];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int git_head(const char *root_path, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return CBM_NOT_FOUND;
+    }
+    out[0] = '\0';
+    const char *args[] = {"rev-parse", "--verify", "HEAD", NULL};
+    char *data = NULL;
+    size_t len = 0;
+    cbm_proc_result_t process;
+    if (git_capture(root_path, args, WATCHER_GIT_META_MAX_BYTES, &data, &len, &process) != 0) {
+        free(data);
+        return CBM_NOT_FOUND;
+    }
+    while (len > 0 && (data[len - 1U] == '\n' || data[len - 1U] == '\r')) {
+        len--;
+    }
+    if (!git_object_id(data, len) || len + 1U > out_size) {
+        free(data);
+        return CBM_NOT_FOUND;
+    }
+    memcpy(out, data, len);
+    out[len] = '\0';
+    free(data);
+    return 0;
+}
+
+/* Porcelain v1 -z is locale-independent and unambiguous for every valid path.
+ * --ignore-submodules=none makes the superproject record modified/untracked
+ * submodule work trees, so no `submodule foreach` shell is needed. Any command,
+ * capture, timeout, or output-limit failure is treated as dirty: uncertainty
+ * must schedule a conservative reindex rather than silently miss a change. */
 static bool git_is_dirty(const char *root_path) {
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd),
-             "git --no-optional-locks -C \"%s\" status --porcelain "
-             "--untracked-files=normal 2>%s",
-             root_path, WATCHER_NULDEV);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return false;
-    }
-
-    char line[CBM_SZ_256];
-    bool dirty = false;
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len > 0) {
-            dirty = true;
-        }
-    }
-    cbm_pclose(fp);
-
-    if (dirty) {
-        return true;
-    }
-
-#if !defined(_WIN32)
-    /* Check submodules: uncommitted changes inside a submodule are invisible
-     * to the parent's git status. Use `git submodule foreach` as a portable
-     * fallback (Apple Git lacks --recurse-submodules). POSIX-only: foreach takes
-     * an inner shell command that cmd.exe cannot pass intact; the parent-repo
-     * status check above already covers the common (non-submodule) case. */
-    snprintf(cmd, sizeof(cmd),
-             "git --no-optional-locks -C '%s' submodule foreach --quiet --recursive "
-             "'git status --porcelain --untracked-files=normal 2>/dev/null' "
-             "2>/dev/null",
-             root_path);
-    fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return false;
-    }
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len > 0) {
-            dirty = true;
-        }
-    }
-    cbm_pclose(fp);
-#endif
+    const char *args[] = {
+        "status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignore-submodules=none",
+        NULL};
+    char *data = NULL;
+    size_t len = 0;
+    cbm_proc_result_t process;
+    int rc = git_capture(root_path, args, WATCHER_GIT_STATUS_MAX_BYTES, &data, &len, &process);
+    bool dirty = rc != 0 || len > 0;
+    free(data);
     return dirty;
 }
 
-/* Count tracked files via git ls-files */
+/* Count the NUL terminators emitted by `git ls-files -z`, not newlines in path
+ * data. If the bounded 64 MiB capture overflows (or otherwise fails), use
+ * INT_MAX: the only consumer is adaptive scheduling, and capping the interval
+ * at 60 seconds is safer than misclassifying a huge repository as empty. */
 static int git_file_count(const char *root_path) {
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" ls-files 2>%s", root_path, WATCHER_NULDEV);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return 0;
+    const char *args[] = {"ls-files", "-z", NULL};
+    char *data = NULL;
+    size_t len = 0;
+    cbm_proc_result_t process;
+    if (git_capture(root_path, args, WATCHER_GIT_FILES_MAX_BYTES, &data, &len, &process) != 0) {
+        free(data);
+        return INT_MAX;
     }
-
-    /* Count newlines (one tracked file per line). `wc -l` is unavailable on
-     * Windows, so count in C, robust to paths longer than the read buffer. */
     int count = 0;
-    char buf[CBM_SZ_1K];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        for (size_t i = 0; i < n; i++) {
-            if (buf[i] == '\n') {
-                count++;
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] == '\0') {
+            if (count == INT_MAX) {
+                break;
             }
+            count++;
         }
     }
-    cbm_pclose(fp);
+    free(data);
     return count;
 }
 
@@ -412,13 +449,6 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         return;
     }
 
-    /* Reject paths with shell metacharacters — all git helpers use popen/system */
-    if (!cbm_validate_shell_arg(root_path)) {
-        cbm_log_warn("watcher.watch.reject", "project", project_name, "reason",
-                     "path contains shell metacharacters");
-        return;
-    }
-
     /* Remove old entry first (key points to state's project_name) */
     cbm_mutex_lock(&w->projects_lock);
     project_state_t *old = cbm_ht_get(w->projects, project_name);
@@ -492,7 +522,14 @@ static void init_baseline(project_state_t *s) {
         return;
     }
 
-    s->is_git = is_git_repo(s->root_path);
+    git_probe_t probe = is_git_repo(s->root_path);
+    if (probe == GIT_PROBE_ERROR) {
+        /* Do not permanently downgrade a repository because git was briefly
+         * unavailable, timed out, or produced an invalid/oversized response. */
+        cbm_log_warn("watcher.git_probe_error", "project", s->project_name, "path", s->root_path);
+        return;
+    }
+    s->is_git = probe == GIT_PROBE_YES;
     s->baseline_done = true;
 
     if (s->is_git) {
