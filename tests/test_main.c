@@ -167,6 +167,7 @@ extern void suite_store_search(void);
 extern void suite_cypher(void);
 extern void suite_memory(void);
 extern void suite_memory_share(void);
+extern void suite_design(void);
 extern void suite_mcp(void);
 extern void suite_language(void);
 extern void suite_userconfig(void);
@@ -322,6 +323,9 @@ int main(int argc, char **argv) {
     /* User-global knowledge memory */
     RUN_SELECTED_SUITE(memory);
     RUN_SELECTED_SUITE(memory_share);
+
+    /* Repository-local Design Context */
+    RUN_SELECTED_SUITE(design);
 
     /* MCP Server (M9) */
     RUN_SELECTED_SUITE(mcp);

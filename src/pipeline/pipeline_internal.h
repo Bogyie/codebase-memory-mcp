@@ -576,6 +576,7 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
 /* Pre-dump pass: SEMANTICALLY_RELATED edges via algorithmic embeddings.
  * Opt-in: only runs when CBM_SEMANTIC_ENABLED=1. */
 int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
+int cbm_pipeline_pass_design(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 
 /* Pre-dump pass: interprocedural complexity propagation (Tier B).
  * Propagates per-function loop_depth along CALLS edges into a transitive
