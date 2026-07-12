@@ -566,6 +566,19 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
                     <div className="min-w-0">
                       <h3 className="text-[14px] font-semibold text-foreground/90 mb-0.5">{p.project.name}</h3>
                       <p className="text-[11px] text-foreground/20 font-mono truncate">{p.project.root_path}</p>
+                      {p.status && (
+                        <div className="mt-2 flex items-center gap-2 text-[10px]">
+                          <span className={`inline-flex items-center gap-1 rounded-md px-1.5 py-[2px] ${p.status.snapshot_complete ? "bg-emerald-500/10 text-emerald-400/80" : "bg-amber-500/10 text-amber-300/80"}`}>
+                            <span className={`h-1 w-1 rounded-full ${p.status.snapshot_complete ? "bg-emerald-400" : "bg-amber-300"}`} />
+                            {p.status.snapshot_complete ? t.projects.snapshotReady : t.projects.snapshotLegacy}
+                          </span>
+                          {p.status.index_generation && (
+                            <span className="font-mono text-foreground/25" title={p.status.index_generation}>
+                              {t.projects.generation} {p.status.index_generation.slice(0, 8)}
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0">

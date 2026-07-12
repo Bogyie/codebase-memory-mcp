@@ -5,6 +5,18 @@ import type { Project, SchemaInfo } from "../lib/types";
 interface ProjectInfo {
   project: Project;
   schema: SchemaInfo | null;
+  status: IndexStatus | null;
+}
+
+export interface IndexStatus {
+  project: string;
+  status: "ready" | "empty" | "no_project";
+  nodes: number;
+  edges: number;
+  root_path?: string;
+  indexed_at?: string;
+  snapshot_complete: boolean;
+  index_generation: string;
 }
 
 interface UseProjectsResult {
@@ -29,14 +41,11 @@ export function useProjects(): UseProjectsResult {
       /* Fetch schema for each project */
       const infos: ProjectInfo[] = await Promise.all(
         list.map(async (p) => {
-          try {
-            const schema = await callTool<SchemaInfo>("get_graph_schema", {
-              project: p.name,
-            });
-            return { project: p, schema };
-          } catch {
-            return { project: p, schema: null };
-          }
+          const [schema, status] = await Promise.all([
+            callTool<SchemaInfo>("get_graph_schema", { project: p.name }).catch(() => null),
+            callTool<IndexStatus>("index_status", { project: p.name }).catch(() => null),
+          ]);
+          return { project: p, schema, status };
         }),
       );
 

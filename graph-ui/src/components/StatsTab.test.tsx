@@ -47,6 +47,27 @@ describe("StatsTab index modal", () => {
     vi.unstubAllGlobals();
   });
 
+  it("shows the published snapshot generation for an indexed project", async () => {
+    mockProjectsFetch((url, init) => {
+      if (url !== "/rpc") return undefined;
+      const request = JSON.parse(String(init?.body));
+      const tool = request.params?.name;
+      const payload = tool === "list_projects"
+        ? { projects: [{ name: "sample", root_path: "/work/sample", indexed_at: "2026-07-12" }] }
+        : tool === "get_graph_schema"
+          ? { node_labels: [{ label: "Function", count: 3 }], edge_types: [], total_nodes: 3, total_edges: 0 }
+          : { project: "sample", status: "ready", nodes: 3, edges: 0, snapshot_complete: true, index_generation: "0123456789abcdef0123456789abcdef" };
+      return new Response(JSON.stringify({ result: { content: [{ text: JSON.stringify(payload) }] } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    render(<StatsTab onSelectProject={() => {}} />);
+    expect(await screen.findByText("Published snapshot")).toBeInTheDocument();
+    expect(screen.getByText("Generation 01234567")).toBeInTheDocument();
+  });
+
   it("submits a custom path and project name", async () => {
     let submitted: unknown = null;
     mockProjectsFetch((url, init) => {

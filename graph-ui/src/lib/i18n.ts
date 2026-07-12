@@ -99,6 +99,9 @@ export const messages = {
       healthChecking: "Checking...",
       indexingInProgress: "Indexing in progress",
       indexingFailed: "Indexing failed",
+      snapshotReady: "Published snapshot",
+      snapshotLegacy: "Legacy snapshot",
+      generation: "Generation",
     },
     index: {
       newIndex: "New Index",
@@ -231,6 +234,9 @@ export const messages = {
       healthChecking: "检查中...",
       indexingInProgress: "正在索引",
       indexingFailed: "索引失败",
+      snapshotReady: "已发布快照",
+      snapshotLegacy: "旧版快照",
+      generation: "代次",
     },
     index: {
       newIndex: "新建索引",
