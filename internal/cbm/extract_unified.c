@@ -600,6 +600,38 @@ static void handle_string_refs(CBMExtractCtx *ctx, TSNode node, const WalkState 
 /* Recursively walk YAML block_mapping_pair nodes, building dotted key paths.
  * Emits string_refs with key_path for leaf values that are URLs or config values.
  * Example: body.operational_info.post_url → "https://..." */
+const char *cbm_yaml_config_path_escape_segment(CBMArena *arena, const char *segment) {
+    if (!arena || !segment) {
+        return NULL;
+    }
+    size_t length = strlen(segment);
+    size_t escaped_length = length;
+    for (size_t i = 0; i < length; i++) {
+        if (segment[i] == '.' || segment[i] == '\\') {
+            escaped_length++;
+        }
+    }
+    if (escaped_length == length) {
+        return segment;
+    }
+    if (escaped_length < length || escaped_length == SIZE_MAX) {
+        return NULL;
+    }
+    char *escaped = (char *)cbm_arena_alloc(arena, escaped_length + 1);
+    if (!escaped) {
+        return NULL;
+    }
+    size_t out = 0;
+    for (size_t i = 0; i < length; i++) {
+        if (segment[i] == '.' || segment[i] == '\\') {
+            escaped[out++] = '\\';
+        }
+        escaped[out++] = segment[i];
+    }
+    escaped[out] = '\0';
+    return escaped;
+}
+
 // Classify and emit a YAML leaf value as a string_ref with key_path.
 static void emit_yaml_leaf_value(CBMExtractCtx *ctx, TSNode val, const char *path) {
     char *val_text = cbm_node_text(ctx->arena, val, ctx->source);
@@ -645,9 +677,8 @@ static void emit_yaml_nested_definition(CBMExtractCtx *ctx, TSNode pair, const c
                                         const char *path) {
     const char *base = strrchr(ctx->rel_path, '/');
     base = base ? base + SKIP_ONE : ctx->rel_path;
-    if (!path || !strchr(path, '.') || strcmp(base, "values.yaml") == 0 ||
-        strcmp(base, "values.yml") == 0) {
-        return; /* top-level keys are emitted by extract_vars_config */
+    if (!path || strcmp(base, "values.yaml") == 0 || strcmp(base, "values.yml") == 0) {
+        return;
     }
     if (ctx->result->yaml_config_defs_emitted >= YAML_CONFIG_DEF_CAP) {
         ctx->result->yaml_config_path_truncated = true;
@@ -670,18 +701,19 @@ static void emit_yaml_nested_definition(CBMExtractCtx *ctx, TSNode pair, const c
 typedef struct {
     TSNode node;
     const char *prefix;
+    int depth;
 } yaml_walk_frame_t;
 #define YAML_WALK_STACK_CAP CBM_SZ_256
 
 /* Push block_mapping children of a block_node/block_mapping value onto the walk stack. */
-static void push_yaml_block_children(TSNode val, const char *path, yaml_walk_frame_t *stack,
-                                     int *top) {
+static void push_yaml_block_children(TSNode val, const char *path, int depth,
+                                     yaml_walk_frame_t *stack, int *top) {
     uint32_t vnc = ts_node_named_child_count(val);
     for (int vi = (int)vnc - SKIP_ONE; vi >= 0 && *top < YAML_WALK_STACK_CAP; vi--) {
         TSNode vc = ts_node_named_child(val, (uint32_t)vi);
         const char *vctype = ts_node_type(vc);
         if (strcmp(vctype, "block_mapping") == 0 || strcmp(vctype, "block_mapping_pair") == 0) {
-            stack[(*top)++] = (yaml_walk_frame_t){vc, path};
+            stack[(*top)++] = (yaml_walk_frame_t){vc, path, depth};
         }
     }
 }
@@ -689,7 +721,7 @@ static void push_yaml_block_children(TSNode val, const char *path, yaml_walk_fra
 static void walk_yaml_mapping(CBMExtractCtx *ctx, TSNode root, const char *root_prefix) {
     yaml_walk_frame_t stack[YAML_WALK_STACK_CAP];
     int top = 0;
-    stack[top++] = (yaml_walk_frame_t){root, root_prefix};
+    stack[top++] = (yaml_walk_frame_t){root, root_prefix, 0};
 
     while (top > 0) {
         yaml_walk_frame_t frame = stack[--top];
@@ -709,16 +741,25 @@ static void walk_yaml_mapping(CBMExtractCtx *ctx, TSNode root, const char *root_
             if (!key_text || !key_text[0]) {
                 continue;
             }
+            const char *escaped_key = cbm_yaml_config_path_escape_segment(ctx->arena, key_text);
+            if (!escaped_key) {
+                continue;
+            }
             const char *path =
-                prefix ? cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, key_text) : key_text;
-            emit_yaml_nested_definition(ctx, child, key_text, path);
+                prefix ? cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, escaped_key) : escaped_key;
+            if (!path) {
+                continue;
+            }
+            if (frame.depth > 0) {
+                emit_yaml_nested_definition(ctx, child, key_text, path);
+            }
             TSNode val = ts_node_child_by_field_name(child, TS_FIELD("value"));
             if (ts_node_is_null(val)) {
                 continue;
             }
             const char *vk = ts_node_type(val);
             if (strcmp(vk, "block_node") == 0 || strcmp(vk, "block_mapping") == 0) {
-                push_yaml_block_children(val, path, stack, &top);
+                push_yaml_block_children(val, path, frame.depth + 1, stack, &top);
                 continue;
             }
             emit_yaml_leaf_value(ctx, val, path);

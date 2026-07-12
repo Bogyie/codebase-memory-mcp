@@ -50,4 +50,8 @@ void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spe
 // Definitions and imports stay as separate passes (different recursion patterns).
 void cbm_extract_unified(CBMExtractCtx *ctx);
 
+/* Escape one YAML mapping-key segment for the reversible dotted config-path
+ * identity. Plain keys are unchanged; `.` and `\\` are prefixed with `\\`. */
+const char *cbm_yaml_config_path_escape_segment(CBMArena *arena, const char *segment);
+
 #endif // CBM_EXTRACT_UNIFIED_H
