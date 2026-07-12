@@ -5863,6 +5863,7 @@ TEST(global_memory_tools_and_graph_need_no_project) {
                                   "RETURN s.name LIMIT 1\",\"format\":\"json\"}")
             : NULL;
     char *lint = srv ? cbm_mcp_handle_tool(srv, "memory_lint", "{}") : NULL;
+    char *status = srv ? cbm_mcp_handle_tool(srv, "memory_status", "{}") : NULL;
 
     bool ingest_ok = ingest && strstr(ingest, "unknown tool") == NULL &&
                      response_contains_json_fragment(ingest, "\"ok\":true");
@@ -5873,12 +5874,16 @@ TEST(global_memory_tools_and_graph_need_no_project) {
     bool cypher_ok = cypher && strstr(cypher, "Memory graph is unavailable") == NULL &&
                      response_contains_json_fragment(cypher, "\"snapshot_epoch\"");
     bool lint_ok = lint && strstr(lint, "unknown tool") == NULL;
+    bool status_ok = status && strstr(status, "unknown tool") == NULL &&
+                     response_contains_json_fragment(status, "\"snapshot_epoch\"") &&
+                     response_contains_json_fragment(status, "\"projection\"");
 
     free(ingest);
     free(query);
     free(schema);
     free(cypher);
     free(lint);
+    free(status);
     cbm_mcp_server_free(srv);
     if (saved) {
         cbm_setenv("CBM_MEMORY_HOME", saved, 1);
@@ -5893,13 +5898,14 @@ TEST(global_memory_tools_and_graph_need_no_project) {
     ASSERT_TRUE(schema_ok);
     ASSERT_TRUE(cypher_ok);
     ASSERT_TRUE(lint_ok);
+    ASSERT_TRUE(status_ok);
     PASS();
 }
 
 TEST(global_memory_tool_schemas_are_registered) {
     static const char *const names[] = {
-        "memory_ingest", "memory_query",  "memory_propose", "memory_commit",
-        "memory_lint",   "memory_export", "memory_import",  "memory_sync",
+        "memory_ingest", "memory_query",  "memory_status", "memory_propose", "memory_commit",
+        "memory_lint",   "memory_export", "memory_import", "memory_sync",
     };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         const char *schema = cbm_mcp_tool_input_schema(names[i]);

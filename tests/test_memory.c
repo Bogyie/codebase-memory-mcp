@@ -828,8 +828,40 @@ TEST(memory_rebuild_projection_restores_graph_and_search) {
     PASS();
 }
 
+TEST(memory_status_reports_entities_maintenance_and_projection) {
+    char home[MEMORY_TEST_PATH];
+    char *temporary = th_mktempdir("cbm_memory_status");
+    ASSERT_NOT_NULL(temporary);
+    snprintf(home, sizeof(home), "%s", temporary);
+    cbm_memory_t *memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+
+    char *empty = cbm_memory_status_json(memory, "{}");
+    ASSERT_TRUE(memory_result_ok(empty));
+    ASSERT_NOT_NULL(strstr(empty, "\"snapshot_epoch\":0"));
+    ASSERT_NOT_NULL(strstr(empty, "\"sources\":0"));
+    ASSERT_NOT_NULL(strstr(empty, "\"open_dirty\":0"));
+    ASSERT_NOT_NULL(strstr(empty, "\"strategy\":\"full_rebuild\""));
+    free(empty);
+
+    char *ingest = cbm_memory_ingest_json(
+        memory, "{\"content\":\"observable source\",\"origin\":\"unit-test\"}");
+    ASSERT_TRUE(memory_result_ok(ingest));
+    free(ingest);
+    char *populated = cbm_memory_status_json(memory, "{}");
+    ASSERT_TRUE(memory_result_ok(populated));
+    ASSERT_NOT_NULL(strstr(populated, "\"sources\":1"));
+    ASSERT_NOT_NULL(strstr(populated, "\"documents\":1"));
+    free(populated);
+
+    cbm_memory_close(memory);
+    th_rmtree(home);
+    PASS();
+}
+
 SUITE(memory) {
     RUN_TEST(memory_open_schema);
+    RUN_TEST(memory_status_reports_entities_maintenance_and_projection);
     RUN_TEST(memory_ingest_deduplicates);
     RUN_TEST(memory_source_revision_dirties_supported_claim);
     RUN_TEST(memory_commit_all_epistemic_entities_and_materializes_wiki);

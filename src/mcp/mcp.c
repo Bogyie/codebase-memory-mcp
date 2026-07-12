@@ -614,6 +614,11 @@ static const tool_def_t TOOLS[] = {
      "\"valid_at\":{\"type\":\"string\"},\"known_at\":{\"type\":\"string\"},"
      "\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100}}}"},
 
+    {"memory_status", "Inspect Global Memory status",
+     "Read-only counters for the current Memory epoch, epistemic entities, open maintenance "
+     "work, CodeRef resolution, and graph/search projection size.",
+     "{\"type\":\"object\",\"properties\":{}}"},
+
     {"memory_propose", "Propose Global Memory update",
      "Stage revision-aware operations without holding a database transaction while an Agent "
      "reasons. Operations support pages, claims, decisions, experiences, preferences, links, "
@@ -7561,6 +7566,9 @@ static char *handle_memory_tool(cbm_mcp_server_t *srv, const char *tool_name, co
     }
     if (strcmp(tool_name, "memory_query") == 0) {
         return handle_memory_json(srv, args, cbm_memory_query_json);
+    }
+    if (strcmp(tool_name, "memory_status") == 0) {
+        return handle_memory_json(srv, args, cbm_memory_status_json);
     }
     if (strcmp(tool_name, "memory_propose") == 0) {
         return handle_memory_json(srv, args, cbm_memory_propose_json);
