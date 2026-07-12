@@ -89,4 +89,6 @@ export interface ProcessInfo {
   elapsed: string;
   command: string;
   is_self: boolean;
+  killable: boolean;
+  job_id: string;
 }

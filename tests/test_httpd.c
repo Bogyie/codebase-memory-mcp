@@ -24,6 +24,7 @@
 #include "ui/http_server.h"
 #include <store/store.h>
 #include <watcher/watcher.h>
+#include <yyjson/yyjson.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,6 +163,7 @@ TEST(httpd_parse_simple_get) {
 
 TEST(httpd_parse_post_with_body_offset) {
     const char *raw = "POST /rpc HTTP/1.1\r\n"
+                      "Host: 127.0.0.1\r\n"
                       "Content-Length: 7\r\n"
                       "Content-Type: application/json\r\n"
                       "\r\n"
@@ -173,6 +175,7 @@ TEST(httpd_parse_post_with_body_offset) {
     ASSERT_STR_EQ(req.method, "POST");
     ASSERT_STR_EQ(req.path, "/rpc");
     ASSERT_STR_EQ(req.query, "");
+    ASSERT_STR_EQ(req.content_type, "application/json");
     ASSERT_EQ((int)clen, 7);
     ASSERT_STR_EQ(raw + body_off, "{\"a\":1}");
     PASS();
@@ -180,12 +183,64 @@ TEST(httpd_parse_post_with_body_offset) {
 
 TEST(httpd_parse_origin_case_insensitive) {
     const char *raw = "GET / HTTP/1.1\r\n"
+                      "Host: 127.0.0.1\r\n"
                       "origin: http://127.0.0.1:9749\r\n"
                       "\r\n";
     cbm_http_req_t req;
     size_t body_off = 0, clen = 0;
     ASSERT_EQ(cbm_http_parse_head(raw, strlen(raw), &req, &body_off, &clen), 0);
     ASSERT_STR_EQ(req.origin, "http://127.0.0.1:9749");
+    PASS();
+}
+
+TEST(httpd_parse_rejects_duplicate_or_oversized_security_headers) {
+    const char *duplicate = "GET / HTTP/1.1\r\n"
+                            "Host: localhost\r\n"
+                            "Host: 127.0.0.1\r\n\r\n";
+    cbm_http_req_t req;
+    size_t body_off = 0, clen = 0;
+    ASSERT_EQ(cbm_http_parse_head(duplicate, strlen(duplicate), &req, &body_off, &clen), 400);
+
+    char oversized[1024];
+    memset(oversized, 'a', sizeof(oversized));
+    int prefix = snprintf(oversized, sizeof(oversized), "GET / HTTP/1.1\r\nHost: ");
+    ASSERT_TRUE(prefix > 0);
+    size_t off = (size_t)prefix;
+    memset(oversized + off, 'a', 300);
+    off += 300;
+    memcpy(oversized + off, "\r\n\r\n", 5);
+    ASSERT_EQ(cbm_http_parse_head(oversized, off + 4, &req, &body_off, &clen), 431);
+    PASS();
+}
+
+TEST(httpd_parse_long_unknown_header_name_is_safe) {
+    char raw[1024];
+    int prefix = snprintf(raw, sizeof(raw), "GET / HTTP/1.1\r\nX-");
+    ASSERT_TRUE(prefix > 0);
+    size_t off = (size_t)prefix;
+    memset(raw + off, 'a', 400);
+    off += 400;
+    static const char tail[] = ": value\r\nHost: 127.0.0.1\r\n\r\n";
+    memcpy(raw + off, tail, sizeof(tail) - 1);
+    off += sizeof(tail) - 1;
+
+    cbm_http_req_t req;
+    size_t body_off = 0, clen = 0;
+    ASSERT_EQ(cbm_http_parse_head(raw, off, &req, &body_off, &clen), 0);
+    PASS();
+}
+
+TEST(httpd_parse_enforces_http11_host) {
+    cbm_http_req_t req;
+    size_t body_off = 0, clen = 0;
+    const char *missing = "GET / HTTP/1.1\r\nX-Test: value\r\n\r\n";
+    ASSERT_EQ(cbm_http_parse_head(missing, strlen(missing), &req, &body_off, &clen), 400);
+
+    const char *empty = "GET / HTTP/1.1\r\nHost: \t \r\n\r\n";
+    ASSERT_EQ(cbm_http_parse_head(empty, strlen(empty), &req, &body_off, &clen), 400);
+
+    const char *http10 = "GET / HTTP/1.0\r\n\r\n";
+    ASSERT_EQ(cbm_http_parse_head(http10, strlen(http10), &req, &body_off, &clen), 0);
     PASS();
 }
 
@@ -214,6 +269,8 @@ TEST(httpd_parse_rejects_oversized_content_length) {
     cbm_http_req_t req;
     size_t body_off = 0, clen = 0;
     ASSERT_EQ(cbm_http_parse_head(raw, strlen(raw), &req, &body_off, &clen), 413);
+    const char *wrapped = "POST /rpc HTTP/1.1\r\nContent-Length: 18446744073709551616\r\n\r\n";
+    ASSERT_EQ(cbm_http_parse_head(wrapped, strlen(wrapped), &req, &body_off, &clen), 413);
     PASS();
 }
 
@@ -338,10 +395,11 @@ TEST(httpd_path_match_matrix) {
     PASS();
 }
 
-TEST(httpd_resolves_bare_binary_path_from_path) {
-#ifdef _WIN32
-    PASS();
-#else
+TEST(httpd_binary_resolution_ignores_mutable_path) {
+    char expected_self[1024];
+    ASSERT_TRUE(cbm_http_server_resolve_binary_path(NULL, expected_self, sizeof(expected_self)));
+    ASSERT_TRUE(expected_self[0] != '\0');
+#ifndef _WIN32
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_httpd_bin_XXXXXX");
     char *td = cbm_mkdtemp(tmpdir);
@@ -361,7 +419,14 @@ TEST(httpd_resolves_bare_binary_path_from_path) {
     char resolved[1024];
     ASSERT_TRUE(
         cbm_http_server_resolve_binary_path("codebase-memory-mcp", resolved, sizeof(resolved)));
-    ASSERT_STR_EQ(resolved, exe);
+    ASSERT_STR_EQ(resolved, expected_self);
+    ASSERT_FALSE(strcmp(resolved, exe) == 0);
+
+    /* An explicit absolute executable remains supported and is canonicalized. */
+    ASSERT_TRUE(cbm_http_server_resolve_binary_path(exe, resolved, sizeof(resolved)));
+    char canonical_exe[1024];
+    ASSERT_TRUE(cbm_canonical_path(exe, canonical_exe, sizeof(canonical_exe)));
+    ASSERT_STR_EQ(resolved, canonical_exe);
 
     if (old_path) {
         cbm_setenv("PATH", old_path, 1);
@@ -369,8 +434,49 @@ TEST(httpd_resolves_bare_binary_path_from_path) {
     } else {
         cbm_unsetenv("PATH");
     }
-    PASS();
+    th_cleanup(td);
+#else
+    char resolved[1024];
+    ASSERT_TRUE(
+        cbm_http_server_resolve_binary_path("codebase-memory-mcp", resolved, sizeof(resolved)));
+    ASSERT_STR_EQ(resolved, expected_self);
 #endif
+    PASS();
+}
+
+TEST(httpd_project_db_path_has_no_shared_tmp_fallback) {
+    char *old_cache = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
+    char *old_home = getenv("HOME") ? strdup(getenv("HOME")) : NULL;
+    char *old_profile = getenv("USERPROFILE") ? strdup(getenv("USERPROFILE")) : NULL;
+    cbm_unsetenv("CBM_CACHE_DIR");
+    cbm_unsetenv("HOME");
+    cbm_unsetenv("USERPROFILE");
+
+    char path[256] = "must-be-cleared";
+    bool ok = cbm_http_server_project_db_path("safe-project", path, sizeof(path));
+
+    if (old_cache) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
+        free(old_cache);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (old_home) {
+        cbm_setenv("HOME", old_home, 1);
+        free(old_home);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    if (old_profile) {
+        cbm_setenv("USERPROFILE", old_profile, 1);
+        free(old_profile);
+    } else {
+        cbm_unsetenv("USERPROFILE");
+    }
+
+    ASSERT_FALSE(ok);
+    ASSERT_EQ(path[0], '\0');
+    PASS();
 }
 
 /* ── Transport integration (listener only) ────────────────────── */
@@ -503,7 +609,7 @@ static int ui_delete_make_sidecars(const ui_delete_fixture_t *fx, const char *pr
 
 static int ui_delete_request(th_server_t *ts, const char *target, char *resp, size_t respsz) {
     char req[512];
-    snprintf(req, sizeof(req), "DELETE %s HTTP/1.1\r\n\r\n", target);
+    snprintf(req, sizeof(req), "DELETE %s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", target);
     return th_http(cbm_http_server_port(ts->srv), req, resp, respsz);
 }
 
@@ -513,7 +619,8 @@ TEST(ui_server_unknown_path_404) {
     int port = cbm_http_server_port(ts.srv);
 
     char resp[4096];
-    int n = th_http(port, "GET /definitely/not/here HTTP/1.1\r\n\r\n", resp, sizeof(resp));
+    int n = th_http(port, "GET /definitely/not/here HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", resp,
+                    sizeof(resp));
     ASSERT_GT(n, 0);
     ASSERT_EQ(th_status(resp), 404);
     /* every response is explicit-length + close */
@@ -529,7 +636,8 @@ TEST(ui_server_root_serves_stub_404) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
     char resp[4096];
-    int n = th_http(cbm_http_server_port(ts.srv), "GET / HTTP/1.1\r\n\r\n", resp, sizeof(resp));
+    int n = th_http(cbm_http_server_port(ts.srv), "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", resp,
+                    sizeof(resp));
     ASSERT_GT(n, 0);
     ASSERT_EQ(th_status(resp), 404);
     ASSERT_NOT_NULL(strstr(resp, "no frontend embedded"));
@@ -541,13 +649,29 @@ TEST(ui_server_cors_localhost_reflected) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
     char resp[4096];
-    int n = th_http(cbm_http_server_port(ts.srv),
-                    "OPTIONS /rpc HTTP/1.1\r\n"
-                    "Origin: http://localhost:5173\r\n\r\n",
-                    resp, sizeof(resp));
+    int port = cbm_http_server_port(ts.srv);
+    char request[512];
+    snprintf(request, sizeof(request),
+             "OPTIONS /rpc HTTP/1.1\r\n"
+             "Host: 127.0.0.1:%d\r\n"
+             "Origin: http://127.0.0.1:%d\r\n\r\n",
+             port, port);
+    int n = th_http(port, request, resp, sizeof(resp));
     ASSERT_GT(n, 0);
     ASSERT_EQ(th_status(resp), 204);
-    ASSERT_NOT_NULL(strstr(resp, "Access-Control-Allow-Origin: http://localhost:5173"));
+    char expected[128];
+    snprintf(expected, sizeof(expected), "Access-Control-Allow-Origin: http://127.0.0.1:%d", port);
+    ASSERT_NOT_NULL(strstr(resp, expected));
+
+    snprintf(request, sizeof(request),
+             "OPTIONS /rpc HTTP/1.1\r\n"
+             "Host: 127.0.0.1:%d\r\n"
+             "Origin: http://127.0.0.1:5173\r\n\r\n",
+             port);
+    n = th_http(port, request, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
+    ASSERT_NULL(strstr(resp, "Access-Control-Allow-Origin"));
     th_server_stop(&ts);
     PASS();
 }
@@ -558,11 +682,167 @@ TEST(ui_server_cors_evil_origin_not_reflected) {
     char resp[4096];
     int n = th_http(cbm_http_server_port(ts.srv),
                     "OPTIONS /rpc HTTP/1.1\r\n"
+                    "Host: 127.0.0.1\r\n"
                     "Origin: http://evil.example.com\r\n\r\n",
                     resp, sizeof(resp));
     ASSERT_GT(n, 0);
-    ASSERT_EQ(th_status(resp), 204);
+    ASSERT_EQ(th_status(resp), 403);
     ASSERT_NULL(strstr(resp, "Access-Control-Allow-Origin"));
+
+    n = th_http(cbm_http_server_port(ts.srv),
+                "OPTIONS /rpc HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Origin: http://localhost:5173.evil.example\r\n\r\n",
+                resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
+    ASSERT_NULL(strstr(resp, "Access-Control-Allow-Origin"));
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_rejects_foreign_origin_post) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body = "{}";
+    char req[512];
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\n"
+             "Host: 127.0.0.1:%d\r\n"
+             "Origin: http://evil.example.com\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             cbm_http_server_port(ts.srv), strlen(body), body);
+    char resp[4096];
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_rejects_simple_post_media_type) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body = "{}";
+    char req[512];
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\n"
+             "Host: 127.0.0.1:%d\r\n"
+             "Content-Type: text/plain\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             cbm_http_server_port(ts.srv), strlen(body), body);
+    char resp[4096];
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 415);
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_validates_json_media_type_parameters) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body = "{}";
+    char req[512];
+    char resp[4096];
+
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\n"
+             "Host: 127.0.0.1\r\n"
+             "Content-Type: Application/JSON; charset=\"utf-8\"\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(body), body);
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\n"
+             "Host: 127.0.0.1\r\n"
+             "Content-Type: application/json; not-a-parameter\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(body), body);
+    n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 415);
+
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_logs_are_valid_json) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[16384];
+    int n =
+        th_http(cbm_http_server_port(ts.srv),
+                "GET /api/logs?lines=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+
+    const char line[] = "quote\"slash\\newline\ncontrol\x01";
+    cbm_ui_log_append(line);
+    n = th_http(cbm_http_server_port(ts.srv),
+                "GET /api/logs?lines=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    char *body = strstr(resp, "\r\n\r\n");
+    ASSERT_NOT_NULL(body);
+    body += 4;
+    yyjson_doc *doc = yyjson_read(body, strlen(body), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *lines = yyjson_obj_get(root, "lines");
+    yyjson_val *first = lines ? yyjson_arr_get_first(lines) : NULL;
+    ASSERT_TRUE(first && yyjson_is_str(first));
+    ASSERT_EQ((int)yyjson_get_len(first), (int)strlen(line));
+    ASSERT_STR_EQ(yyjson_get_str(first), line);
+    yyjson_doc_free(doc);
+
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_processes_returns_bounded_json) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[16384];
+    int n = th_http(cbm_http_server_port(ts.srv),
+                    "GET /api/processes HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"self_pid\":"));
+    ASSERT_NOT_NULL(strstr(resp, "\"self_rss_mb\":"));
+    ASSERT_NOT_NULL(strstr(resp, "\"processes\":["));
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_process_kill_rejects_unowned_or_invalid_pid) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[4096];
+    const char *unowned = "{\"pid\":2147483647,\"job_id\":\"1\"}";
+    char req[512];
+    snprintf(req, sizeof(req),
+             "POST /api/process-kill HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(unowned), unowned);
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
+
+    const char *oversized = "{\"pid\":18446744073709551615,\"job_id\":\"1\"}";
+    snprintf(req, sizeof(req),
+             "POST /api/process-kill HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(oversized), oversized);
+    n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 400);
     th_server_stop(&ts);
     PASS();
 }
@@ -577,6 +857,7 @@ TEST(ui_server_rpc_initialize) {
     char req[1024];
     snprintf(req, sizeof(req),
              "POST /rpc HTTP/1.1\r\n"
+             "Host: 127.0.0.1\r\n"
              "Content-Type: application/json\r\n"
              "Content-Length: %d\r\n\r\n%s",
              (int)strlen(body), body);
@@ -607,8 +888,9 @@ TEST(ui_server_encoded_slash_not_routed) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
     char resp[4096];
-    int n = th_http(cbm_http_server_port(ts.srv), "GET /api%2Fbrowse?path=/tmp HTTP/1.1\r\n\r\n",
-                    resp, sizeof(resp));
+    int n = th_http(cbm_http_server_port(ts.srv),
+                    "GET /api%2Fbrowse?path=/tmp HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", resp,
+                    sizeof(resp));
     ASSERT_GT(n, 0);
     /* must fall through to 404 — NOT the browse handler */
     ASSERT_EQ(th_status(resp), 404);
@@ -638,8 +920,9 @@ TEST(ui_server_browse_traversal_probe) {
     ASSERT_EQ(th_server_start(&ts), 0);
     char resp[65536];
     int n = th_http(cbm_http_server_port(ts.srv),
-                    "GET /api/browse?path=%2Ftmp%2F..%2F..%2Fprivate HTTP/1.1\r\n\r\n", resp,
-                    sizeof(resp));
+                    "GET /api/browse?path=%2Ftmp%2F..%2F..%2Fprivate HTTP/1.1\r\n"
+                    "Host: 127.0.0.1\r\n\r\n",
+                    resp, sizeof(resp));
     ASSERT_GT(n, 0);
     int st = th_status(resp);
     ASSERT_TRUE(st == 200 || st == 400 || st == 403);
@@ -648,6 +931,209 @@ TEST(ui_server_browse_traversal_probe) {
     ASSERT_EQ(json[4], '{');
     th_server_stop(&ts);
     PASS();
+}
+
+TEST(ui_server_adr_save_keeps_parsed_strings_alive) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    char db[1024];
+    ui_delete_db_path(&fx, "ui-adr", db, sizeof(db));
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "ui-adr", fx.root_dir), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body = "{\"project\":\"ui-adr\",\"content\":\"line\\nquote\\\"slash\\\\tab\\t\"}";
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "POST /api/adr HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(body), body);
+    char resp[4096];
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    th_server_stop(&ts);
+
+    store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(store, "ui-adr", &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "line\nquote\"slash\\tab\t");
+    cbm_store_adr_free(&adr);
+    cbm_store_close(store);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_adr_rejects_embedded_nul) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body = "{\"project\":\"ui-adr\",\"content\":\"x\\u0000y\"}";
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "POST /api/adr HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(body), body);
+    char resp[4096];
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 400);
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_index_worker_nonzero_is_not_reported_done) {
+#ifdef _WIN32
+    SKIP_PLATFORM("the discarded waitpid status regression was POSIX-only");
+#else
+    char *dir = th_mktempdir("cbm_httpd_index_failure");
+    ASSERT_NOT_NULL(dir);
+    char worker[1024];
+    snprintf(worker, sizeof(worker), "%s/failing-worker", dir);
+    ASSERT_EQ(th_write_file(worker, "#!/bin/sh\nexit 7\n"), 0);
+    ASSERT_EQ(chmod(worker, 0755), 0);
+
+    char self[1024];
+    ASSERT_TRUE(cbm_http_server_resolve_binary_path(NULL, self, sizeof(self)));
+    cbm_http_server_set_binary_path(worker);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char body[1400];
+    snprintf(body, sizeof(body), "{\"root_path\":\"%s\"}", dir);
+    char req[1800];
+    snprintf(req, sizeof(req),
+             "POST /api/index HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(body), body);
+    char resp[8192];
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 202);
+
+    bool saw_error = false;
+    for (int i = 0; i < 100 && !saw_error; i++) {
+        struct timespec delay = {0, 50 * 1000 * 1000L};
+        cbm_nanosleep(&delay, NULL);
+        n = th_http(cbm_http_server_port(ts.srv),
+                    "GET /api/index-status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", resp,
+                    sizeof(resp));
+        ASSERT_GT(n, 0);
+        saw_error =
+            strstr(resp, "\"status\":\"error\"") != NULL && strstr(resp, "exit_nonzero") != NULL;
+    }
+    th_server_stop(&ts);
+    cbm_http_server_set_binary_path(self);
+    th_cleanup(dir);
+    ASSERT_TRUE(saw_error);
+    PASS();
+#endif
+}
+
+/* The HTTP handler may only enqueue a generation-bound supervisor request. */
+TEST(ui_server_index_worker_kill_is_supervised) {
+#ifdef _WIN32
+    SKIP_PLATFORM("covered by cross-platform subprocess control test");
+#else
+    char *dir = th_mktempdir("cbm_httpd_index_kill");
+    ASSERT_NOT_NULL(dir);
+    char worker[1024];
+    snprintf(worker, sizeof(worker), "%s/slow-worker", dir);
+    ASSERT_EQ(th_write_file(worker, "#!/bin/sh\nwhile :; do :; done\n"), 0);
+    ASSERT_EQ(chmod(worker, 0755), 0);
+
+    char self[1024];
+    ASSERT_TRUE(cbm_http_server_resolve_binary_path(NULL, self, sizeof(self)));
+    cbm_http_server_set_binary_path(worker);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char body[1400];
+    snprintf(body, sizeof(body), "{\"root_path\":\"%s\"}", dir);
+    char req[1800];
+    snprintf(req, sizeof(req),
+             "POST /api/index HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(body), body);
+    char resp[8192];
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 202);
+
+    uint64_t child_pid = 0;
+    uint64_t job_id = 0;
+    for (int i = 0; i < 100 && child_pid == 0; i++) {
+        struct timespec delay = {0, 20 * 1000 * 1000L};
+        cbm_nanosleep(&delay, NULL);
+        n = th_http(cbm_http_server_port(ts.srv),
+                    "GET /api/index-status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", resp,
+                    sizeof(resp));
+        ASSERT_GT(n, 0);
+        char *json = strstr(resp, "\r\n\r\n");
+        yyjson_doc *doc = json ? yyjson_read(json + 4, strlen(json + 4), 0) : NULL;
+        yyjson_val *jobs = doc ? yyjson_doc_get_root(doc) : NULL;
+        yyjson_val *job = yyjson_is_arr(jobs) ? yyjson_arr_get_first(jobs) : NULL;
+        yyjson_val *pid = yyjson_is_obj(job) ? yyjson_obj_get(job, "pid") : NULL;
+        yyjson_val *id = yyjson_is_obj(job) ? yyjson_obj_get(job, "job_id") : NULL;
+        if (yyjson_is_uint(pid))
+            child_pid = yyjson_get_uint(pid);
+        if (yyjson_is_str(id))
+            job_id = strtoull(yyjson_get_str(id), NULL, 10);
+        if (doc)
+            yyjson_doc_free(doc);
+    }
+    ASSERT_TRUE(child_pid > 0);
+    ASSERT_TRUE(job_id > 0);
+
+    char kill_body[128];
+    snprintf(kill_body, sizeof(kill_body), "{\"pid\":%llu,\"job_id\":\"%llu\"}",
+             (unsigned long long)child_pid, (unsigned long long)(job_id + 1U));
+    snprintf(req, sizeof(req),
+             "POST /api/process-kill HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(kill_body), kill_body);
+    n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
+
+    /* The same PID with the current run identity is accepted. */
+    snprintf(kill_body, sizeof(kill_body), "{\"pid\":%llu,\"job_id\":\"%llu\"}",
+             (unsigned long long)child_pid, (unsigned long long)job_id);
+    snprintf(req, sizeof(req),
+             "POST /api/process-kill HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             strlen(kill_body), kill_body);
+    n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 202);
+
+    bool saw_killed = false;
+    for (int i = 0; i < 100 && !saw_killed; i++) {
+        struct timespec delay = {0, 20 * 1000 * 1000L};
+        cbm_nanosleep(&delay, NULL);
+        n = th_http(cbm_http_server_port(ts.srv),
+                    "GET /api/index-status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", resp,
+                    sizeof(resp));
+        ASSERT_GT(n, 0);
+        saw_killed = strstr(resp, "\"status\":\"error\"") != NULL && strstr(resp, "killed") != NULL;
+    }
+
+    th_server_stop(&ts);
+    cbm_http_server_set_binary_path(self);
+    th_cleanup(dir);
+    ASSERT_TRUE(saw_killed);
+    PASS();
+#endif
 }
 
 TEST(ui_server_delete_project_unwatches_after_delete) {
@@ -792,6 +1278,7 @@ TEST(ui_server_ui_config_detects_zh_accept_language) {
     char resp[4096];
     int n = th_http(cbm_http_server_port(ts.srv),
                     "GET /api/ui-config HTTP/1.1\r\n"
+                    "Host: 127.0.0.1\r\n"
                     "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8\r\n"
                     "\r\n",
                     resp, sizeof(resp));
@@ -825,6 +1312,7 @@ TEST(ui_server_ui_config_prefers_config_lang) {
     char resp[4096];
     int n = th_http(cbm_http_server_port(ts.srv),
                     "GET /api/ui-config HTTP/1.1\r\n"
+                    "Host: 127.0.0.1\r\n"
                     "Accept-Language: en-US,en;q=0.9\r\n"
                     "\r\n",
                     resp, sizeof(resp));
@@ -860,7 +1348,8 @@ TEST(ui_server_slow_request_hits_deadline) {
 
     /* …and the server must still answer the next request */
     char resp2[4096];
-    int n2 = th_http(port, "GET /definitely/not/here HTTP/1.1\r\n\r\n", resp2, sizeof(resp2));
+    int n2 = th_http(port, "GET /definitely/not/here HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", resp2,
+                     sizeof(resp2));
     ASSERT_GT(n2, 0);
     ASSERT_EQ(th_status(resp2), 404);
 
@@ -879,7 +1368,9 @@ TEST(ui_server_access_log_redacts_query) {
     ASSERT_EQ(th_server_start(&ts), 0);
     char resp[4096];
     int n = th_http(cbm_http_server_port(ts.srv),
-                    "GET /definitely/not/here?token=secret HTTP/1.1\r\n\r\n", resp, sizeof(resp));
+                    "GET /definitely/not/here?token=secret HTTP/1.1\r\n"
+                    "Host: 127.0.0.1\r\n\r\n",
+                    resp, sizeof(resp));
     ASSERT_GT(n, 0);
     ASSERT_EQ(th_status(resp), 404);
     th_server_stop(&ts);
@@ -1006,6 +1497,7 @@ TEST(ui_server_list_projects_responds_under_watchdog) {
     char req[512];
     snprintf(req, sizeof(req),
              "POST /rpc HTTP/1.1\r\n"
+             "Host: 127.0.0.1\r\n"
              "Content-Type: application/json\r\n"
              "Content-Length: %d\r\n\r\n%s",
              (int)strlen(body), body);
@@ -1107,6 +1599,11 @@ TEST(ui_server_rejects_non_loopback_host) {
     ASSERT_GT(n, 0);
     ASSERT_NEQ(th_status(resp), 403);
 
+    /* Prefix matches are not sufficient: this is not a numeric port. */
+    n = th_http(port, "GET / HTTP/1.1\r\nHost: localhost:9749.evil\r\n\r\n", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
+
     th_server_stop(&ts);
     PASS();
 }
@@ -1176,6 +1673,9 @@ SUITE(httpd) {
     RUN_TEST(httpd_parse_simple_get);
     RUN_TEST(httpd_parse_post_with_body_offset);
     RUN_TEST(httpd_parse_origin_case_insensitive);
+    RUN_TEST(httpd_parse_rejects_duplicate_or_oversized_security_headers);
+    RUN_TEST(httpd_parse_long_unknown_header_name_is_safe);
+    RUN_TEST(httpd_parse_enforces_http11_host);
     RUN_TEST(httpd_parse_rejects_bare_lf);
     RUN_TEST(httpd_parse_rejects_chunked);
     RUN_TEST(httpd_parse_rejects_oversized_content_length);
@@ -1188,7 +1688,8 @@ SUITE(httpd) {
     RUN_TEST(httpd_query_param_decode);
     RUN_TEST(httpd_query_param_edge_cases);
     RUN_TEST(httpd_path_match_matrix);
-    RUN_TEST(httpd_resolves_bare_binary_path_from_path);
+    RUN_TEST(httpd_binary_resolution_ignores_mutable_path);
+    RUN_TEST(httpd_project_db_path_has_no_shared_tmp_fallback);
     RUN_TEST(repo_info_web_base_normalizes_to_https);
     RUN_TEST(repo_info_strips_credentials_from_remote);
 
@@ -1202,11 +1703,21 @@ SUITE(httpd) {
     RUN_TEST(ui_server_root_serves_stub_404);
     RUN_TEST(ui_server_cors_localhost_reflected);
     RUN_TEST(ui_server_cors_evil_origin_not_reflected);
+    RUN_TEST(ui_server_rejects_foreign_origin_post);
+    RUN_TEST(ui_server_rejects_simple_post_media_type);
+    RUN_TEST(ui_server_validates_json_media_type_parameters);
+    RUN_TEST(ui_server_logs_are_valid_json);
+    RUN_TEST(ui_server_processes_returns_bounded_json);
+    RUN_TEST(ui_server_process_kill_rejects_unowned_or_invalid_pid);
     RUN_TEST(ui_server_rpc_initialize);
     RUN_TEST(ui_server_oversized_body_rejected);
     RUN_TEST(ui_server_encoded_slash_not_routed);
     RUN_TEST(ui_server_nul_in_target_rejected);
     RUN_TEST(ui_server_browse_traversal_probe);
+    RUN_TEST(ui_server_adr_save_keeps_parsed_strings_alive);
+    RUN_TEST(ui_server_adr_rejects_embedded_nul);
+    RUN_TEST(ui_server_index_worker_nonzero_is_not_reported_done);
+    RUN_TEST(ui_server_index_worker_kill_is_supervised);
     RUN_TEST(ui_server_delete_project_unwatches_after_delete);
     RUN_TEST(ui_server_delete_project_unwatches_missing_db);
     RUN_TEST(ui_server_delete_project_no_watcher_still_deletes);

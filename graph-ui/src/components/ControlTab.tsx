@@ -33,8 +33,16 @@ function ProcessCard({ proc, selected, onSelect, onKill }: {
 }) {
   const t = useUiMessages();
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onSelect}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect();
+        }
+      }}
       className={`w-full text-left rounded-xl border p-4 transition-all ${
         selected
           ? "border-primary/40 bg-primary/5"
@@ -51,7 +59,7 @@ function ProcessCard({ proc, selected, onSelect, onKill }: {
             <span className="text-[9px] px-1.5 py-0.5 rounded bg-primary/15 text-primary font-medium">{t.control.thisProcess}</span>
           )}
         </div>
-        {!proc.is_self && (
+        {proc.killable && proc.job_id && proc.job_id !== "0" && (
           <button
             onClick={(e) => { e.stopPropagation(); onKill(); }}
             className="px-2 py-1 rounded-lg text-[10px] text-foreground/20 hover:text-destructive hover:bg-destructive/10 transition-all"
@@ -77,7 +85,7 @@ function ProcessCard({ proc, selected, onSelect, onKill }: {
       </div>
 
       <p className="text-[10px] text-foreground/15 font-mono truncate">{proc.command}</p>
-    </button>
+    </div>
   );
 }
 
@@ -159,13 +167,13 @@ export function ControlTab() {
     return () => clearInterval(interval);
   }, [fetchProcesses]);
 
-  const killProcess = useCallback(async (pid: number) => {
-    if (!confirm(t.control.killConfirm(pid))) return;
+  const killProcess = useCallback(async (proc: ProcessInfo) => {
+    if (!proc.killable || !proc.job_id || proc.job_id === "0" || !confirm(t.control.killConfirm(proc.pid))) return;
     try {
       await fetch("/api/process-kill", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pid }),
+        body: JSON.stringify({ pid: proc.pid, job_id: proc.job_id }),
       });
       setTimeout(fetchProcesses, 1000);
     } catch { /* ignore */ }
@@ -208,11 +216,11 @@ export function ControlTab() {
             <div className="grid grid-cols-2 gap-3">
               {processes.map((p) => (
                 <ProcessCard
-                  key={p.pid}
+                  key={`${p.pid}:${p.job_id}`}
                   proc={p}
                   selected={selectedPid === p.pid}
                   onSelect={() => setSelectedPid(selectedPid === p.pid ? null : p.pid)}
-                  onKill={() => killProcess(p.pid)}
+                  onKill={() => killProcess(p)}
                 />
               ))}
             </div>

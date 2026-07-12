@@ -181,6 +181,102 @@ TEST(config_missing_fields) {
     PASS();
 }
 
+TEST(config_path_fails_closed_without_private_cache) {
+    char *old_cache = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
+    char *old_home = getenv("HOME") ? strdup(getenv("HOME")) : NULL;
+    char *old_profile = getenv("USERPROFILE") ? strdup(getenv("USERPROFILE")) : NULL;
+    cbm_unsetenv("CBM_CACHE_DIR");
+    cbm_unsetenv("HOME");
+    cbm_unsetenv("USERPROFILE");
+
+    char path[128] = "must-be-cleared";
+    bool path_ok = cbm_ui_config_path(path, (int)sizeof(path));
+    cbm_ui_config_t loaded = {.ui_enabled = true, .ui_port = 1};
+    cbm_ui_config_load(&loaded);
+    cbm_ui_config_t attempted = {.ui_enabled = true, .ui_port = 12345};
+    cbm_ui_config_save(&attempted); /* must be a no-op, never /tmp/config.json */
+
+    if (old_cache) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
+        free(old_cache);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (old_home) {
+        cbm_setenv("HOME", old_home, 1);
+        free(old_home);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    if (old_profile) {
+        cbm_setenv("USERPROFILE", old_profile, 1);
+        free(old_profile);
+    } else {
+        cbm_unsetenv("USERPROFILE");
+    }
+
+    ASSERT_FALSE(path_ok);
+    ASSERT_EQ(path[0], '\0');
+    ASSERT_FALSE(loaded.ui_enabled);
+    ASSERT_EQ(loaded.ui_port, CBM_UI_DEFAULT_PORT);
+    PASS();
+}
+
+TEST(config_save_atomically_replaces_symlink) {
+#ifdef _WIN32
+    SKIP_PLATFORM("creating symlinks requires optional Windows privileges");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_test_config_atomic_XXXXXX");
+    char *td = cbm_mkdtemp(tmpdir);
+    ASSERT_NOT_NULL(td);
+    char *old_home = getenv("HOME") ? strdup(getenv("HOME")) : NULL;
+    char *old_cache = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
+    cbm_unsetenv("CBM_CACHE_DIR");
+    cbm_setenv("HOME", td, 1);
+
+    char path[1024];
+    ASSERT_TRUE(cbm_ui_config_path(path, (int)sizeof(path)));
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s/.cache/codebase-memory-mcp", td);
+    ASSERT_TRUE(cbm_mkdir_p(dir, 0750));
+    char victim[1024];
+    snprintf(victim, sizeof(victim), "%s/victim", td);
+    FILE *f = fopen(victim, "wb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_TRUE(fputs("do-not-touch", f) >= 0);
+    ASSERT_EQ(fclose(f), 0);
+    ASSERT_EQ(symlink(victim, path), 0);
+
+    cbm_ui_config_t cfg = {.ui_enabled = true, .ui_port = 8081};
+    cbm_ui_config_save(&cfg);
+    char contents[32] = {0};
+    f = fopen(victim, "rb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_NOT_NULL(fgets(contents, sizeof(contents), f));
+    ASSERT_EQ(fclose(f), 0);
+
+    cbm_ui_config_t loaded;
+    cbm_ui_config_load(&loaded);
+    if (old_home) {
+        cbm_setenv("HOME", old_home, 1);
+        free(old_home);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    if (old_cache) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
+        free(old_cache);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    ASSERT_STR_EQ(contents, "do-not-touch");
+    ASSERT_TRUE(loaded.ui_enabled);
+    ASSERT_EQ(loaded.ui_port, 8081);
+    PASS();
+#endif
+}
+
 /* ── Embedded asset tests ─────────────────────────────────────── */
 
 TEST(embedded_lookup_not_found) {
@@ -790,6 +886,8 @@ SUITE(ui) {
     RUN_TEST(config_overwrite);
     RUN_TEST(config_corrupt_file);
     RUN_TEST(config_missing_fields);
+    RUN_TEST(config_path_fails_closed_without_private_cache);
+    RUN_TEST(config_save_atomically_replaces_symlink);
 
     /* Embedded assets (stub) */
     RUN_TEST(embedded_lookup_not_found);

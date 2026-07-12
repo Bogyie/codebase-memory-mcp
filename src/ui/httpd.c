@@ -8,6 +8,7 @@
 #include "ui/httpd.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -24,6 +25,7 @@ typedef SOCKET cbm_sock_t;
 #else
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -47,11 +49,13 @@ struct cbm_httpd {
     cbm_sock_t fd;
     int port;
     int recv_deadline_ms;
+    int send_deadline_ms;
 };
 
 struct cbm_http_conn {
     cbm_sock_t fd;
     int recv_deadline_ms;
+    int send_deadline_ms;
     int response_status;
     size_t response_bytes;
 };
@@ -93,14 +97,44 @@ static int wait_readable(cbm_sock_t fd, int timeout_ms) {
 #endif
 }
 
-static int send_all(cbm_sock_t fd, const void *data, size_t len) {
+static int wait_writable(cbm_sock_t fd, int timeout_ms) {
+#ifdef _WIN32
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    int rc = select(0, NULL, &wfds, NULL, &tv);
+    return rc < 0 ? -1 : (rc > 0 ? 1 : 0);
+#else
+    struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+    int rc;
+    do {
+        rc = poll(&pfd, 1, timeout_ms);
+    } while (rc < 0 && errno == EINTR);
+    return rc < 0 ? -1 : (rc > 0 ? 1 : 0);
+#endif
+}
+
+static int send_all(cbm_sock_t fd, const void *data, size_t len, int deadline_ms) {
     const char *p = data;
     size_t off = 0;
+    int64_t deadline = now_ms() + deadline_ms;
     while (off < len) {
+        int64_t remaining_ms = deadline - now_ms();
+        if (remaining_ms <= 0 || wait_writable(fd, (int)remaining_ms) != 1)
+            return -1;
 #ifdef _WIN32
-        int n = send(fd, p + off, (int)(len - off), CBM_SEND_FLAGS);
+        size_t remaining = len - off;
+        int chunk = remaining > (size_t)INT_MAX ? INT_MAX : (int)remaining;
+        int n = send(fd, p + off, chunk, CBM_SEND_FLAGS);
+        if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK)
+            continue;
 #else
         ssize_t n = send(fd, p + off, len - off, CBM_SEND_FLAGS);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+            continue;
 #endif
         if (n <= 0)
             return -1;
@@ -121,9 +155,19 @@ cbm_httpd_t *cbm_httpd_listen(int port) {
     }
 #endif
 
-    cbm_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    int socket_type = SOCK_STREAM;
+#if !defined(_WIN32) && defined(SOCK_CLOEXEC)
+    socket_type |= SOCK_CLOEXEC;
+#endif
+    cbm_sock_t fd = socket(AF_INET, socket_type, 0);
     if (fd == CBM_SOCK_BAD)
         return NULL;
+#ifndef _WIN32
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+        cbm_sock_close(fd);
+        return NULL;
+    }
+#endif
 
     /* POSIX: SO_REUSEADDR only permits rebinding a TIME_WAIT port.
      * Windows: SO_REUSEADDR would let ANY local user hijack the port, so
@@ -163,7 +207,13 @@ cbm_httpd_t *cbm_httpd_listen(int port) {
     d->fd = fd;
     d->port = (int)ntohs(bound.sin_port);
     d->recv_deadline_ms = CBM_HTTP_RECV_DEADLINE_MS;
+    d->send_deadline_ms = CBM_HTTP_SEND_DEADLINE_MS;
     return d;
+}
+
+void cbm_httpd_set_send_deadline_ms(cbm_httpd_t *d, int ms) {
+    if (d && ms > 0)
+        d->send_deadline_ms = ms;
 }
 
 int cbm_httpd_port(const cbm_httpd_t *d) {
@@ -194,6 +244,22 @@ cbm_http_conn_t *cbm_httpd_accept(cbm_httpd_t *d, int timeout_ms) {
     if (cfd == CBM_SOCK_BAD)
         return NULL;
 
+#ifdef _WIN32
+    u_long nonblocking = 1;
+    if (ioctlsocket(cfd, FIONBIO, &nonblocking) != 0) {
+        cbm_sock_close(cfd);
+        return NULL;
+    }
+#else
+    int fd_flags = fcntl(cfd, F_GETFD, 0);
+    int status_flags = fcntl(cfd, F_GETFL, 0);
+    if (fd_flags < 0 || status_flags < 0 || fcntl(cfd, F_SETFD, fd_flags | FD_CLOEXEC) != 0 ||
+        fcntl(cfd, F_SETFL, status_flags | O_NONBLOCK) != 0) {
+        cbm_sock_close(cfd);
+        return NULL;
+    }
+#endif
+
     int one = 1;
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
 #ifdef SO_NOSIGPIPE
@@ -207,6 +273,7 @@ cbm_http_conn_t *cbm_httpd_accept(cbm_httpd_t *d, int timeout_ms) {
     }
     c->fd = cfd;
     c->recv_deadline_ms = d->recv_deadline_ms;
+    c->send_deadline_ms = d->send_deadline_ms;
     return c;
 }
 
@@ -228,26 +295,45 @@ size_t cbm_http_conn_response_bytes(const cbm_http_conn_t *c) {
 /* ── Head parsing ─────────────────────────────────────────────── */
 
 static bool header_name_is(const char *line, size_t name_len, const char *name) {
+    size_t expected_len = strlen(name);
+    if (name_len != expected_len)
+        return false;
     for (size_t i = 0; i < name_len; i++) {
         if (tolower((unsigned char)line[i]) != name[i])
             return false;
     }
-    return name[name_len] == '\0' ? true : false;
+    return true;
 }
 
 /* Copy a trimmed header value into out. */
-static void copy_header_value(const char *val, const char *val_end, char *out, size_t outsz) {
+static bool copy_header_value(const char *val, const char *val_end, char *out, size_t outsz) {
     while (val < val_end && (*val == ' ' || *val == '\t'))
         val++;
     while (val_end > val && (val_end[-1] == ' ' || val_end[-1] == '\t'))
         val_end--;
     size_t n = (size_t)(val_end - val);
     if (n >= outsz) {
-        out[0] = '\0'; /* oversize values are ignored, never truncated */
-        return;
+        out[0] = '\0';
+        return false;
     }
     memcpy(out, val, n);
     out[n] = '\0';
+    return true;
+}
+
+static bool valid_header_name(const char *name, size_t len) {
+    if (len == 0)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)name[i];
+        if (isalnum(ch) || ch == '!' || ch == '#' || ch == '$' || ch == '%' || ch == '&' ||
+            ch == '\'' || ch == '*' || ch == '+' || ch == '-' || ch == '.' || ch == '^' ||
+            ch == '_' || ch == '`' || ch == '|' || ch == '~') {
+            continue;
+        }
+        return false;
+    }
+    return true;
 }
 
 int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_t *body_offset,
@@ -257,12 +343,14 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
     *content_length = 0;
 
     /* Scan for the CRLFCRLF terminator. While scanning, enforce the strict
-     * byte rules: no raw NUL, no LF that is not preceded by CR. */
+     * byte rules: no raw NUL, bare CR, or bare LF. */
     size_t scan = len < CBM_HTTP_MAX_HEAD ? len : CBM_HTTP_MAX_HEAD;
     size_t head_end = 0; /* offset just past CRLFCRLF */
     for (size_t i = 0; i < scan; i++) {
         char ch = data[i];
         if (ch == '\0')
+            return 400;
+        if (ch == '\r' && i + 1 < scan && data[i + 1] != '\n')
             return 400;
         if (ch == '\n' && (i == 0 || data[i - 1] != '\r'))
             return 400;
@@ -302,6 +390,7 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
     /* Exactly HTTP/1.0 or HTTP/1.1 */
     if (vlen != 8 || memcmp(version, "HTTP/1.", 7) != 0 || (version[7] != '0' && version[7] != '1'))
         return 400;
+    bool host_required = version[7] == '1';
 
     size_t tlen = (size_t)(sp2 - target);
     if (tlen == 0 || target[0] != '/')
@@ -329,6 +418,10 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
 
     /* ── Header fields ── */
     bool have_content_length = false;
+    bool have_origin = false;
+    bool have_host = false;
+    bool have_content_type = false;
+    bool have_accept_language = false;
     const char *p = line_end + 2;
     const char *head_stop = data + head_end - 2; /* start of final CRLF */
     while (p < head_stop) {
@@ -339,28 +432,53 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
         if (!colon)
             return 400;
         size_t nlen = (size_t)(colon - p);
+        if (!valid_header_name(p, nlen))
+            return 400;
+        for (const char *v = colon + 1; v < eol; v++) {
+            unsigned char ch = (unsigned char)*v;
+            if ((ch < 0x20 && ch != '\t') || ch == 0x7f)
+                return 400;
+        }
 
         if (header_name_is(p, nlen, "origin")) {
-            copy_header_value(colon + 1, eol, req->origin, sizeof(req->origin));
+            if (have_origin || !copy_header_value(colon + 1, eol, req->origin, sizeof(req->origin)))
+                return have_origin ? 400 : 431;
+            if (req->origin[0] == '\0')
+                return 400;
+            have_origin = true;
         } else if (header_name_is(p, nlen, "host")) {
-            copy_header_value(colon + 1, eol, req->host, sizeof(req->host));
+            if (have_host || !copy_header_value(colon + 1, eol, req->host, sizeof(req->host)))
+                return have_host ? 400 : 431;
+            if (req->host[0] == '\0')
+                return 400;
+            have_host = true;
+        } else if (header_name_is(p, nlen, "content-type")) {
+            if (have_content_type ||
+                !copy_header_value(colon + 1, eol, req->content_type, sizeof(req->content_type)))
+                return have_content_type ? 400 : 431;
+            have_content_type = true;
         } else if (header_name_is(p, nlen, "accept-language")) {
-            copy_header_value(colon + 1, eol, req->accept_language, sizeof(req->accept_language));
+            if (have_accept_language || !copy_header_value(colon + 1, eol, req->accept_language,
+                                                           sizeof(req->accept_language)))
+                return have_accept_language ? 400 : 431;
+            have_accept_language = true;
         } else if (header_name_is(p, nlen, "transfer-encoding")) {
             /* Chunked (or any transfer coding) is not supported. */
             return 411;
         } else if (header_name_is(p, nlen, "content-length")) {
             char val[32];
-            copy_header_value(colon + 1, eol, val, sizeof(val));
+            if (!copy_header_value(colon + 1, eol, val, sizeof(val)))
+                return 431;
             if (val[0] == '\0')
                 return 400;
             uint64_t cl = 0;
             for (const char *v = val; *v; v++) {
                 if (!isdigit((unsigned char)*v))
                     return 400;
-                cl = cl * 10 + (uint64_t)(*v - '0');
-                if (cl > (uint64_t)CBM_HTTP_MAX_BODY)
+                uint64_t digit = (uint64_t)(*v - '0');
+                if (cl > ((uint64_t)CBM_HTTP_MAX_BODY - digit) / 10U)
                     return 413;
+                cl = cl * 10U + digit;
             }
             if (have_content_length && cl != (uint64_t)*content_length)
                 return 400; /* conflicting duplicates */
@@ -369,6 +487,11 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
         }
         p = eol + 2;
     }
+
+    /* RFC 9112 requires exactly one non-empty Host field in HTTP/1.1. HTTP/1.0
+     * remains available to local diagnostic clients that intentionally omit it. */
+    if (host_required && !have_host)
+        return 400;
 
     *body_offset = head_end;
     return 0;
@@ -505,6 +628,8 @@ static const char *status_reason(int status) {
         return "Length Required";
     case 413:
         return "Content Too Large";
+    case 415:
+        return "Unsupported Media Type";
     case 429:
         return "Too Many Requests";
     case 431:
@@ -532,10 +657,10 @@ void cbm_http_reply_buf(cbm_http_conn_t *c, int status, const char *extra_header
                       status, status_reason(status), extra_headers ? extra_headers : "", len);
     if (hn < 0 || hn >= (int)sizeof(head))
         return; /* oversized extra_headers — drop the response, conn closes */
-    if (send_all(c->fd, head, (size_t)hn) != 0)
+    if (send_all(c->fd, head, (size_t)hn, c->send_deadline_ms) != 0)
         return;
     if (len > 0)
-        (void)send_all(c->fd, data, len);
+        (void)send_all(c->fd, data, len, c->send_deadline_ms);
 }
 
 void cbm_http_replyf(cbm_http_conn_t *c, int status, const char *extra_headers, const char *fmt,

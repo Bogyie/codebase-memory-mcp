@@ -15,6 +15,13 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     globals: true,
+    // Node 25 exposes an incomplete process-global Web Storage shim unless a
+    // persistence file is configured. jsdom supplies the storage used by the
+    // tests, so disable only that Node shim in workers when the runtime knows
+    // the flag; this also keeps older supported Node versions compatible.
+    execArgv: process.allowedNodeEnvironmentFlags.has("--no-experimental-webstorage")
+      ? ["--no-experimental-webstorage"]
+      : [],
   },
   build: {
     outDir: "dist",
