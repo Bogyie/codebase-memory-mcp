@@ -1,5 +1,9 @@
 # Global Memory Architecture
 
+> Looking for setup and task-oriented examples? Start with
+> [Using Global Memory](GLOBAL_MEMORY_GUIDE.md). This document defines the underlying storage,
+> epistemic, temporal, concurrency, and sharing contracts.
+
 Status: implementation contract for phases 0-5 (sharing scope limited as described below).
 
 ## Scope

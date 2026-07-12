@@ -30,4 +30,4 @@ Allow: /
 User-agent: Bingbot
 Allow: /
 
-Sitemap: https://deusdata.github.io/codebase-memory-mcp/sitemap.xml
+Sitemap: https://bogyie.github.io/codebase-memory-mcp/sitemap.xml
