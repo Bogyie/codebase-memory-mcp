@@ -15,6 +15,9 @@
 #include "foundation/sha256.h"
 #include "foundation/str_util.h"
 #include "foundation/subprocess.h"
+#ifdef _WIN32
+#include "foundation/win_utf8.h"
+#endif
 
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
@@ -94,6 +97,23 @@ typedef enum {
     MERGE_KEEP_REMOTE,
     MERGE_NEWEST,
 } merge_policy_t;
+
+typedef struct {
+    char *target;
+    char *staged;
+    char hash[CBM_SHA256_HEX_LEN + 1];
+    bool installed;
+} raw_stage_item_t;
+
+typedef struct {
+    raw_stage_item_t *items;
+    size_t count;
+    size_t capacity;
+    char root[MEM_SHARE_PATH_CAP];
+    char dir[MEM_SHARE_PATH_CAP];
+    int added;
+    int skipped;
+} raw_bundle_stage_t;
 
 static char *share_strdup(const char *s) {
     if (!s) {
@@ -228,7 +248,36 @@ static unsigned char *read_file(const char *path, size_t max_size, size_t *out_l
     return data;
 }
 
-static int write_atomic(const char *path, const void *data, size_t len) {
+/* Atomically expose an already-written file only when the destination does not
+ * exist.  Staging and destination are always on the same filesystem. */
+static int link_no_replace(const char *staged, const char *target) {
+#ifdef _WIN32
+    wchar_t *wide_staged = cbm_utf8_to_wide(staged);
+    wchar_t *wide_target = cbm_utf8_to_wide(target);
+    if (!wide_staged || !wide_target) {
+        free(wide_staged);
+        free(wide_target);
+        return -1;
+    }
+    BOOL linked = CreateHardLinkW(wide_target, wide_staged, NULL);
+    DWORD error = linked ? ERROR_SUCCESS : GetLastError();
+    free(wide_staged);
+    free(wide_target);
+    if (linked) {
+        return 0;
+    }
+    return error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS ? 1 : -1;
+#else
+    if (link(staged, target) == 0) {
+        return 0;
+    }
+    return errno == EEXIST ? 1 : -1;
+#endif
+}
+
+/* Returns 0 on success, 1 when overwrite=false and the destination already
+ * exists, and -1 for all other failures. */
+static int write_atomic_mode(const char *path, const void *data, size_t len, bool overwrite) {
     char dir[MEM_SHARE_PATH_CAP];
     if (!parent_dir(path, dir, sizeof(dir)) || !cbm_mkdir_p(dir, MEM_SHARE_DIR_MODE)) {
         return -1;
@@ -268,9 +317,17 @@ static int write_atomic(const char *path, const void *data, size_t len) {
         return -1;
     }
 #endif
-    if (cbm_rename_replace(temp, path) != 0) {
+    if (overwrite) {
+        if (cbm_rename_replace(temp, path) != 0) {
+            cbm_unlink(temp);
+            return -1;
+        }
+    } else {
+        int install_rc = link_no_replace(temp, path);
         cbm_unlink(temp);
-        return -1;
+        if (install_rc != 0) {
+            return install_rc;
+        }
     }
 #ifndef _WIN32
     /* Persist the rename itself when the filesystem supports directory fsync. */
@@ -281,6 +338,10 @@ static int write_atomic(const char *path, const void *data, size_t len) {
     }
 #endif
     return 0;
+}
+
+static int write_atomic(const char *path, const void *data, size_t len) {
+    return write_atomic_mode(path, data, len, true);
 }
 
 static char hex_digit(unsigned int value) {
@@ -691,6 +752,120 @@ static yyjson_mut_val *export_raw_objects(yyjson_mut_doc *doc, sqlite3 *db, cons
     return objects;
 }
 
+typedef enum {
+    SHARE_PATH_MISSING = 0,
+    SHARE_PATH_REGULAR,
+    SHARE_PATH_UNSAFE,
+} share_path_kind_t;
+
+static bool share_target_parent(const char *path, char parent[MEM_SHARE_PATH_CAP]) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    int n = snprintf(parent, MEM_SHARE_PATH_CAP, "%s", path);
+    if (n < 0 || (size_t)n >= MEM_SHARE_PATH_CAP) {
+        return false;
+    }
+    char *slash = strrchr(parent, '/');
+#ifdef _WIN32
+    char *backslash = strrchr(parent, '\\');
+    if (backslash && (!slash || backslash > slash)) {
+        slash = backslash;
+    }
+#endif
+    const char *name = slash ? slash + 1 : path;
+    if (!name[0] || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return false;
+    }
+    if (!slash) {
+        memcpy(parent, ".", 2);
+    } else if (slash == parent) {
+        slash[1] = '\0';
+#ifdef _WIN32
+    } else if (slash == parent + 2 && parent[1] == ':') {
+        slash[1] = '\0';
+#endif
+    } else {
+        *slash = '\0';
+    }
+    return true;
+}
+
+static bool canonical_path_within(const char *root, const char *candidate) {
+    size_t root_len = strlen(root);
+    size_t candidate_len = strlen(candidate);
+    if (candidate_len < root_len) {
+        return false;
+    }
+    for (size_t i = 0; i < root_len; i++) {
+        unsigned char left = (unsigned char)root[i];
+        unsigned char right = (unsigned char)candidate[i];
+#ifdef _WIN32
+        if (left == '/') {
+            left = '\\';
+        }
+        if (right == '/') {
+            right = '\\';
+        }
+        left = (unsigned char)tolower(left);
+        right = (unsigned char)tolower(right);
+#endif
+        if (left != right) {
+            return false;
+        }
+    }
+    if (candidate_len == root_len) {
+        return true;
+    }
+    return candidate[root_len] == '/' || candidate[root_len] == '\\';
+}
+
+static bool share_path_scope(cbm_memory_t *memory, const char *path, bool *inside_home,
+                             const char **error) {
+    char parent[MEM_SHARE_PATH_CAP];
+    char canonical_parent[MEM_SHARE_PATH_CAP];
+    char canonical_home[MEM_SHARE_PATH_CAP];
+    if (!share_target_parent(path, parent)) {
+        *error = "invalid share path";
+        return false;
+    }
+    if (!cbm_canonical_path(parent, canonical_parent, sizeof(canonical_parent))) {
+        *error = "share path parent directory must exist";
+        return false;
+    }
+    if (!cbm_canonical_path(cbm_memory_home(memory), canonical_home, sizeof(canonical_home))) {
+        *error = "cannot resolve memory home";
+        return false;
+    }
+    *inside_home = canonical_path_within(canonical_home, canonical_parent);
+    return true;
+}
+
+static share_path_kind_t share_path_kind(const char *path) {
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return SHARE_PATH_UNSAFE;
+    }
+    DWORD attributes = GetFileAttributesW(wide);
+    DWORD error = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    free(wide);
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? SHARE_PATH_MISSING
+                                                                              : SHARE_PATH_UNSAFE;
+    }
+    return (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0
+               ? SHARE_PATH_REGULAR
+               : SHARE_PATH_UNSAFE;
+#else
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        return errno == ENOENT ? SHARE_PATH_MISSING : SHARE_PATH_UNSAFE;
+    }
+    return S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode) ? SHARE_PATH_REGULAR : SHARE_PATH_UNSAFE;
+#endif
+}
+
 static bool default_export_path(cbm_memory_t *memory, char *out, size_t cap) {
     return path_join(out, cap, cbm_memory_home(memory), "export/memory-export.json");
 }
@@ -705,6 +880,9 @@ char *cbm_memory_export_json(cbm_memory_t *memory, const char *args_json) {
     }
     yyjson_val *args = yyjson_doc_get_root(args_doc);
     const char *requested = json_string(args, "path");
+    bool user_approved = json_bool(args, "user_approved", false);
+    bool allow_external_path = json_bool(args, "allow_external_path", false);
+    bool overwrite = json_bool(args, "overwrite", false);
     char path[MEM_SHARE_PATH_CAP];
     if (requested) {
         if (snprintf(path, sizeof(path), "%s", requested) < 0 ||
@@ -715,6 +893,31 @@ char *cbm_memory_export_json(cbm_memory_t *memory, const char *args_json) {
     } else if (!default_export_path(memory, path, sizeof(path))) {
         yyjson_doc_free(args_doc);
         return share_json_result(false, "cannot construct export path", NULL, -1, -1, 0, 0, 0);
+    }
+    const char *path_error = NULL;
+    bool inside_home = false;
+    if (!share_path_scope(memory, path, &inside_home, &path_error)) {
+        yyjson_doc_free(args_doc);
+        return share_json_result(false, path_error, path, -1, -1, 0, 0, 0);
+    }
+    if (!inside_home && !(user_approved && allow_external_path)) {
+        yyjson_doc_free(args_doc);
+        return share_json_result(false,
+                                 "external export path requires user_approved and "
+                                 "allow_external_path",
+                                 path, -1, -1, 0, 0, 0);
+    }
+    share_path_kind_t destination_kind = share_path_kind(path);
+    if (destination_kind == SHARE_PATH_UNSAFE) {
+        yyjson_doc_free(args_doc);
+        return share_json_result(false, "export destination must be a regular file or absent", path,
+                                 -1, -1, 0, 0, 0);
+    }
+    bool replace_existing = destination_kind == SHARE_PATH_REGULAR;
+    if (replace_existing && !(overwrite && user_approved)) {
+        yyjson_doc_free(args_doc);
+        return share_json_result(false, "overwrite requires overwrite and user_approved", path, -1,
+                                 -1, 0, 0, 0);
     }
     yyjson_doc_free(args_doc);
 
@@ -775,13 +978,16 @@ char *cbm_memory_export_json(cbm_memory_t *memory, const char *args_json) {
     if (!json) {
         return NULL;
     }
-    int rc = write_atomic(path, json, len);
+    int rc = write_atomic_mode(path, json, len, replace_existing);
     char digest[CBM_SHA256_HEX_LEN + 1];
     cbm_sha256_hex(json, len, digest);
     free(json);
     if (rc != 0) {
-        return share_json_result(false, "failed to atomically write export", path, epoch, -1, 0, 0,
-                                 0);
+        return share_json_result(false,
+                                 rc == 1
+                                     ? "export destination appeared; overwrite approval required"
+                                     : "failed to atomically write export",
+                                 path, epoch, -1, 0, 0, 0);
     }
 
     yyjson_mut_doc *result_doc = yyjson_mut_doc_new(NULL);
@@ -1060,8 +1266,173 @@ static bool validate_raw_bundle(yyjson_val *root, const char **error) {
     return true;
 }
 
-static bool install_raw_bundle(cbm_memory_t *memory, yyjson_val *root, int *added, int *skipped,
-                               const char **error) {
+/* Create a private import directory without ever joining a directory created by
+ * another process.  Raw objects are decoded here before the SQLite transaction,
+ * but no file is visible at its canonical raw/objects path yet. */
+static int create_directory_exclusive(const char *path) {
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return -1;
+    }
+    BOOL created = CreateDirectoryW(wide, NULL);
+    DWORD error = created ? ERROR_SUCCESS : GetLastError();
+    free(wide);
+    if (created) {
+        return 0;
+    }
+    return error == ERROR_ALREADY_EXISTS ? 1 : -1;
+#else
+    if (mkdir(path, MEM_SHARE_DIR_MODE) == 0) {
+        return 0;
+    }
+    return errno == EEXIST ? 1 : -1;
+#endif
+}
+
+static bool raw_stage_open(cbm_memory_t *memory, raw_bundle_stage_t *stage) {
+    if (stage->dir[0]) {
+        return true;
+    }
+    if (!path_join(stage->root, sizeof(stage->root), cbm_memory_home(memory), ".import-staging") ||
+        !cbm_mkdir_p(stage->root, MEM_SHARE_DIR_MODE)) {
+        return false;
+    }
+    for (unsigned int attempt = 0; attempt < 32; attempt++) {
+        int n = snprintf(stage->dir, sizeof(stage->dir), "%s/import-%ld-%llu-%u", stage->root,
+                         (long)share_getpid(), (unsigned long long)cbm_now_ns(), attempt);
+        if (n < 0 || (size_t)n >= sizeof(stage->dir)) {
+            stage->dir[0] = '\0';
+            return false;
+        }
+        int rc = create_directory_exclusive(stage->dir);
+        if (rc == 0) {
+            return true;
+        }
+        if (rc < 0) {
+            stage->dir[0] = '\0';
+            return false;
+        }
+    }
+    stage->dir[0] = '\0';
+    return false;
+}
+
+static bool raw_stage_reserve(raw_bundle_stage_t *stage) {
+    if (stage->count < stage->capacity) {
+        return true;
+    }
+    size_t next = stage->capacity ? stage->capacity * 2U : 8U;
+    if (next < stage->capacity || next > SIZE_MAX / sizeof(*stage->items)) {
+        return false;
+    }
+    raw_stage_item_t *items = realloc(stage->items, next * sizeof(*items));
+    if (!items) {
+        return false;
+    }
+    memset(items + stage->capacity, 0, (next - stage->capacity) * sizeof(*items));
+    stage->items = items;
+    stage->capacity = next;
+    return true;
+}
+
+static bool raw_object_matches(const char *path, const char *expected_hash) {
+    size_t len = 0;
+    unsigned char *data = read_file(path, MEM_SHARE_RAW_MAX, &len);
+    if (!data) {
+        return false;
+    }
+    char actual[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(data, len, actual);
+    free(data);
+    return strcmp(actual, expected_hash) == 0;
+}
+
+static bool raw_paths_are_same_file(const char *left, const char *right) {
+#ifdef _WIN32
+    wchar_t *wide_left = cbm_utf8_to_wide(left);
+    wchar_t *wide_right = cbm_utf8_to_wide(right);
+    if (!wide_left || !wide_right) {
+        free(wide_left);
+        free(wide_right);
+        return false;
+    }
+    HANDLE left_handle =
+        CreateFileW(wide_left, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE right_handle =
+        CreateFileW(wide_right, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wide_left);
+    free(wide_right);
+    BY_HANDLE_FILE_INFORMATION left_info;
+    BY_HANDLE_FILE_INFORMATION right_info;
+    bool same = left_handle != INVALID_HANDLE_VALUE && right_handle != INVALID_HANDLE_VALUE &&
+                GetFileInformationByHandle(left_handle, &left_info) &&
+                GetFileInformationByHandle(right_handle, &right_info) &&
+                left_info.dwVolumeSerialNumber == right_info.dwVolumeSerialNumber &&
+                left_info.nFileIndexHigh == right_info.nFileIndexHigh &&
+                left_info.nFileIndexLow == right_info.nFileIndexLow;
+    if (left_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(left_handle);
+    }
+    if (right_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(right_handle);
+    }
+    return same;
+#else
+    struct stat left_stat;
+    struct stat right_stat;
+    return stat(left, &left_stat) == 0 && stat(right, &right_stat) == 0 &&
+           left_stat.st_dev == right_stat.st_dev && left_stat.st_ino == right_stat.st_ino;
+#endif
+}
+
+static void raw_remove_empty_target_parent(const char *target) {
+    char dir[MEM_SHARE_PATH_CAP];
+    if (target && parent_dir(target, dir, sizeof(dir))) {
+        /* rmdir is deliberately non-recursive: a pre-existing directory or a
+         * concurrently populated prefix is never removed. */
+        (void)cbm_rmdir(dir);
+    }
+}
+
+static void raw_stage_dispose(raw_bundle_stage_t *stage, bool rollback_installed) {
+    if (!stage) {
+        return;
+    }
+    /* Remove only targets that are still hard links to our private staged
+     * inode.  A concurrently replaced pre-existing object is never unlinked. */
+    if (rollback_installed) {
+        for (size_t i = 0; i < stage->count; i++) {
+            raw_stage_item_t *item = &stage->items[i];
+            if (item->installed && item->staged && item->target &&
+                raw_paths_are_same_file(item->staged, item->target)) {
+                (void)cbm_unlink(item->target);
+            }
+        }
+    }
+    for (size_t i = 0; i < stage->count; i++) {
+        raw_stage_item_t *item = &stage->items[i];
+        if (item->staged) {
+            (void)cbm_unlink(item->staged);
+        }
+        raw_remove_empty_target_parent(item->target);
+        free(item->target);
+        free(item->staged);
+    }
+    if (stage->dir[0]) {
+        (void)cbm_rmdir(stage->dir);
+    }
+    if (stage->root[0]) {
+        (void)cbm_rmdir(stage->root);
+    }
+    free(stage->items);
+    memset(stage, 0, sizeof(*stage));
+}
+
+static bool stage_raw_bundle(cbm_memory_t *memory, yyjson_val *root, raw_bundle_stage_t *stage,
+                             const char **error) {
     yyjson_val *objects = yyjson_obj_get(root, "raw_objects");
     size_t index, max;
     yyjson_val *item;
@@ -1069,8 +1440,9 @@ static bool install_raw_bundle(cbm_memory_t *memory, yyjson_val *root, int *adde
         const char *path = json_string(item, "path");
         const char *hash = json_string(item, "sha256");
         const char *content = json_string(item, "content");
-        char target[MEM_SHARE_PATH_CAP];
+        char target[MEM_SHARE_PATH_CAP] = {0};
         if (!safe_object_target(cbm_memory_home(memory), path, hash, target)) {
+            raw_remove_empty_target_parent(target);
             *error = "raw object path escapes memory home";
             return false;
         }
@@ -1084,18 +1456,63 @@ static bool install_raw_bundle(cbm_memory_t *memory, yyjson_val *root, int *adde
                 *error = "immutable raw object collision";
                 return false;
             }
-            (*skipped)++;
+            stage->skipped++;
             continue;
         }
+        if (!raw_stage_open(memory, stage) || !raw_stage_reserve(stage)) {
+            raw_remove_empty_target_parent(target);
+            *error = "failed to create raw object staging area";
+            return false;
+        }
+        raw_stage_item_t *staged_item = &stage->items[stage->count];
+        char staged_path[MEM_SHARE_PATH_CAP];
+        int n =
+            snprintf(staged_path, sizeof(staged_path), "%s/object-%zu", stage->dir, stage->count);
+        if (n < 0 || (size_t)n >= sizeof(staged_path)) {
+            raw_remove_empty_target_parent(target);
+            *error = "raw object staging path is too long";
+            return false;
+        }
+        char *target_copy = share_strdup(target);
+        char *staged_copy = share_strdup(staged_path);
+        if (!target_copy || !staged_copy) {
+            free(target_copy);
+            free(staged_copy);
+            raw_remove_empty_target_parent(target);
+            *error = "out of memory while staging raw object";
+            return false;
+        }
+        staged_item->target = target_copy;
+        staged_item->staged = staged_copy;
+        memcpy(staged_item->hash, hash, CBM_SHA256_HEX_LEN + 1);
+        stage->count++;
         size_t len = 0;
         unsigned char *data = hex_decode(content, &len);
-        if (!data || write_atomic(target, data, len) != 0) {
+        if (!data || write_atomic(staged_path, data, len) != 0) {
             free(data);
-            *error = "failed to install raw object";
+            *error = "failed to stage raw object";
             return false;
         }
         free(data);
-        (*added)++;
+    }
+    return true;
+}
+
+static bool promote_raw_bundle(raw_bundle_stage_t *stage, const char **error) {
+    for (size_t i = 0; i < stage->count; i++) {
+        raw_stage_item_t *item = &stage->items[i];
+        int rc = link_no_replace(item->staged, item->target);
+        if (rc == 0) {
+            item->installed = true;
+            stage->added++;
+            continue;
+        }
+        if (rc == 1 && raw_object_matches(item->target, item->hash)) {
+            stage->skipped++;
+            continue;
+        }
+        *error = rc == 1 ? "immutable raw object collision" : "failed to install raw object";
+        return false;
     }
     return true;
 }
@@ -2048,6 +2465,8 @@ char *cbm_memory_import_json(cbm_memory_t *memory, const char *args_json) {
     yyjson_val *args = yyjson_doc_get_root(args_doc);
     const char *requested = json_string(args, "path");
     const char *policy_name = json_string(args, "policy");
+    bool user_approved = json_bool(args, "user_approved", false);
+    bool allow_external_path = json_bool(args, "allow_external_path", false);
     bool policy_valid = false;
     merge_policy_t policy = parse_policy(policy_name, &policy_valid);
     char path[MEM_SHARE_PATH_CAP];
@@ -2064,6 +2483,24 @@ char *cbm_memory_import_json(cbm_memory_t *memory, const char *args_json) {
     } else if (!default_export_path(memory, path, sizeof(path))) {
         yyjson_doc_free(args_doc);
         return share_json_result(false, "cannot construct import path", NULL, -1, 0, 0, 0, 0);
+    }
+    const char *path_error = NULL;
+    bool inside_home = false;
+    if (!share_path_scope(memory, path, &inside_home, &path_error)) {
+        yyjson_doc_free(args_doc);
+        return share_json_result(false, path_error, path, -1, 0, 0, 0, 0);
+    }
+    if (!inside_home && !(user_approved && allow_external_path)) {
+        yyjson_doc_free(args_doc);
+        return share_json_result(false,
+                                 "external import path requires user_approved and "
+                                 "allow_external_path",
+                                 path, -1, 0, 0, 0, 0);
+    }
+    if (share_path_kind(path) != SHARE_PATH_REGULAR) {
+        yyjson_doc_free(args_doc);
+        return share_json_result(false, "import bundle must be a regular non-symlink file", path,
+                                 -1, 0, 0, 0, 0);
     }
     yyjson_doc_free(args_doc);
 
@@ -2089,22 +2526,32 @@ char *cbm_memory_import_json(cbm_memory_t *memory, const char *args_json) {
         return share_json_result(false, error, path, -1, 0, 0, 0, 0);
     }
 
-    int added = 0;
-    int skipped = 0;
+    raw_bundle_stage_t raw_stage = {0};
     int updated = 0;
-    if (!install_raw_bundle(memory, root, &added, &skipped, &error)) {
+    if (!stage_raw_bundle(memory, root, &raw_stage, &error)) {
+        int skipped = raw_stage.skipped;
+        raw_stage_dispose(&raw_stage, true);
         yyjson_doc_free(bundle_doc);
-        return share_json_result(false, error, path, -1, added, skipped, updated, 0);
+        return share_json_result(false, error, path, -1, 0, skipped, updated, 0);
     }
 
     sqlite3 *db = cbm_memory_db(memory);
     conflict_list_t conflicts = {0};
     blocked_list_t blocked = {0};
-    if (!db || sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK ||
-        sqlite3_exec(db, "PRAGMA defer_foreign_keys=ON;", NULL, NULL, NULL) != SQLITE_OK) {
+    if (!db || sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        int skipped = raw_stage.skipped;
+        raw_stage_dispose(&raw_stage, true);
         yyjson_doc_free(bundle_doc);
-        return share_json_result(false, "cannot begin memory import", path, -1, added, skipped,
-                                 updated, 0);
+        return share_json_result(false, "cannot begin memory import", path, -1, 0, skipped, updated,
+                                 0);
+    }
+    if (sqlite3_exec(db, "PRAGMA defer_foreign_keys=ON;", NULL, NULL, NULL) != SQLITE_OK) {
+        (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        int skipped = raw_stage.skipped;
+        raw_stage_dispose(&raw_stage, true);
+        yyjson_doc_free(bundle_doc);
+        return share_json_result(false, "cannot configure memory import transaction", path, -1, 0,
+                                 skipped, updated, 0);
     }
     int db_added = 0;
     int db_skipped = 0;
@@ -2129,18 +2576,23 @@ char *cbm_memory_import_json(cbm_memory_t *memory, const char *args_json) {
         import_rc = -1;
         error = "failed to enqueue imported wiki materialization";
     }
+    if (import_rc == 0 && !promote_raw_bundle(&raw_stage, &error)) {
+        import_rc = -1;
+    }
     if (import_rc == 0 && !import_state_integrity_ok(db, cbm_memory_home(memory))) {
         import_rc = -1;
         error = "import would violate canonical memory integrity";
     }
     if (import_rc != 0) {
         (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        int skipped = raw_stage.skipped;
+        raw_stage_dispose(&raw_stage, true);
         yyjson_doc_free(bundle_doc);
         char *response =
             import_response(false,
                             import_rc == 1 ? "semantic conflict rejected"
                                            : (error ? error : "failed to merge import rows"),
-                            path, cbm_memory_snapshot_epoch(memory), added, skipped + db_skipped,
+                            path, cbm_memory_snapshot_epoch(memory), 0, skipped + db_skipped,
                             updated, &conflicts, NULL, false);
         conflict_list_free(&conflicts);
         blocked_list_free(&blocked);
@@ -2153,22 +2605,29 @@ char *cbm_memory_import_json(cbm_memory_t *memory, const char *args_json) {
                      " updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE singleton=1;",
                      NULL, NULL, NULL) != SQLITE_OK) {
         (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        int skipped = raw_stage.skipped;
+        raw_stage_dispose(&raw_stage, true);
         yyjson_doc_free(bundle_doc);
         int conflict_count = conflicts.count;
         conflict_list_free(&conflicts);
         blocked_list_free(&blocked);
-        return share_json_result(false, "failed to advance memory epoch", path, -1, added,
+        return share_json_result(false, "failed to advance memory epoch", path, -1, 0,
                                  skipped + db_skipped, updated, conflict_count);
     }
     if (sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
         (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        int skipped = raw_stage.skipped;
+        raw_stage_dispose(&raw_stage, true);
         yyjson_doc_free(bundle_doc);
         int conflict_count = conflicts.count;
         conflict_list_free(&conflicts);
         blocked_list_free(&blocked);
-        return share_json_result(false, "failed to commit memory import", path, -1, added,
+        return share_json_result(false, "failed to commit memory import", path, -1, 0,
                                  skipped + db_skipped, updated, conflict_count);
     }
+    int added = raw_stage.added;
+    int skipped = raw_stage.skipped;
+    raw_stage_dispose(&raw_stage, false);
     yyjson_doc_free(bundle_doc);
 
     added += db_added;
@@ -2437,6 +2896,8 @@ static char *call_export_path(cbm_memory_t *memory, const char *path) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_strcpy(doc, root, "path", path);
+    yyjson_mut_obj_add_bool(doc, root, "overwrite", true);
+    yyjson_mut_obj_add_bool(doc, root, "user_approved", true);
     char *args = yyjson_mut_write(doc, 0, NULL);
     yyjson_mut_doc_free(doc);
     if (!args) {

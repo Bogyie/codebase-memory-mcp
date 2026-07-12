@@ -5,6 +5,7 @@
 #include "test_helpers.h"
 
 #include "foundation/compat_fs.h"
+#include "foundation/platform.h"
 #include "foundation/sha256.h"
 #include "memory/memory.h"
 #include "memory/memory_share.h"
@@ -18,6 +19,7 @@
 #include <string.h>
 #ifndef _WIN32
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 enum { SHARE_TEST_PATH = 1024 };
@@ -84,8 +86,47 @@ static int query_count(cbm_memory_t *memory, const char *table) {
     return count;
 }
 
-static int seed_raw_source(cbm_memory_t *memory) {
-    static const char content[] = "portable raw source\n";
+static void raw_object_path(char out[SHARE_TEST_PATH], const char *home, const char *content) {
+    char hash[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(content, strlen(content), hash);
+    snprintf(out, SHARE_TEST_PATH, "%s/raw/objects/%.2s/%s.md", home, hash, hash);
+}
+
+static bool raw_object_matches_text(const char *home, const char *content) {
+    char path[SHARE_TEST_PATH];
+    raw_object_path(path, home, content);
+    char *actual = read_text(path);
+    bool matches = actual && strcmp(actual, content) == 0;
+    free(actual);
+    return matches;
+}
+
+static bool raw_object_exists(const char *home, const char *content) {
+    char path[SHARE_TEST_PATH];
+    raw_object_path(path, home, content);
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file) {
+        return false;
+    }
+    fclose(file);
+    return true;
+}
+
+static bool raw_prefix_dir_absent(const char *home, const char *content) {
+    char hash[CBM_SHA256_HEX_LEN + 1];
+    char path[SHARE_TEST_PATH];
+    cbm_sha256_hex(content, strlen(content), hash);
+    snprintf(path, sizeof(path), "%s/raw/objects/%.2s", home, hash);
+    return !cbm_is_dir(path);
+}
+
+static bool import_staging_absent(const char *home) {
+    char path[SHARE_TEST_PATH];
+    snprintf(path, sizeof(path), "%s/.import-staging", home);
+    return !cbm_is_dir(path);
+}
+
+static int seed_named_raw_source(cbm_memory_t *memory, const char *source_id, const char *content) {
     char hash[CBM_SHA256_HEX_LEN + 1];
     cbm_sha256_hex(content, strlen(content), hash);
     char relative[SHARE_TEST_PATH];
@@ -98,17 +139,22 @@ static int seed_raw_source(cbm_memory_t *memory) {
     sqlite3_stmt *statement = NULL;
     const char *sql =
         "INSERT INTO memory_sources(source_id,content_hash,object_relpath,title,origin,media_type,"
-        " retrieved_at,byte_size,created_at) VALUES('source:portable',?1,?2,'Portable source',"
-        " 'test://portable','text/markdown','2026-01-01T00:00:00Z',?3,'2026-01-01T00:00:00Z')";
+        " retrieved_at,byte_size,created_at) VALUES(?1,?2,?3,'Portable source',"
+        " 'test://portable','text/markdown','2026-01-01T00:00:00Z',?4,'2026-01-01T00:00:00Z')";
     if (sqlite3_prepare_v2(cbm_memory_db(memory), sql, -1, &statement, NULL) != SQLITE_OK) {
         return -1;
     }
-    sqlite3_bind_text(statement, 1, hash, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(statement, 2, relative, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(statement, 3, (sqlite3_int64)strlen(content));
+    sqlite3_bind_text(statement, 1, source_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 2, hash, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 3, relative, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(statement, 4, (sqlite3_int64)strlen(content));
     int rc = sqlite3_step(statement);
     sqlite3_finalize(statement);
     return rc == SQLITE_DONE ? 0 : -1;
+}
+
+static int seed_raw_source(cbm_memory_t *memory) {
+    return seed_named_raw_source(memory, "source:portable", "portable raw source\n");
 }
 
 static int seed_full_memory(cbm_memory_t *memory, const char *page_title, const char *ref_status,
@@ -182,14 +228,20 @@ static int seed_conflicting_page(cbm_memory_t *memory) {
 }
 
 static char *export_to(cbm_memory_t *memory, const char *path) {
-    char args[SHARE_TEST_PATH + 64];
-    snprintf(args, sizeof(args), "{\"path\":\"%s\"}", path);
+    char args[SHARE_TEST_PATH + 160];
+    snprintf(args, sizeof(args),
+             "{\"path\":\"%s\",\"overwrite\":true,\"user_approved\":true,"
+             "\"allow_external_path\":true}",
+             path);
     return cbm_memory_export_json(memory, args);
 }
 
 static char *import_from(cbm_memory_t *memory, const char *path, const char *policy) {
-    char args[SHARE_TEST_PATH + 128];
-    snprintf(args, sizeof(args), "{\"path\":\"%s\",\"policy\":\"%s\"}", path, policy);
+    char args[SHARE_TEST_PATH + 192];
+    snprintf(args, sizeof(args),
+             "{\"path\":\"%s\",\"policy\":\"%s\",\"user_approved\":true,"
+             "\"allow_external_path\":true}",
+             path, policy);
     return cbm_memory_import_json(memory, args);
 }
 
@@ -204,8 +256,9 @@ static int update_portable_page(cbm_memory_t *memory) {
         return -1;
     }
     free(proposal);
-    char *commit = cbm_memory_commit_json(memory, "{\"proposal_id\":\"proposal:portable-v2\","
-                                                  "\"operation_id\":\"operation:portable-v2\"}");
+    char *commit = cbm_memory_commit_json(
+        memory, "{\"proposal_id\":\"proposal:portable-v2\","
+                "\"operation_id\":\"operation:portable-v2\",\"user_approved\":true}");
     bool ok = result_ok(commit);
     free(commit);
     return ok ? 0 : -1;
@@ -270,6 +323,142 @@ TEST(memory_share_export_preserves_parent_permissions) {
 #endif
 }
 
+TEST(memory_share_share_paths_require_explicit_authority) {
+    char root[SHARE_TEST_PATH];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_memory_share_authority"));
+    char source_home[SHARE_TEST_PATH];
+    char target_home[SHARE_TEST_PATH];
+    char external[SHARE_TEST_PATH];
+    snprintf(source_home, sizeof(source_home), "%s/source", root);
+    snprintf(target_home, sizeof(target_home), "%s/target", root);
+    snprintf(external, sizeof(external), "%s/external.json", root);
+    cbm_memory_t *source = cbm_memory_open(source_home);
+    cbm_memory_t *target = cbm_memory_open(target_home);
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(target);
+    ASSERT_EQ(seed_full_memory(source, "Portable", "resolved", 10), 0);
+
+    char args[SHARE_TEST_PATH + 192];
+    snprintf(args, sizeof(args), "{\"path\":\"%s\"}", external);
+    char *external_denied = cbm_memory_export_json(source, args);
+    ASSERT_FALSE(result_ok(external_denied));
+    ASSERT_NULL(read_text(external));
+    snprintf(args, sizeof(args), "{\"path\":\"%s\",\"user_approved\":true}", external);
+    char *missing_opt_in = cbm_memory_export_json(source, args);
+    ASSERT_FALSE(result_ok(missing_opt_in));
+    snprintf(args, sizeof(args),
+             "{\"path\":\"%s\",\"user_approved\":true,\"allow_external_path\":true}", external);
+    char *external_allowed = cbm_memory_export_json(source, args);
+    ASSERT_TRUE(result_ok(external_allowed));
+
+    /* A second write needs a distinct overwrite authorization even though the
+     * external path itself was approved. */
+    char *overwrite_denied = cbm_memory_export_json(source, args);
+    ASSERT_FALSE(result_ok(overwrite_denied));
+    snprintf(args, sizeof(args),
+             "{\"path\":\"%s\",\"overwrite\":true,\"user_approved\":true,"
+             "\"allow_external_path\":true}",
+             external);
+    char *overwrite_allowed = cbm_memory_export_json(source, args);
+    ASSERT_TRUE(result_ok(overwrite_allowed));
+
+    snprintf(args, sizeof(args), "{\"path\":\"%s\",\"policy\":\"reject\"}", external);
+    char *import_denied = cbm_memory_import_json(target, args);
+    ASSERT_FALSE(result_ok(import_denied));
+    ASSERT_EQ(query_count(target, "memory_sources"), 0);
+    snprintf(args, sizeof(args),
+             "{\"path\":\"%s\",\"policy\":\"reject\",\"user_approved\":true,"
+             "\"allow_external_path\":true}",
+             external);
+    char *import_allowed = cbm_memory_import_json(target, args);
+    ASSERT_TRUE(result_ok(import_allowed));
+    ASSERT_EQ(query_count(target, "memory_sources"), 1);
+
+    /* Default exports stay inside memory home, but replacing even that file is
+     * still an explicit destructive action. */
+    char *default_first = cbm_memory_export_json(target, "{}");
+    char *default_denied = cbm_memory_export_json(target, "{}");
+    char *default_missing_approval = cbm_memory_export_json(target, "{\"overwrite\":true}");
+    char *default_overwrite =
+        cbm_memory_export_json(target, "{\"overwrite\":true,\"user_approved\":true}");
+    ASSERT_TRUE(result_ok(default_first));
+    ASSERT_FALSE(result_ok(default_denied));
+    ASSERT_FALSE(result_ok(default_missing_approval));
+    ASSERT_TRUE(result_ok(default_overwrite));
+
+    free(external_denied);
+    free(missing_opt_in);
+    free(external_allowed);
+    free(overwrite_denied);
+    free(overwrite_allowed);
+    free(import_denied);
+    free(import_allowed);
+    free(default_first);
+    free(default_denied);
+    free(default_missing_approval);
+    free(default_overwrite);
+    cbm_memory_close(source);
+    cbm_memory_close(target);
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(memory_share_rejects_symlink_and_nonregular_paths) {
+    char root[SHARE_TEST_PATH];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_memory_share_path_kind"));
+    char home[SHARE_TEST_PATH];
+    char bundle[SHARE_TEST_PATH];
+    char directory[SHARE_TEST_PATH];
+    snprintf(home, sizeof(home), "%s/memory", root);
+    snprintf(bundle, sizeof(bundle), "%s/bundle.json", root);
+    snprintf(directory, sizeof(directory), "%s/not-a-file", root);
+    cbm_memory_t *memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+    char *export_result = export_to(memory, bundle);
+    ASSERT_TRUE(result_ok(export_result));
+    ASSERT_TRUE(cbm_mkdir_p(directory, 0700));
+    char args[SHARE_TEST_PATH + 192];
+    snprintf(args, sizeof(args),
+             "{\"path\":\"%s\",\"overwrite\":true,\"user_approved\":true,"
+             "\"allow_external_path\":true}",
+             directory);
+    char *directory_export = cbm_memory_export_json(memory, args);
+    ASSERT_FALSE(result_ok(directory_export));
+    snprintf(args, sizeof(args),
+             "{\"path\":\"%s\",\"policy\":\"reject\",\"user_approved\":true,"
+             "\"allow_external_path\":true}",
+             directory);
+    char *directory_import = cbm_memory_import_json(memory, args);
+    ASSERT_FALSE(result_ok(directory_import));
+
+#ifndef _WIN32
+    char link_path[SHARE_TEST_PATH];
+    snprintf(link_path, sizeof(link_path), "%s/bundle-link.json", root);
+    ASSERT_EQ(symlink(bundle, link_path), 0);
+    snprintf(args, sizeof(args),
+             "{\"path\":\"%s\",\"overwrite\":true,\"user_approved\":true,"
+             "\"allow_external_path\":true}",
+             link_path);
+    char *symlink_export = cbm_memory_export_json(memory, args);
+    ASSERT_FALSE(result_ok(symlink_export));
+    snprintf(args, sizeof(args),
+             "{\"path\":\"%s\",\"policy\":\"reject\",\"user_approved\":true,"
+             "\"allow_external_path\":true}",
+             link_path);
+    char *symlink_import = cbm_memory_import_json(memory, args);
+    ASSERT_FALSE(result_ok(symlink_import));
+    free(symlink_export);
+    free(symlink_import);
+#endif
+
+    free(export_result);
+    free(directory_export);
+    free(directory_import);
+    cbm_memory_close(memory);
+    th_rmtree(root);
+    PASS();
+}
+
 TEST(memory_share_import_round_trip_is_idempotent) {
     char root[SHARE_TEST_PATH];
     snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_memory_share_roundtrip"));
@@ -291,6 +480,8 @@ TEST(memory_share_import_round_trip_is_idempotent) {
     ASSERT_EQ(query_count(target, "memory_sources"), 1);
     ASSERT_EQ(query_count(target, "memory_pages"), 1);
     ASSERT_EQ(query_count(target, "memory_preferences"), 1);
+    ASSERT_TRUE(raw_object_matches_text(target_home, "portable raw source\n"));
+    ASSERT_TRUE(import_staging_absent(target_home));
     char wiki_path[SHARE_TEST_PATH];
     snprintf(wiki_path, sizeof(wiki_path), "%s/wiki/concept/portable.md", target_home);
     char *wiki = read_text(wiki_path);
@@ -300,6 +491,8 @@ TEST(memory_share_import_round_trip_is_idempotent) {
     char *second = import_from(target, bundle, "reject");
     ASSERT_TRUE(result_ok(second));
     ASSERT_EQ(result_int(second, "added"), 0);
+    ASSERT_TRUE(raw_object_matches_text(target_home, "portable raw source\n"));
+    ASSERT_TRUE(import_staging_absent(target_home));
     free(export_result);
     free(first);
     free(second);
@@ -410,6 +603,9 @@ TEST(memory_share_reject_rolls_back_canonical_rows) {
     ASSERT_FALSE(result_ok(result));
     ASSERT_EQ(query_count(target, "memory_sources"), 0);
     ASSERT_EQ(query_count(target, "memory_pages"), 1);
+    ASSERT_FALSE(raw_object_exists(target_home, "portable raw source\n"));
+    ASSERT_TRUE(raw_prefix_dir_absent(target_home, "portable raw source\n"));
+    ASSERT_TRUE(import_staging_absent(target_home));
     free(export_result);
     free(result);
     cbm_memory_close(source);
@@ -565,9 +761,96 @@ TEST(memory_share_rejects_broken_relation_endpoint_atomically) {
     ASSERT_FALSE(result_ok(result));
     ASSERT_EQ(query_count(target, "memory_sources"), 0);
     ASSERT_EQ(query_count(target, "memory_relations"), 0);
+    ASSERT_FALSE(raw_object_exists(target_home, "portable raw source\n"));
+    ASSERT_TRUE(raw_prefix_dir_absent(target_home, "portable raw source\n"));
+    ASSERT_TRUE(import_staging_absent(target_home));
     free(result);
     free(text);
     free(export_result);
+    cbm_memory_close(source);
+    cbm_memory_close(target);
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(memory_share_begin_failure_discards_staged_raw_objects) {
+    char root[SHARE_TEST_PATH];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_memory_share_begin_failure"));
+    char source_home[SHARE_TEST_PATH];
+    char target_home[SHARE_TEST_PATH];
+    char bundle[SHARE_TEST_PATH];
+    snprintf(source_home, sizeof(source_home), "%s/source", root);
+    snprintf(target_home, sizeof(target_home), "%s/target", root);
+    snprintf(bundle, sizeof(bundle), "%s/bundle.json", root);
+    cbm_memory_t *source = cbm_memory_open(source_home);
+    cbm_memory_t *target = cbm_memory_open(target_home);
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(target);
+    ASSERT_EQ(seed_full_memory(source, "Portable", "resolved", 10), 0);
+    char *export_result = export_to(source, bundle);
+    ASSERT_TRUE(result_ok(export_result));
+
+    /* An already-active transaction makes BEGIN IMMEDIATE fail immediately,
+     * after decoding/staging but before any canonical raw object is promoted. */
+    ASSERT_EQ(sqlite3_exec(cbm_memory_db(target), "BEGIN;", NULL, NULL, NULL), SQLITE_OK);
+    char *result = import_from(target, bundle, "reject");
+    ASSERT_FALSE(result_ok(result));
+    ASSERT_EQ(sqlite3_exec(cbm_memory_db(target), "ROLLBACK;", NULL, NULL, NULL), SQLITE_OK);
+    ASSERT_EQ(query_count(target, "memory_sources"), 0);
+    ASSERT_FALSE(raw_object_exists(target_home, "portable raw source\n"));
+    ASSERT_TRUE(raw_prefix_dir_absent(target_home, "portable raw source\n"));
+    ASSERT_TRUE(import_staging_absent(target_home));
+
+    free(export_result);
+    free(result);
+    cbm_memory_close(source);
+    cbm_memory_close(target);
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(memory_share_partial_raw_promotion_rolls_back_only_new_objects) {
+    static const char portable[] = "portable raw source\n";
+    static const char second[] = "second portable raw source\n";
+    static const char failing[] = "failing portable raw source\n";
+    char root[SHARE_TEST_PATH];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_memory_share_partial_raw"));
+    char source_home[SHARE_TEST_PATH];
+    char target_home[SHARE_TEST_PATH];
+    char bundle[SHARE_TEST_PATH];
+    snprintf(source_home, sizeof(source_home), "%s/source", root);
+    snprintf(target_home, sizeof(target_home), "%s/target", root);
+    snprintf(bundle, sizeof(bundle), "%s/bundle.json", root);
+    cbm_memory_t *source = cbm_memory_open(source_home);
+    cbm_memory_t *target = cbm_memory_open(target_home);
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(target);
+    ASSERT_EQ(seed_full_memory(source, "Portable", "resolved", 10), 0);
+    ASSERT_EQ(seed_named_raw_source(source, "source:second", second), 0);
+    ASSERT_EQ(seed_named_raw_source(source, "source:zzzz", failing), 0);
+    char *export_result = export_to(source, bundle);
+    ASSERT_TRUE(result_ok(export_result));
+
+    /* The first raw object already exists and must survive.  The second is
+     * promoted by this import.  A directory at the third object's destination
+     * forces a no-replace collision after that partial promotion. */
+    char portable_path[SHARE_TEST_PATH];
+    char failing_path[SHARE_TEST_PATH];
+    raw_object_path(portable_path, target_home, portable);
+    raw_object_path(failing_path, target_home, failing);
+    ASSERT_EQ(th_write_file(portable_path, portable), 0);
+    ASSERT_TRUE(cbm_mkdir_p(failing_path, 0700));
+    char *result = import_from(target, bundle, "reject");
+    ASSERT_FALSE(result_ok(result));
+    ASSERT_EQ(query_count(target, "memory_sources"), 0);
+    ASSERT_TRUE(raw_object_matches_text(target_home, portable));
+    ASSERT_FALSE(raw_object_exists(target_home, second));
+    ASSERT_TRUE(raw_prefix_dir_absent(target_home, second));
+    ASSERT_TRUE(cbm_is_dir(failing_path));
+    ASSERT_TRUE(import_staging_absent(target_home));
+
+    free(export_result);
+    free(result);
     cbm_memory_close(source);
     cbm_memory_close(target);
     th_rmtree(root);
@@ -647,6 +930,8 @@ TEST(memory_share_git_sync_round_trip_uses_local_bare_remote) {
 SUITE(memory_share) {
     RUN_TEST(memory_share_export_is_deterministic_and_complete);
     RUN_TEST(memory_share_export_preserves_parent_permissions);
+    RUN_TEST(memory_share_share_paths_require_explicit_authority);
+    RUN_TEST(memory_share_rejects_symlink_and_nonregular_paths);
     RUN_TEST(memory_share_import_round_trip_is_idempotent);
     RUN_TEST(memory_share_page_fast_forward_materializes_new_revision);
     RUN_TEST(memory_share_natural_identity_conflict_becomes_proposal);
@@ -655,6 +940,8 @@ SUITE(memory_share) {
     RUN_TEST(memory_share_rejects_tampered_raw_object);
     RUN_TEST(memory_share_rejects_truncated_raw_object_path);
     RUN_TEST(memory_share_rejects_broken_relation_endpoint_atomically);
+    RUN_TEST(memory_share_begin_failure_discards_staged_raw_objects);
+    RUN_TEST(memory_share_partial_raw_promotion_rolls_back_only_new_objects);
     RUN_TEST(memory_share_remote_validation_blocks_credentials_and_accepts_github);
     RUN_TEST(memory_share_git_sync_round_trip_uses_local_bare_remote);
 }
