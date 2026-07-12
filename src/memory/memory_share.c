@@ -7,6 +7,7 @@
  */
 
 #include "memory/memory_share.h"
+#include "memory/memory_raw.h"
 
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
@@ -102,7 +103,14 @@ typedef struct {
     char *target;
     char *staged;
     char hash[CBM_SHA256_HEX_LEN + 1];
-    bool installed;
+#ifndef _WIN32
+    int target_parent_fd;
+    bool target_parent_fd_open;
+    bool target_parent_created;
+    char target_name[MEM_SHARE_NAME_CAP];
+    char target_parent_name[4];
+    char staged_name[MEM_SHARE_NAME_CAP];
+#endif
 } raw_stage_item_t;
 
 typedef struct {
@@ -113,7 +121,35 @@ typedef struct {
     char dir[MEM_SHARE_PATH_CAP];
     int added;
     int skipped;
+#ifndef _WIN32
+    int home_fd;
+    int raw_root_fd;
+    int root_fd;
+    int dir_fd;
+    int *lease_fds;
+    char (*lease_names)[MEM_SHARE_NAME_CAP];
+    size_t lease_count;
+    size_t lease_capacity;
+    bool fds_open;
+    char dir_name[MEM_SHARE_NAME_CAP];
+#endif
 } raw_bundle_stage_t;
+
+typedef enum {
+    SHARE_PATH_MISSING = 0,
+    SHARE_PATH_REGULAR,
+    SHARE_PATH_UNSAFE,
+} share_path_kind_t;
+
+typedef struct {
+    bool inside_home;
+    char parent[MEM_SHARE_PATH_CAP];
+    char name[MEM_SHARE_PATH_CAP];
+#ifndef _WIN32
+    dev_t parent_device;
+    ino_t parent_inode;
+#endif
+} share_path_scope_t;
 
 static char *share_strdup(const char *s) {
     if (!s) {
@@ -209,49 +245,10 @@ static bool parent_dir(const char *path, char *out, size_t cap) {
     return out[0] != '\0';
 }
 
-static bool regular_file_size(const char *path, size_t max_size, size_t *out_size) {
-    struct stat st;
-    if (!path || stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
-        (uint64_t)st.st_size > max_size) {
-        return false;
-    }
-    if (out_size) {
-        *out_size = (size_t)st.st_size;
-    }
-    return true;
-}
-
-static unsigned char *read_file(const char *path, size_t max_size, size_t *out_len) {
-    size_t len = 0;
-    if (!regular_file_size(path, max_size, &len)) {
-        return NULL;
-    }
-    FILE *file = cbm_fopen(path, "rb");
-    if (!file) {
-        return NULL;
-    }
-    unsigned char *data = malloc(len + 1);
-    if (!data) {
-        fclose(file);
-        return NULL;
-    }
-    size_t got = len ? fread(data, 1, len, file) : 0;
-    int close_rc = fclose(file);
-    if (got != len || close_rc != 0) {
-        free(data);
-        return NULL;
-    }
-    data[len] = 0;
-    if (out_len) {
-        *out_len = len;
-    }
-    return data;
-}
-
 /* Atomically expose an already-written file only when the destination does not
  * exist.  Staging and destination are always on the same filesystem. */
-static int link_no_replace(const char *staged, const char *target) {
 #ifdef _WIN32
+static int link_no_replace(const char *staged, const char *target) {
     wchar_t *wide_staged = cbm_utf8_to_wide(staged);
     wchar_t *wide_target = cbm_utf8_to_wide(target);
     if (!wide_staged || !wide_target) {
@@ -267,12 +264,6 @@ static int link_no_replace(const char *staged, const char *target) {
         return 0;
     }
     return error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS ? 1 : -1;
-#else
-    if (link(staged, target) == 0) {
-        return 0;
-    }
-    return errno == EEXIST ? 1 : -1;
-#endif
 }
 
 /* Returns 0 on success, 1 when overwrite=false and the destination already
@@ -311,12 +302,6 @@ static int write_atomic_mode(const char *path, const void *data, size_t len, boo
         cbm_unlink(temp);
         return -1;
     }
-#ifndef _WIN32
-    if (chmod(temp, 0600) != 0) {
-        cbm_unlink(temp);
-        return -1;
-    }
-#endif
     if (overwrite) {
         if (cbm_rename_replace(temp, path) != 0) {
             cbm_unlink(temp);
@@ -329,20 +314,150 @@ static int write_atomic_mode(const char *path, const void *data, size_t len, boo
             return install_rc;
         }
     }
-#ifndef _WIN32
-    /* Persist the rename itself when the filesystem supports directory fsync. */
-    int dir_fd = open(dir, O_RDONLY);
-    if (dir_fd >= 0) {
-        (void)fsync(dir_fd);
-        (void)close(dir_fd);
-    }
-#endif
     return 0;
 }
 
 static int write_atomic(const char *path, const void *data, size_t len) {
     return write_atomic_mode(path, data, len, true);
 }
+#endif
+
+#ifndef _WIN32
+static int share_directory_open_flags(void) {
+    int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    return flags;
+}
+
+static int share_open_directory_path_verified(const char *path) {
+    int fd = path && path[0] ? open(path, share_directory_open_flags()) : -1;
+    struct stat opened;
+    struct stat current;
+    if (fd < 0 || fstat(fd, &opened) != 0 || !S_ISDIR(opened.st_mode) ||
+        lstat(path, &current) != 0 || !S_ISDIR(current.st_mode) ||
+        opened.st_dev != current.st_dev || opened.st_ino != current.st_ino) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    return fd;
+}
+
+static int share_open_directory_at(int parent_fd, const char *name) {
+    int fd = parent_fd >= 0 && name && name[0] && !strchr(name, '/')
+                 ? openat(parent_fd, name, share_directory_open_flags())
+                 : -1;
+    struct stat opened;
+    struct stat current;
+    if (fd < 0 || fstat(fd, &opened) != 0 || !S_ISDIR(opened.st_mode) ||
+        fstatat(parent_fd, name, &current, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(current.st_mode) ||
+        opened.st_dev != current.st_dev || opened.st_ino != current.st_ino) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    return fd;
+}
+
+static int share_open_scoped_parent(const share_path_scope_t *scope) {
+    if (!scope || !scope->parent[0]) {
+        return -1;
+    }
+    int fd = share_open_directory_path_verified(scope->parent);
+    struct stat opened;
+    if (fd < 0 || fstat(fd, &opened) != 0 || opened.st_dev != scope->parent_device ||
+        opened.st_ino != scope->parent_inode) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    return fd;
+}
+
+static share_path_kind_t share_path_kind_at(int parent_fd, const char *name) {
+    struct stat st;
+    if (parent_fd < 0 || !name || !name[0] || strchr(name, '/') ||
+        fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        return errno == ENOENT ? SHARE_PATH_MISSING : SHARE_PATH_UNSAFE;
+    }
+    return S_ISREG(st.st_mode) ? SHARE_PATH_REGULAR : SHARE_PATH_UNSAFE;
+}
+
+static int write_atomic_mode_at(int parent_fd, const char *name, const void *data, size_t len,
+                                bool overwrite) {
+    if (parent_fd < 0 || !name || !name[0] || strchr(name, '/')) {
+        return -1;
+    }
+    char temp_name[MEM_SHARE_NAME_CAP];
+    int temp_fd = -1;
+    for (unsigned int attempt = 0; attempt < 32 && temp_fd < 0; attempt++) {
+        int n = snprintf(temp_name, sizeof(temp_name), ".cbm-share-%ld-%llu-%u",
+                         (long)share_getpid(), (unsigned long long)cbm_now_ns(), attempt);
+        if (n < 0 || (size_t)n >= sizeof(temp_name)) {
+            return -1;
+        }
+        int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+        temp_fd = openat(parent_fd, temp_name, flags, 0600);
+        if (temp_fd < 0 && errno != EEXIST) {
+            return -1;
+        }
+    }
+    if (temp_fd < 0 || fchmod(temp_fd, 0600) != 0) {
+        if (temp_fd >= 0) {
+            close(temp_fd);
+            (void)unlinkat(parent_fd, temp_name, 0);
+        }
+        return -1;
+    }
+    FILE *file = fdopen(temp_fd, "wb");
+    if (!file) {
+        close(temp_fd);
+        (void)unlinkat(parent_fd, temp_name, 0);
+        return -1;
+    }
+    size_t wrote = len ? fwrite(data, 1, len, file) : 0;
+    bool failed = wrote != len || fflush(file) != 0 || fsync(fileno(file)) != 0;
+    if (fclose(file) != 0) {
+        failed = true;
+    }
+    if (failed) {
+        (void)unlinkat(parent_fd, temp_name, 0);
+        return -1;
+    }
+    int install_rc;
+    if (overwrite) {
+        install_rc = renameat(parent_fd, temp_name, parent_fd, name) == 0 ? 0 : -1;
+    } else {
+        install_rc =
+            linkat(parent_fd, temp_name, parent_fd, name, 0) == 0 ? 0 : (errno == EEXIST ? 1 : -1);
+        (void)unlinkat(parent_fd, temp_name, 0);
+    }
+    if (install_rc != 0) {
+        if (overwrite) {
+            (void)unlinkat(parent_fd, temp_name, 0);
+        }
+        return install_rc;
+    }
+    return fsync(parent_fd) == 0 ? 0 : -1;
+}
+#endif
 
 static char hex_digit(unsigned int value) {
     return "0123456789abcdef"[value & 0x0fU];
@@ -704,23 +819,16 @@ static yyjson_mut_val *export_raw_objects(yyjson_mut_doc *doc, sqlite3 *db, cons
             *ok = false;
             break;
         }
-        /* A source path must resolve underneath the canonical raw root.  This
-         * rejects file and directory symlinks that escape the memory home. */
-        char raw_root[MEM_SHARE_PATH_CAP];
-        char canonical_root[MEM_SHARE_PATH_CAP];
-        char canonical_file[MEM_SHARE_PATH_CAP];
-        if (!path_join(raw_root, sizeof(raw_root), home, "raw/objects") ||
-            !cbm_canonical_path(raw_root, canonical_root, sizeof(canonical_root)) ||
-            !cbm_canonical_path(absolute, canonical_file, sizeof(canonical_file)) ||
-            strlen(canonical_file) <= strlen(canonical_root) ||
-            strncmp(canonical_file, canonical_root, strlen(canonical_root)) != 0 ||
-            (canonical_file[strlen(canonical_root)] != '/' &&
-             canonical_file[strlen(canonical_root)] != '\\')) {
+        char object_parent[MEM_SHARE_PATH_CAP];
+        if (!parent_dir(absolute, object_parent, sizeof(object_parent)) ||
+            cbm_memory_raw_validate_object_parent(home, absolute, object_parent, absolute,
+                                                  sizeof(absolute), object_parent,
+                                                  sizeof(object_parent)) != 0) {
             *ok = false;
             break;
         }
-        unsigned char *data = read_file(absolute, MEM_SHARE_RAW_MAX, &len);
-        if (!data) {
+        unsigned char *data = NULL;
+        if (cbm_memory_raw_read_regular_file(absolute, MEM_SHARE_RAW_MAX, &data, &len) != 0) {
             *ok = false;
             break;
         }
@@ -751,12 +859,6 @@ static yyjson_mut_val *export_raw_objects(yyjson_mut_doc *doc, sqlite3 *db, cons
     sqlite3_finalize(statement);
     return objects;
 }
-
-typedef enum {
-    SHARE_PATH_MISSING = 0,
-    SHARE_PATH_REGULAR,
-    SHARE_PATH_UNSAFE,
-} share_path_kind_t;
 
 static bool share_target_parent(const char *path, char parent[MEM_SHARE_PATH_CAP]) {
     if (!path || !path[0]) {
@@ -817,32 +919,111 @@ static bool canonical_path_within(const char *root, const char *candidate) {
     if (candidate_len == root_len) {
         return true;
     }
+#ifdef _WIN32
+    if (root_len > 0 && (root[root_len - 1] == '/' || root[root_len - 1] == '\\')) {
+        return true;
+    }
     return candidate[root_len] == '/' || candidate[root_len] == '\\';
+#else
+    if (root_len > 0 && root[root_len - 1] == '/') {
+        return true;
+    }
+    return candidate[root_len] == '/';
+#endif
 }
 
-static bool share_path_scope(cbm_memory_t *memory, const char *path, bool *inside_home,
-                             const char **error) {
+static bool share_path_scope(cbm_memory_t *memory, char path[MEM_SHARE_PATH_CAP],
+                             share_path_scope_t *scope, const char **error) {
+    if (!memory || !scope || !error) {
+        return false;
+    }
+    memset(scope, 0, sizeof(*scope));
     char parent[MEM_SHARE_PATH_CAP];
     char canonical_parent[MEM_SHARE_PATH_CAP];
     char canonical_home[MEM_SHARE_PATH_CAP];
+    char name[MEM_SHARE_PATH_CAP];
+    const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(path, '\\');
+    if (backslash && (!slash || backslash > slash)) {
+        slash = backslash;
+    }
+#endif
+    const char *basename = slash ? slash + 1 : path;
+    int name_length = snprintf(name, sizeof(name), "%s", basename);
     if (!share_target_parent(path, parent)) {
         *error = "invalid share path";
         return false;
     }
-    if (!cbm_canonical_path(parent, canonical_parent, sizeof(canonical_parent))) {
+    if (name_length < 0 || (size_t)name_length >= sizeof(name)) {
+        *error = "invalid share path";
+        return false;
+    }
+    if (cbm_memory_raw_resolve_directory(parent, canonical_parent, sizeof(canonical_parent)) != 0) {
         *error = "share path parent directory must exist";
         return false;
     }
-    if (!cbm_canonical_path(cbm_memory_home(memory), canonical_home, sizeof(canonical_home))) {
+    if (cbm_memory_raw_resolve_directory(cbm_memory_home(memory), canonical_home,
+                                         sizeof(canonical_home)) != 0) {
         *error = "cannot resolve memory home";
         return false;
     }
-    *inside_home = canonical_path_within(canonical_home, canonical_parent);
+    scope->inside_home = canonical_path_within(canonical_home, canonical_parent);
+    if (snprintf(scope->parent, sizeof(scope->parent), "%s", canonical_parent) >=
+            (int)sizeof(scope->parent) ||
+        snprintf(scope->name, sizeof(scope->name), "%s", name) >= (int)sizeof(scope->name)) {
+        *error = "share path is too long";
+        return false;
+    }
+#ifndef _WIN32
+    int directory_flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    directory_flags |= O_CLOEXEC;
+#endif
+#ifdef O_DIRECTORY
+    directory_flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    directory_flags |= O_NOFOLLOW;
+#endif
+    int parent_fd = open(canonical_parent, directory_flags);
+    struct stat opened_parent;
+    struct stat current_parent;
+    bool stable_parent =
+        parent_fd >= 0 && fstat(parent_fd, &opened_parent) == 0 && S_ISDIR(opened_parent.st_mode) &&
+        lstat(canonical_parent, &current_parent) == 0 && S_ISDIR(current_parent.st_mode) &&
+        opened_parent.st_dev == current_parent.st_dev &&
+        opened_parent.st_ino == current_parent.st_ino;
+    if (parent_fd >= 0) {
+        close(parent_fd);
+    }
+    if (!stable_parent) {
+        *error = "share path parent changed during validation";
+        return false;
+    }
+    scope->parent_device = opened_parent.st_dev;
+    scope->parent_inode = opened_parent.st_ino;
+#endif
+    size_t parent_length = strlen(canonical_parent);
+    bool has_separator = parent_length > 0 && canonical_parent[parent_length - 1] == '/';
+#ifdef _WIN32
+    has_separator =
+        has_separator || (parent_length > 0 && canonical_parent[parent_length - 1] == '\\');
+#endif
+    int target_length = snprintf(path, MEM_SHARE_PATH_CAP, has_separator ? "%s%s" : "%s/%s",
+                                 canonical_parent, name);
+    if (target_length < 0 || target_length >= MEM_SHARE_PATH_CAP) {
+        *error = "share path is too long";
+        return false;
+    }
+#ifdef _WIN32
+    cbm_normalize_path_sep(path);
+#endif
     return true;
 }
 
-static share_path_kind_t share_path_kind(const char *path) {
 #ifdef _WIN32
+static share_path_kind_t share_path_kind(const char *path) {
     wchar_t *wide = cbm_utf8_to_wide(path);
     if (!wide) {
         return SHARE_PATH_UNSAFE;
@@ -857,14 +1038,8 @@ static share_path_kind_t share_path_kind(const char *path) {
     return (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0
                ? SHARE_PATH_REGULAR
                : SHARE_PATH_UNSAFE;
-#else
-    struct stat st;
-    if (lstat(path, &st) != 0) {
-        return errno == ENOENT ? SHARE_PATH_MISSING : SHARE_PATH_UNSAFE;
-    }
-    return S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode) ? SHARE_PATH_REGULAR : SHARE_PATH_UNSAFE;
-#endif
 }
+#endif
 
 static bool default_export_path(cbm_memory_t *memory, char *out, size_t cap) {
     return path_join(out, cap, cbm_memory_home(memory), "export/memory-export.json");
@@ -895,19 +1070,29 @@ char *cbm_memory_export_json(cbm_memory_t *memory, const char *args_json) {
         return share_json_result(false, "cannot construct export path", NULL, -1, -1, 0, 0, 0);
     }
     const char *path_error = NULL;
-    bool inside_home = false;
-    if (!share_path_scope(memory, path, &inside_home, &path_error)) {
+    share_path_scope_t path_scope;
+    if (!share_path_scope(memory, path, &path_scope, &path_error)) {
         yyjson_doc_free(args_doc);
         return share_json_result(false, path_error, path, -1, -1, 0, 0, 0);
     }
-    if (!inside_home && !(user_approved && allow_external_path)) {
+    if (!path_scope.inside_home && !(user_approved && allow_external_path)) {
         yyjson_doc_free(args_doc);
         return share_json_result(false,
                                  "external export path requires user_approved and "
                                  "allow_external_path",
                                  path, -1, -1, 0, 0, 0);
     }
+#ifndef _WIN32
+    int destination_parent_fd = share_open_scoped_parent(&path_scope);
+    share_path_kind_t destination_kind =
+        destination_parent_fd >= 0 ? share_path_kind_at(destination_parent_fd, path_scope.name)
+                                   : SHARE_PATH_UNSAFE;
+    if (destination_parent_fd >= 0) {
+        close(destination_parent_fd);
+    }
+#else
     share_path_kind_t destination_kind = share_path_kind(path);
+#endif
     if (destination_kind == SHARE_PATH_UNSAFE) {
         yyjson_doc_free(args_doc);
         return share_json_result(false, "export destination must be a regular file or absent", path,
@@ -978,7 +1163,17 @@ char *cbm_memory_export_json(cbm_memory_t *memory, const char *args_json) {
     if (!json) {
         return NULL;
     }
+#ifndef _WIN32
+    int output_parent_fd = share_open_scoped_parent(&path_scope);
+    int rc = output_parent_fd >= 0 ? write_atomic_mode_at(output_parent_fd, path_scope.name, json,
+                                                          len, replace_existing)
+                                   : -1;
+    if (output_parent_fd >= 0) {
+        close(output_parent_fd);
+    }
+#else
     int rc = write_atomic_mode(path, json, len, replace_existing);
+#endif
     char digest[CBM_SHA256_HEX_LEN + 1];
     cbm_sha256_hex(json, len, digest);
     free(json);
@@ -1214,20 +1409,13 @@ static bool safe_object_target(const char *home, const char *relative, const cha
         !path_join(target, MEM_SHARE_PATH_CAP, home, relative)) {
         return false;
     }
-    char root[MEM_SHARE_PATH_CAP];
-    char root_canon[MEM_SHARE_PATH_CAP];
     char dir[MEM_SHARE_PATH_CAP];
-    char dir_canon[MEM_SHARE_PATH_CAP];
-    if (!path_join(root, sizeof(root), home, "raw/objects") ||
-        !cbm_mkdir_p(root, MEM_SHARE_DIR_MODE) || !parent_dir(target, dir, sizeof(dir)) ||
-        !cbm_mkdir_p(dir, MEM_SHARE_DIR_MODE) ||
-        !cbm_canonical_path(root, root_canon, sizeof(root_canon)) ||
-        !cbm_canonical_path(dir, dir_canon, sizeof(dir_canon))) {
+    if (!parent_dir(target, dir, sizeof(dir)) ||
+        cbm_memory_raw_validate_object_parent(home, target, dir, target, MEM_SHARE_PATH_CAP, dir,
+                                              sizeof(dir)) != 0) {
         return false;
     }
-    size_t root_len = strlen(root_canon);
-    return strlen(dir_canon) > root_len && strncmp(dir_canon, root_canon, root_len) == 0 &&
-           (dir_canon[root_len] == '/' || dir_canon[root_len] == '\\');
+    return true;
 }
 
 /* Validate every raw entry before writing any object. */
@@ -1269,53 +1457,90 @@ static bool validate_raw_bundle(yyjson_val *root, const char **error) {
 /* Create a private import directory without ever joining a directory created by
  * another process.  Raw objects are decoded here before the SQLite transaction,
  * but no file is visible at its canonical raw/objects path yet. */
-static int create_directory_exclusive(const char *path) {
-#ifdef _WIN32
-    wchar_t *wide = cbm_utf8_to_wide(path);
-    if (!wide) {
-        return -1;
-    }
-    BOOL created = CreateDirectoryW(wide, NULL);
-    DWORD error = created ? ERROR_SUCCESS : GetLastError();
-    free(wide);
-    if (created) {
-        return 0;
-    }
-    return error == ERROR_ALREADY_EXISTS ? 1 : -1;
-#else
-    if (mkdir(path, MEM_SHARE_DIR_MODE) == 0) {
-        return 0;
-    }
-    return errno == EEXIST ? 1 : -1;
-#endif
-}
 
 static bool raw_stage_open(cbm_memory_t *memory, raw_bundle_stage_t *stage) {
-    if (stage->dir[0]) {
+#ifndef _WIN32
+    if (stage->fds_open && stage->dir_fd >= 0) {
         return true;
     }
-    if (!path_join(stage->root, sizeof(stage->root), cbm_memory_home(memory), ".import-staging") ||
-        !cbm_mkdir_p(stage->root, MEM_SHARE_DIR_MODE)) {
+    if (!stage->fds_open) {
+        stage->home_fd = -1;
+        stage->raw_root_fd = -1;
+        stage->root_fd = -1;
+        stage->dir_fd = -1;
+        stage->fds_open = true;
+    }
+    char canonical_home[MEM_SHARE_PATH_CAP];
+    if (cbm_memory_raw_resolve_directory(cbm_memory_home(memory), canonical_home,
+                                         sizeof(canonical_home)) != 0) {
+        return false;
+    }
+    stage->home_fd = share_open_directory_path_verified(canonical_home);
+    if (stage->home_fd < 0) {
+        return false;
+    }
+    int raw_fd = share_open_directory_at(stage->home_fd, "raw");
+    if (raw_fd < 0) {
+        return false;
+    }
+    stage->raw_root_fd = share_open_directory_at(raw_fd, "objects");
+    close(raw_fd);
+    if (stage->raw_root_fd < 0 ||
+        (mkdirat(stage->home_fd, ".import-staging", MEM_SHARE_DIR_MODE) != 0 && errno != EEXIST)) {
+        return false;
+    }
+    stage->root_fd = share_open_directory_at(stage->home_fd, ".import-staging");
+    if (stage->root_fd < 0 || fchmod(stage->root_fd, MEM_SHARE_DIR_MODE) != 0 ||
+        snprintf(stage->root, sizeof(stage->root), "%s/.import-staging", canonical_home) >=
+            (int)sizeof(stage->root)) {
         return false;
     }
     for (unsigned int attempt = 0; attempt < 32; attempt++) {
-        int n = snprintf(stage->dir, sizeof(stage->dir), "%s/import-%ld-%llu-%u", stage->root,
+        int n = snprintf(stage->dir_name, sizeof(stage->dir_name), "import-%ld-%llu-%u",
                          (long)share_getpid(), (unsigned long long)cbm_now_ns(), attempt);
-        if (n < 0 || (size_t)n >= sizeof(stage->dir)) {
+        if (n < 0 || (size_t)n >= sizeof(stage->dir_name)) {
+            return false;
+        }
+        if (mkdirat(stage->root_fd, stage->dir_name, MEM_SHARE_DIR_MODE) != 0) {
+            if (errno == EEXIST) {
+                continue;
+            }
+            return false;
+        }
+        stage->dir_fd = share_open_directory_at(stage->root_fd, stage->dir_name);
+        if (stage->dir_fd < 0 || fchmod(stage->dir_fd, MEM_SHARE_DIR_MODE) != 0) {
+            (void)unlinkat(stage->root_fd, stage->dir_name, AT_REMOVEDIR);
+            stage->dir_fd = -1;
+            return false;
+        }
+        n = snprintf(stage->dir, sizeof(stage->dir), "%s/%s", stage->root, stage->dir_name);
+        return n >= 0 && (size_t)n < sizeof(stage->dir);
+    }
+    return false;
+#else
+    if (stage->dir[0]) {
+        return true;
+    }
+    if (cbm_memory_raw_ensure_private_subdir(cbm_memory_home(memory), ".import-staging",
+                                             stage->root, sizeof(stage->root)) != 0) {
+        return false;
+    }
+    for (unsigned int attempt = 0; attempt < 32; attempt++) {
+        char name[MEM_SHARE_NAME_CAP];
+        int n = snprintf(name, sizeof(name), "import-%ld-%llu-%u", (long)share_getpid(),
+                         (unsigned long long)cbm_now_ns(), attempt);
+        if (n < 0 || (size_t)n >= sizeof(name)) {
             stage->dir[0] = '\0';
             return false;
         }
-        int rc = create_directory_exclusive(stage->dir);
-        if (rc == 0) {
+        if (cbm_memory_raw_create_private_subdir(stage->root, name, stage->dir,
+                                                 sizeof(stage->dir)) == 0) {
             return true;
-        }
-        if (rc < 0) {
-            stage->dir[0] = '\0';
-            return false;
         }
     }
     stage->dir[0] = '\0';
     return false;
+#endif
 }
 
 static bool raw_stage_reserve(raw_bundle_stage_t *stage) {
@@ -1336,10 +1561,47 @@ static bool raw_stage_reserve(raw_bundle_stage_t *stage) {
     return true;
 }
 
+#ifndef _WIN32
+static bool raw_stage_add_lease(raw_bundle_stage_t *stage, int lease_fd, const char *lease_name) {
+    if (!stage || lease_fd < 0) {
+        return false;
+    }
+    if (stage->lease_count == stage->lease_capacity) {
+        size_t next = stage->lease_capacity ? stage->lease_capacity * 2U : 8U;
+        if (next < stage->lease_capacity || next > SIZE_MAX / sizeof(*stage->lease_fds) ||
+            next > SIZE_MAX / sizeof(*stage->lease_names)) {
+            return false;
+        }
+        int *leases = malloc(next * sizeof(*leases));
+        char(*names)[MEM_SHARE_NAME_CAP] = malloc(next * sizeof(*names));
+        if (!leases || !names) {
+            free(leases);
+            free(names);
+            return false;
+        }
+        if (stage->lease_count > 0) {
+            memcpy(leases, stage->lease_fds, stage->lease_count * sizeof(*leases));
+            memcpy(names, stage->lease_names, stage->lease_count * sizeof(*names));
+        }
+        free(stage->lease_fds);
+        free(stage->lease_names);
+        stage->lease_fds = leases;
+        stage->lease_names = names;
+        stage->lease_capacity = next;
+    }
+    stage->lease_fds[stage->lease_count] = lease_fd;
+    (void)snprintf(stage->lease_names[stage->lease_count], MEM_SHARE_NAME_CAP, "%s",
+                   lease_name ? lease_name : "");
+    stage->lease_count++;
+    return true;
+}
+#endif
+
+#ifdef _WIN32
 static bool raw_object_matches(const char *path, const char *expected_hash) {
     size_t len = 0;
-    unsigned char *data = read_file(path, MEM_SHARE_RAW_MAX, &len);
-    if (!data) {
+    unsigned char *data = NULL;
+    if (cbm_memory_raw_read_regular_file(path, MEM_SHARE_RAW_MAX, &data, &len) != 0) {
         return false;
     }
     char actual[CBM_SHA256_HEX_LEN + 1];
@@ -1347,47 +1609,21 @@ static bool raw_object_matches(const char *path, const char *expected_hash) {
     free(data);
     return strcmp(actual, expected_hash) == 0;
 }
-
-static bool raw_paths_are_same_file(const char *left, const char *right) {
-#ifdef _WIN32
-    wchar_t *wide_left = cbm_utf8_to_wide(left);
-    wchar_t *wide_right = cbm_utf8_to_wide(right);
-    if (!wide_left || !wide_right) {
-        free(wide_left);
-        free(wide_right);
+#else
+static bool raw_object_matches_at(int parent_fd, const char *name, const char *expected_hash) {
+    size_t len = 0;
+    unsigned char *data = NULL;
+    if (cbm_memory_raw_read_regular_at(parent_fd, name, MEM_SHARE_RAW_MAX, &data, &len) != 0) {
         return false;
     }
-    HANDLE left_handle =
-        CreateFileW(wide_left, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    HANDLE right_handle =
-        CreateFileW(wide_right, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    free(wide_left);
-    free(wide_right);
-    BY_HANDLE_FILE_INFORMATION left_info;
-    BY_HANDLE_FILE_INFORMATION right_info;
-    bool same = left_handle != INVALID_HANDLE_VALUE && right_handle != INVALID_HANDLE_VALUE &&
-                GetFileInformationByHandle(left_handle, &left_info) &&
-                GetFileInformationByHandle(right_handle, &right_info) &&
-                left_info.dwVolumeSerialNumber == right_info.dwVolumeSerialNumber &&
-                left_info.nFileIndexHigh == right_info.nFileIndexHigh &&
-                left_info.nFileIndexLow == right_info.nFileIndexLow;
-    if (left_handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(left_handle);
-    }
-    if (right_handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(right_handle);
-    }
-    return same;
-#else
-    struct stat left_stat;
-    struct stat right_stat;
-    return stat(left, &left_stat) == 0 && stat(right, &right_stat) == 0 &&
-           left_stat.st_dev == right_stat.st_dev && left_stat.st_ino == right_stat.st_ino;
-#endif
+    char actual[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(data, len, actual);
+    free(data);
+    return strcmp(actual, expected_hash) == 0;
 }
+#endif
 
+#ifdef _WIN32
 static void raw_remove_empty_target_parent(const char *target) {
     char dir[MEM_SHARE_PATH_CAP];
     if (target && parent_dir(target, dir, sizeof(dir))) {
@@ -1396,37 +1632,72 @@ static void raw_remove_empty_target_parent(const char *target) {
         (void)cbm_rmdir(dir);
     }
 }
+#endif
 
 static void raw_stage_dispose(raw_bundle_stage_t *stage, bool rollback_installed) {
     if (!stage) {
         return;
     }
-    /* Remove only targets that are still hard links to our private staged
-     * inode.  A concurrently replaced pre-existing object is never unlinked. */
-    if (rollback_installed) {
-        for (size_t i = 0; i < stage->count; i++) {
-            raw_stage_item_t *item = &stage->items[i];
-            if (item->installed && item->staged && item->target &&
-                raw_paths_are_same_file(item->staged, item->target)) {
-                (void)cbm_unlink(item->target);
-            }
-        }
-    }
+    /* Rollback may leave valid content-addressed orphans.  Never perform a
+     * check-then-unlink on canonical targets: replacement makes that sequence
+     * non-atomic and could delete a file owned by another writer. */
+    (void)rollback_installed;
     for (size_t i = 0; i < stage->count; i++) {
         raw_stage_item_t *item = &stage->items[i];
+#ifndef _WIN32
+        if (stage->dir_fd >= 0 && item->staged_name[0]) {
+            (void)unlinkat(stage->dir_fd, item->staged_name, 0);
+        }
+        if (item->target_parent_fd_open) {
+            close(item->target_parent_fd);
+        }
+        if (item->target_parent_created && stage->raw_root_fd >= 0 && item->target_parent_name[0]) {
+            (void)unlinkat(stage->raw_root_fd, item->target_parent_name, AT_REMOVEDIR);
+        }
+#else
         if (item->staged) {
             (void)cbm_unlink(item->staged);
         }
         raw_remove_empty_target_parent(item->target);
+#endif
         free(item->target);
         free(item->staged);
     }
+#ifndef _WIN32
+    for (size_t i = 0; i < stage->lease_count; i++) {
+        if (stage->dir_fd >= 0 && stage->lease_names[i][0]) {
+            (void)unlinkat(stage->dir_fd, stage->lease_names[i], 0);
+        }
+        close(stage->lease_fds[i]);
+    }
+    free(stage->lease_fds);
+    free(stage->lease_names);
+    if (stage->fds_open && stage->dir_fd >= 0) {
+        close(stage->dir_fd);
+    }
+    if (stage->fds_open && stage->root_fd >= 0 && stage->dir_name[0]) {
+        (void)unlinkat(stage->root_fd, stage->dir_name, AT_REMOVEDIR);
+    }
+    if (stage->fds_open && stage->root_fd >= 0) {
+        close(stage->root_fd);
+    }
+    if (stage->fds_open && stage->home_fd >= 0 && stage->root[0]) {
+        (void)unlinkat(stage->home_fd, ".import-staging", AT_REMOVEDIR);
+    }
+    if (stage->fds_open && stage->raw_root_fd >= 0) {
+        close(stage->raw_root_fd);
+    }
+    if (stage->fds_open && stage->home_fd >= 0) {
+        close(stage->home_fd);
+    }
+#else
     if (stage->dir[0]) {
         (void)cbm_rmdir(stage->dir);
     }
     if (stage->root[0]) {
         (void)cbm_rmdir(stage->root);
     }
+#endif
     free(stage->items);
     memset(stage, 0, sizeof(*stage));
 }
@@ -1442,13 +1713,91 @@ static bool stage_raw_bundle(cbm_memory_t *memory, yyjson_val *root, raw_bundle_
         const char *content = json_string(item, "content");
         char target[MEM_SHARE_PATH_CAP] = {0};
         if (!safe_object_target(cbm_memory_home(memory), path, hash, target)) {
-            raw_remove_empty_target_parent(target);
             *error = "raw object path escapes memory home";
             return false;
         }
+#ifndef _WIN32
+        if (!raw_stage_open(memory, stage)) {
+            *error = "failed to create raw object staging area";
+            return false;
+        }
+        char target_parent_name[4];
+        int parent_name_length =
+            snprintf(target_parent_name, sizeof(target_parent_name), "%.2s", hash);
+        bool target_parent_created = false;
+        if (mkdirat(stage->raw_root_fd, target_parent_name, MEM_SHARE_DIR_MODE) == 0) {
+            target_parent_created = true;
+        } else if (errno != EEXIST) {
+            *error = "failed to create raw object prefix";
+            return false;
+        }
+        int target_parent_fd = share_open_directory_at(stage->raw_root_fd, target_parent_name);
+        const char *target_name = strrchr(target, '/');
+        target_name = target_name ? target_name + 1 : NULL;
+        if (parent_name_length != 2 || target_parent_fd < 0 || !target_name || !target_name[0]) {
+            if (target_parent_fd >= 0) {
+                close(target_parent_fd);
+            }
+            if (target_parent_created) {
+                (void)unlinkat(stage->raw_root_fd, target_parent_name, AT_REMOVEDIR);
+            }
+            *error = "raw object prefix is unsafe";
+            return false;
+        }
+        struct stat existing_entry;
+        int existing_stat_rc =
+            fstatat(target_parent_fd, target_name, &existing_entry, AT_SYMLINK_NOFOLLOW);
+        int existing_stat_error = existing_stat_rc == 0 ? 0 : errno;
+        if (existing_stat_rc == 0 && S_ISREG(existing_entry.st_mode)) {
+            int lease_fd = -1;
+            size_t existing_len = 0;
+            unsigned char *existing = NULL;
+            if (cbm_memory_raw_lock_regular_at(target_parent_fd, target_name, &lease_fd) != 0 ||
+                cbm_memory_raw_read_regular_at(target_parent_fd, target_name, MEM_SHARE_RAW_MAX,
+                                               &existing, &existing_len) != 0) {
+                free(existing);
+                if (lease_fd >= 0) {
+                    close(lease_fd);
+                }
+                close(target_parent_fd);
+                *error = "immutable raw object is unsafe or busy";
+                return false;
+            }
+            char existing_hash[CBM_SHA256_HEX_LEN + 1];
+            cbm_sha256_hex(existing, existing_len, existing_hash);
+            free(existing);
+            if (strcmp(existing_hash, hash) != 0) {
+                close(lease_fd);
+                close(target_parent_fd);
+                *error = "immutable raw object collision";
+                return false;
+            }
+            char lease_name[MEM_SHARE_NAME_CAP] = "";
+            int lease_name_length = snprintf(lease_name, sizeof(lease_name), "lease-%zu",
+                                             stage->lease_count);
+            if (lease_name_length < 0 || (size_t)lease_name_length >= sizeof(lease_name) ||
+                linkat(target_parent_fd, target_name, stage->dir_fd, lease_name, 0) != 0 ||
+                !raw_stage_add_lease(stage, lease_fd, lease_name)) {
+                (void)unlinkat(stage->dir_fd, lease_name, 0);
+                close(lease_fd);
+                close(target_parent_fd);
+                *error = "failed to retain raw object lease";
+                return false;
+            }
+            close(target_parent_fd);
+            stage->skipped++;
+            continue;
+        }
+        if (existing_stat_rc != 0 && existing_stat_error != ENOENT) {
+            close(target_parent_fd);
+            *error = "cannot inspect immutable raw object";
+            return false;
+        }
+#else
         size_t existing_len = 0;
-        unsigned char *existing = read_file(target, MEM_SHARE_RAW_MAX, &existing_len);
-        if (existing) {
+        unsigned char *existing = NULL;
+        if (cbm_memory_raw_read_regular_file(target, MEM_SHARE_RAW_MAX, &existing, &existing_len) ==
+            0) {
             char existing_hash[CBM_SHA256_HEX_LEN + 1];
             cbm_sha256_hex(existing, existing_len, existing_hash);
             free(existing);
@@ -1459,17 +1808,36 @@ static bool stage_raw_bundle(cbm_memory_t *memory, yyjson_val *root, raw_bundle_
             stage->skipped++;
             continue;
         }
+#endif
+#ifdef _WIN32
         if (!raw_stage_open(memory, stage) || !raw_stage_reserve(stage)) {
             raw_remove_empty_target_parent(target);
             *error = "failed to create raw object staging area";
             return false;
         }
+#else
+        if (!raw_stage_reserve(stage)) {
+            close(target_parent_fd);
+            if (target_parent_created) {
+                (void)unlinkat(stage->raw_root_fd, target_parent_name, AT_REMOVEDIR);
+            }
+            *error = "failed to reserve raw object staging state";
+            return false;
+        }
+#endif
         raw_stage_item_t *staged_item = &stage->items[stage->count];
         char staged_path[MEM_SHARE_PATH_CAP];
         int n =
             snprintf(staged_path, sizeof(staged_path), "%s/object-%zu", stage->dir, stage->count);
         if (n < 0 || (size_t)n >= sizeof(staged_path)) {
+#ifndef _WIN32
+            close(target_parent_fd);
+            if (target_parent_created) {
+                (void)unlinkat(stage->raw_root_fd, target_parent_name, AT_REMOVEDIR);
+            }
+#else
             raw_remove_empty_target_parent(target);
+#endif
             *error = "raw object staging path is too long";
             return false;
         }
@@ -1478,22 +1846,59 @@ static bool stage_raw_bundle(cbm_memory_t *memory, yyjson_val *root, raw_bundle_
         if (!target_copy || !staged_copy) {
             free(target_copy);
             free(staged_copy);
+#ifndef _WIN32
+            close(target_parent_fd);
+            if (target_parent_created) {
+                (void)unlinkat(stage->raw_root_fd, target_parent_name, AT_REMOVEDIR);
+            }
+#else
             raw_remove_empty_target_parent(target);
+#endif
             *error = "out of memory while staging raw object";
             return false;
         }
         staged_item->target = target_copy;
         staged_item->staged = staged_copy;
         memcpy(staged_item->hash, hash, CBM_SHA256_HEX_LEN + 1);
+#ifndef _WIN32
+        staged_item->target_parent_fd = target_parent_fd;
+        staged_item->target_parent_fd_open = true;
+        staged_item->target_parent_created = target_parent_created;
+        (void)snprintf(staged_item->target_name, sizeof(staged_item->target_name), "%s",
+                       target_name);
+        (void)snprintf(staged_item->target_parent_name, sizeof(staged_item->target_parent_name),
+                       "%s", target_parent_name);
+        (void)snprintf(staged_item->staged_name, sizeof(staged_item->staged_name), "object-%zu",
+                       stage->count);
+#endif
         stage->count++;
         size_t len = 0;
         unsigned char *data = hex_decode(content, &len);
-        if (!data || write_atomic(staged_path, data, len) != 0) {
+#ifndef _WIN32
+        int write_rc =
+            data ? write_atomic_mode_at(stage->dir_fd, staged_item->staged_name, data, len, false)
+                 : -1;
+#else
+        int write_rc = data ? write_atomic(staged_path, data, len) : -1;
+#endif
+        if (write_rc != 0) {
             free(data);
             *error = "failed to stage raw object";
             return false;
         }
         free(data);
+#ifndef _WIN32
+        int lease_fd = -1;
+        if (cbm_memory_raw_lock_regular_at(stage->dir_fd, staged_item->staged_name, &lease_fd) !=
+                0 ||
+            !raw_stage_add_lease(stage, lease_fd, NULL)) {
+            if (lease_fd >= 0) {
+                close(lease_fd);
+            }
+            *error = "failed to lease staged raw object";
+            return false;
+        }
+#endif
     }
     return true;
 }
@@ -1501,9 +1906,25 @@ static bool stage_raw_bundle(cbm_memory_t *memory, yyjson_val *root, raw_bundle_
 static bool promote_raw_bundle(raw_bundle_stage_t *stage, const char **error) {
     for (size_t i = 0; i < stage->count; i++) {
         raw_stage_item_t *item = &stage->items[i];
+#ifndef _WIN32
+        int rc = linkat(stage->dir_fd, item->staged_name, item->target_parent_fd, item->target_name,
+                        0) == 0
+                     ? 0
+                     : (errno == EEXIST ? 1 : -1);
+        if (rc == 0 &&
+            raw_object_matches_at(item->target_parent_fd, item->target_name, item->hash) &&
+            fsync(item->target_parent_fd) == 0) {
+            stage->added++;
+            continue;
+        }
+        if (rc == 1 &&
+            raw_object_matches_at(item->target_parent_fd, item->target_name, item->hash)) {
+            stage->skipped++;
+            continue;
+        }
+#else
         int rc = link_no_replace(item->staged, item->target);
         if (rc == 0) {
-            item->installed = true;
             stage->added++;
             continue;
         }
@@ -1511,6 +1932,7 @@ static bool promote_raw_bundle(raw_bundle_stage_t *stage, const char **error) {
             stage->skipped++;
             continue;
         }
+#endif
         *error = rc == 1 ? "immutable raw object collision" : "failed to install raw object";
         return false;
     }
@@ -2303,24 +2725,15 @@ static bool import_state_integrity_ok(sqlite3 *db, const char *home) {
         const char *expected = (const char *)sqlite3_column_text(sources, 1);
         sqlite3_int64 expected_size = sqlite3_column_int64(sources, 2);
         char target[MEM_SHARE_PATH_CAP];
-        char raw_root[MEM_SHARE_PATH_CAP];
-        char canonical_root[MEM_SHARE_PATH_CAP];
-        char canonical_target[MEM_SHARE_PATH_CAP];
         size_t len = 0;
-        if (!safe_object_target(home, relative, expected, target) ||
-            !path_join(raw_root, sizeof(raw_root), home, "raw/objects") ||
-            !cbm_canonical_path(raw_root, canonical_root, sizeof(canonical_root)) ||
-            !cbm_canonical_path(target, canonical_target, sizeof(canonical_target)) ||
-            strlen(canonical_target) <= strlen(canonical_root) ||
-            strncmp(canonical_target, canonical_root, strlen(canonical_root)) != 0 ||
-            (canonical_target[strlen(canonical_root)] != '/' &&
-             canonical_target[strlen(canonical_root)] != '\\')) {
+        if (!safe_object_target(home, relative, expected, target)) {
             sqlite3_finalize(sources);
             return false;
         }
-        unsigned char *data = read_file(target, MEM_SHARE_RAW_MAX, &len);
+        unsigned char *data = NULL;
         char actual[CBM_SHA256_HEX_LEN + 1];
-        if (!data || expected_size < 0 || (uint64_t)expected_size != (uint64_t)len) {
+        if (cbm_memory_raw_read_regular_file(target, MEM_SHARE_RAW_MAX, &data, &len) != 0 ||
+            expected_size < 0 || (uint64_t)expected_size != (uint64_t)len) {
             free(data);
             sqlite3_finalize(sources);
             return false;
@@ -2485,19 +2898,32 @@ char *cbm_memory_import_json(cbm_memory_t *memory, const char *args_json) {
         return share_json_result(false, "cannot construct import path", NULL, -1, 0, 0, 0, 0);
     }
     const char *path_error = NULL;
-    bool inside_home = false;
-    if (!share_path_scope(memory, path, &inside_home, &path_error)) {
+    share_path_scope_t path_scope;
+    if (!share_path_scope(memory, path, &path_scope, &path_error)) {
         yyjson_doc_free(args_doc);
         return share_json_result(false, path_error, path, -1, 0, 0, 0, 0);
     }
-    if (!inside_home && !(user_approved && allow_external_path)) {
+    if (!path_scope.inside_home && !(user_approved && allow_external_path)) {
         yyjson_doc_free(args_doc);
         return share_json_result(false,
                                  "external import path requires user_approved and "
                                  "allow_external_path",
                                  path, -1, 0, 0, 0, 0);
     }
-    if (share_path_kind(path) != SHARE_PATH_REGULAR) {
+#ifndef _WIN32
+    int import_parent_fd = share_open_scoped_parent(&path_scope);
+    share_path_kind_t import_kind = import_parent_fd >= 0
+                                        ? share_path_kind_at(import_parent_fd, path_scope.name)
+                                        : SHARE_PATH_UNSAFE;
+#else
+    share_path_kind_t import_kind = share_path_kind(path);
+#endif
+    if (import_kind != SHARE_PATH_REGULAR) {
+#ifndef _WIN32
+        if (import_parent_fd >= 0) {
+            close(import_parent_fd);
+        }
+#endif
         yyjson_doc_free(args_doc);
         return share_json_result(false, "import bundle must be a regular non-symlink file", path,
                                  -1, 0, 0, 0, 0);
@@ -2505,8 +2931,16 @@ char *cbm_memory_import_json(cbm_memory_t *memory, const char *args_json) {
     yyjson_doc_free(args_doc);
 
     size_t bundle_len = 0;
-    unsigned char *bundle = read_file(path, MEM_SHARE_BUNDLE_MAX, &bundle_len);
-    if (!bundle) {
+    unsigned char *bundle = NULL;
+#ifndef _WIN32
+    int bundle_read_rc = cbm_memory_raw_read_regular_at(import_parent_fd, path_scope.name,
+                                                        MEM_SHARE_BUNDLE_MAX, &bundle, &bundle_len);
+    close(import_parent_fd);
+#else
+    int bundle_read_rc =
+        cbm_memory_raw_read_regular_file(path, MEM_SHARE_BUNDLE_MAX, &bundle, &bundle_len);
+#endif
+    if (bundle_read_rc != 0) {
         return share_json_result(false, "cannot read import bundle", path, -1, 0, 0, 0, 0);
     }
     char bundle_hash[CBM_SHA256_HEX_LEN + 1];

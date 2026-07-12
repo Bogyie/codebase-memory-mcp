@@ -7,6 +7,7 @@
  */
 
 #include "memory/memory.h"
+#include "memory/memory_raw.h"
 
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
@@ -51,11 +52,10 @@ enum {
     MEM_TIME_MAX = 32,
     MEM_DEFAULT_LIMIT = 10,
     MEM_MAX_LIMIT = 100,
-    MEM_MAX_SOURCE_BYTES = 16 * 1024 * 1024,
     MEM_OUTBOX_LEASE_SECONDS = 30,
     MEM_OUTBOX_RETRY_BASE_SECONDS = 2,
     MEM_OUTBOX_RETRY_MAX_SECONDS = 300,
-    MEM_INGEST_ROOTS_MAX = MEM_PATH_MAX * 4,
+    MEM_RAW_GC_GRACE_SECONDS = 24 * 60 * 60,
 };
 
 struct cbm_memory {
@@ -529,6 +529,23 @@ static void memory_harden_sqlite_files(cbm_memory_t *m) {
 #endif
 }
 
+static bool memory_raw_object_is_referenced(const char *object_relpath, void *opaque) {
+    cbm_memory_t *m = opaque;
+    if (!m || !m->db || !object_relpath) {
+        return true;
+    }
+    sqlite3_stmt *stmt = NULL;
+    bool referenced = true;
+    if (sqlite3_prepare_v2(m->db, "SELECT 1 FROM memory_sources WHERE object_relpath=?1 LIMIT 1;",
+                           -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(stmt, 1, object_relpath, -1, SQLITE_TRANSIENT) == SQLITE_OK) {
+        int step_rc = sqlite3_step(stmt);
+        referenced = step_rc != SQLITE_DONE;
+    }
+    sqlite3_finalize(stmt);
+    return referenced;
+}
+
 cbm_memory_t *cbm_memory_open(const char *home_override) {
     char home[MEM_PATH_MAX];
     if (resolve_memory_home(home_override, home) != 0) {
@@ -594,6 +611,8 @@ cbm_memory_t *cbm_memory_open(const char *home_override) {
         free(m);
         return NULL;
     }
+    (void)cbm_memory_raw_gc(m->home, MEM_RAW_GC_GRACE_SECONDS, memory_raw_object_is_referenced, m,
+                            NULL, NULL);
     (void)memory_recover_outbox(m);
     memory_harden_sqlite_files(m);
     return m;
@@ -934,309 +953,35 @@ static int memory_document_upsert(cbm_memory_t *m, const char *kind, const char 
 
 /* ── Immutable source objects ─────────────────────────────────── */
 
-static bool memory_env_enabled(const char *name) {
-    char value[16] = "";
-    if (!cbm_safe_getenv(name, value, sizeof(value), NULL)) {
-        return false;
+static int memory_read_canonical_raw_object(cbm_memory_t *m, const char *relative,
+                                            unsigned char **out, size_t *out_len) {
+    if (!m || !relative || !out || !out_len) {
+        return -1;
     }
-    return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0;
-}
-
-static bool memory_path_is_absolute(const char *path) {
-    if (!path || !path[0]) {
-        return false;
-    }
-#ifdef _WIN32
-    return ((((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
-             path[1] == ':' && (path[2] == '/' || path[2] == '\\')) ||
-            ((path[0] == '/' || path[0] == '\\') && (path[1] == '/' || path[1] == '\\')));
-#else
-    return path[0] == '/';
-#endif
-}
-
-static bool memory_directory_exists(const char *path) {
-#ifdef _WIN32
-    wchar_t *wide = cbm_utf8_to_wide(path);
-    if (!wide) {
-        return false;
-    }
-    DWORD attrs = GetFileAttributesW(wide);
-    free(wide);
-    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
-#else
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-#endif
-}
-
-static bool memory_canonical_within_root(const char *canonical_root, const char *canonical_path) {
-    size_t root_len = strlen(canonical_root);
-    if (root_len == 0) {
-        return false;
-    }
-#ifdef _WIN32
-    bool prefix = _strnicmp(canonical_root, canonical_path, root_len) == 0;
-#else
-    bool prefix = strncmp(canonical_root, canonical_path, root_len) == 0;
-#endif
-    if (!prefix) {
-        return false;
-    }
-    if (canonical_root[root_len - 1] == '/' || canonical_root[root_len - 1] == '\\') {
-        return true;
-    }
-    return canonical_path[root_len] == '/' || canonical_path[root_len] == '\\' ||
-           canonical_path[root_len] == '\0';
-}
-
-/* Authorize an already-resolved path. Returns 0 when allowed, -2 when path
- * ingest has no configured authority, and -1 when outside every allowed root. */
-static int memory_authorize_canonical_ingest_path(const char *canonical) {
-    if (memory_env_enabled("CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST")) {
-        return 0;
-    }
-
-    char roots[MEM_INGEST_ROOTS_MAX] = "";
-    if (!cbm_safe_getenv("CBM_MEMORY_INGEST_ROOTS", roots, sizeof(roots), NULL) || !roots[0]) {
-        return -2;
-    }
-#ifdef _WIN32
-    const char separator = ';';
-#else
-    const char separator = ':';
-#endif
-    const char *cursor = roots;
-    while (*cursor) {
-        const char *end = strchr(cursor, separator);
-        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
-        if (length > 0 && length < MEM_PATH_MAX) {
-            char root[MEM_PATH_MAX];
-            memcpy(root, cursor, length);
-            root[length] = '\0';
-            if (memory_path_is_absolute(root)) {
-                char canonical_root[MEM_PATH_MAX];
-                if (cbm_canonical_path(root, canonical_root, sizeof(canonical_root))) {
-                    cbm_normalize_path_sep(canonical_root);
-                    if (memory_directory_exists(canonical_root) &&
-                        memory_canonical_within_root(canonical_root, canonical)) {
-                        return 0;
-                    }
-                }
-            }
-        }
-        if (!end) {
-            break;
-        }
-        cursor = end + 1;
-    }
-    return -1;
-}
-
-#ifdef _WIN32
-static bool memory_final_path_from_handle(HANDLE handle, char out[MEM_PATH_MAX]) {
-    wchar_t wide[MEM_PATH_MAX];
-    DWORD length = GetFinalPathNameByHandleW(handle, wide, MEM_PATH_MAX, FILE_NAME_NORMALIZED);
-    if (length == 0 || length >= MEM_PATH_MAX) {
-        return false;
-    }
-    const wchar_t *source = wide;
-    wchar_t normalized[MEM_PATH_MAX];
-    if (wcsncmp(wide, L"\\\\?\\UNC\\", 8) == 0) {
-        int n = swprintf(normalized, MEM_PATH_MAX, L"\\\\%ls", wide + 8);
-        if (n < 0 || n >= MEM_PATH_MAX) {
-            return false;
-        }
-        source = normalized;
-    } else if (wcsncmp(wide, L"\\\\?\\", 4) == 0) {
-        source = wide + 4;
-    }
-    char *utf8 = cbm_wide_to_utf8(source);
-    if (!utf8) {
-        return false;
-    }
-    int n = snprintf(out, MEM_PATH_MAX, "%s", utf8);
-    free(utf8);
-    if (n < 0 || n >= MEM_PATH_MAX) {
-        return false;
-    }
-    cbm_normalize_path_sep(out);
-    return true;
-}
-#endif
-
-/* Open, authorize, and read one path through the same file descriptor/handle.
- * A preliminary canonical check prevents even opening an obviously out-of-root
- * path. The post-open identity/final-path check closes the replacement window:
- * no bytes are read until the opened regular file is proven to be the same
- * in-root object that was authorized. */
-static int memory_read_authorized_ingest_path(const char *path, unsigned char **out,
-                                              size_t *out_len) {
     *out = NULL;
     *out_len = 0;
-    if (!path || !path[0]) {
+    char target[MEM_PATH_MAX];
+    char target_parent[MEM_PATH_MAX];
+    char canonical_target[MEM_PATH_MAX];
+    char canonical_parent[MEM_PATH_MAX];
+    int n = snprintf(target, sizeof(target), "%s/%s", m->home, relative);
+    if (n < 0 || n >= (int)sizeof(target) ||
+        snprintf(target_parent, sizeof(target_parent), "%s", target) >=
+            (int)sizeof(target_parent)) {
         return -1;
     }
-    char preliminary[MEM_PATH_MAX];
-    if (!cbm_canonical_path(path, preliminary, sizeof(preliminary))) {
+    char *slash = strrchr(target_parent, '/');
+    if (!slash || slash == target_parent) {
         return -1;
     }
-    cbm_normalize_path_sep(preliminary);
-    int authorization = memory_authorize_canonical_ingest_path(preliminary);
-    if (authorization != 0) {
-        return authorization;
-    }
-
-#ifdef _WIN32
-    wchar_t *wide = cbm_utf8_to_wide(path);
-    if (!wide) {
+    *slash = '\0';
+    if (cbm_memory_raw_validate_object_parent(m->home, target, target_parent, canonical_target,
+                                              sizeof(canonical_target), canonical_parent,
+                                              sizeof(canonical_parent)) != 0) {
         return -1;
     }
-    HANDLE handle = CreateFileW(
-        wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    free(wide);
-    if (handle == INVALID_HANDLE_VALUE) {
-        return -1;
-    }
-    BY_HANDLE_FILE_INFORMATION info;
-    LARGE_INTEGER size;
-    char opened_path[MEM_PATH_MAX];
-    bool valid = GetFileInformationByHandle(handle, &info) &&
-                 !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-                 !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-                 GetFileSizeEx(handle, &size) && size.QuadPart >= 0 &&
-                 size.QuadPart <= MEM_MAX_SOURCE_BYTES &&
-                 memory_final_path_from_handle(handle, opened_path) &&
-                 memory_authorize_canonical_ingest_path(opened_path) == 0;
-    if (!valid) {
-        CloseHandle(handle);
-        return -1;
-    }
-    size_t len = (size_t)size.QuadPart;
-    unsigned char *bytes = malloc(len + 1U);
-    if (!bytes) {
-        CloseHandle(handle);
-        return -3;
-    }
-    size_t offset = 0;
-    while (offset < len) {
-        DWORD chunk = (DWORD)((len - offset) > UINT32_MAX ? UINT32_MAX : (len - offset));
-        DWORD got = 0;
-        if (!ReadFile(handle, bytes + offset, chunk, &got, NULL) || got == 0) {
-            free(bytes);
-            CloseHandle(handle);
-            return -3;
-        }
-        offset += got;
-    }
-    CloseHandle(handle);
-#else
-    int flags = O_RDONLY;
-#ifdef O_CLOEXEC
-    flags |= O_CLOEXEC;
-#endif
-#ifdef O_NOFOLLOW
-    flags |= O_NOFOLLOW;
-#endif
-    int fd = open(path, flags);
-    if (fd < 0) {
-        return -1;
-    }
-    struct stat opened_stat;
-    char opened_path[MEM_PATH_MAX];
-    struct stat resolved_stat;
-    bool valid = fstat(fd, &opened_stat) == 0 && S_ISREG(opened_stat.st_mode) &&
-                 opened_stat.st_size >= 0 && opened_stat.st_size <= MEM_MAX_SOURCE_BYTES &&
-                 cbm_canonical_path(path, opened_path, sizeof(opened_path));
-    if (valid) {
-        cbm_normalize_path_sep(opened_path);
-        valid = stat(opened_path, &resolved_stat) == 0 &&
-                resolved_stat.st_dev == opened_stat.st_dev &&
-                resolved_stat.st_ino == opened_stat.st_ino &&
-                memory_authorize_canonical_ingest_path(opened_path) == 0;
-    }
-    if (!valid) {
-        close(fd);
-        return -1;
-    }
-    size_t len = (size_t)opened_stat.st_size;
-    unsigned char *bytes = malloc(len + 1U);
-    if (!bytes) {
-        close(fd);
-        return -3;
-    }
-    size_t offset = 0;
-    while (offset < len) {
-        ssize_t got = read(fd, bytes + offset, len - offset);
-        if (got < 0 && errno == EINTR) {
-            continue;
-        }
-        if (got <= 0) {
-            free(bytes);
-            close(fd);
-            return -3;
-        }
-        offset += (size_t)got;
-    }
-    close(fd);
-#endif
-    bytes[len] = 0;
-    *out = bytes;
-    *out_len = len;
-    return 0;
-}
-
-static int read_file_bytes(const char *path, unsigned char **out, size_t *out_len) {
-    *out = NULL;
-    *out_len = 0;
-    FILE *fp = cbm_fopen(path, "rb");
-    if (!fp) {
-        return -1;
-    }
-    if (fseek(fp, 0, SEEK_END) != 0) {
-        fclose(fp);
-        return -1;
-    }
-    long size = ftell(fp);
-    if (size < 0 || size > MEM_MAX_SOURCE_BYTES || fseek(fp, 0, SEEK_SET) != 0) {
-        fclose(fp);
-        return -1;
-    }
-    unsigned char *bytes = malloc((size_t)size + 1U);
-    if (!bytes) {
-        fclose(fp);
-        return -1;
-    }
-    size_t got = fread(bytes, 1, (size_t)size, fp);
-    int failed = ferror(fp);
-    fclose(fp);
-    if (failed || got != (size_t)size) {
-        free(bytes);
-        return -1;
-    }
-    bytes[got] = 0;
-    *out = bytes;
-    *out_len = got;
-    return 0;
-}
-
-static bool raw_object_matches(const char *path, const unsigned char *bytes, size_t len,
-                               const char *expected_hash) {
-    if (!cbm_file_exists(path) || cbm_file_size(path) != (int64_t)len) {
-        return false;
-    }
-    unsigned char *existing = NULL;
-    size_t existing_len = 0;
-    if (read_file_bytes(path, &existing, &existing_len) != 0) {
-        return false;
-    }
-    char hash[CBM_SHA256_HEX_LEN + 1];
-    cbm_sha256_hex(existing, existing_len, hash);
-    bool matches = existing_len == len && strcmp(hash, expected_hash) == 0 &&
-                   (len == 0 || memcmp(existing, bytes, len) == 0);
-    free(existing);
-    return matches;
+    return cbm_memory_raw_read_regular_file(canonical_target, CBM_MEMORY_RAW_MAX_SOURCE_BYTES, out,
+                                            out_len);
 }
 
 static int durable_flush(FILE *fp) {
@@ -1277,215 +1022,6 @@ static int sync_parent_directory(const char *path) {
     close(fd);
     return rc;
 #endif
-}
-
-typedef struct {
-    char root[MEM_PATH_MAX];
-    char staged[MEM_PATH_MAX];
-    char target[MEM_PATH_MAX];
-    char target_parent[MEM_PATH_MAX];
-    bool staged_exists;
-    bool installed;
-    bool target_parent_created;
-} memory_raw_stage_t;
-
-static int memory_link_no_replace(const char *staged, const char *target) {
-#ifdef _WIN32
-    wchar_t *wide_staged = cbm_utf8_to_wide(staged);
-    wchar_t *wide_target = cbm_utf8_to_wide(target);
-    if (!wide_staged || !wide_target) {
-        free(wide_staged);
-        free(wide_target);
-        return -1;
-    }
-    BOOL linked = CreateHardLinkW(wide_target, wide_staged, NULL);
-    DWORD error = linked ? ERROR_SUCCESS : GetLastError();
-    free(wide_staged);
-    free(wide_target);
-    if (linked) {
-        return 0;
-    }
-    return error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS ? 1 : -1;
-#else
-    if (link(staged, target) == 0) {
-        return 0;
-    }
-    return errno == EEXIST ? 1 : -1;
-#endif
-}
-
-static bool memory_paths_are_same_file(const char *left, const char *right) {
-#ifdef _WIN32
-    wchar_t *wide_left = cbm_utf8_to_wide(left);
-    wchar_t *wide_right = cbm_utf8_to_wide(right);
-    if (!wide_left || !wide_right) {
-        free(wide_left);
-        free(wide_right);
-        return false;
-    }
-    HANDLE left_handle =
-        CreateFileW(wide_left, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    HANDLE right_handle =
-        CreateFileW(wide_right, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    free(wide_left);
-    free(wide_right);
-    BY_HANDLE_FILE_INFORMATION left_info;
-    BY_HANDLE_FILE_INFORMATION right_info;
-    bool same = left_handle != INVALID_HANDLE_VALUE && right_handle != INVALID_HANDLE_VALUE &&
-                GetFileInformationByHandle(left_handle, &left_info) &&
-                GetFileInformationByHandle(right_handle, &right_info) &&
-                left_info.dwVolumeSerialNumber == right_info.dwVolumeSerialNumber &&
-                left_info.nFileIndexHigh == right_info.nFileIndexHigh &&
-                left_info.nFileIndexLow == right_info.nFileIndexLow;
-    if (left_handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(left_handle);
-    }
-    if (right_handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(right_handle);
-    }
-    return same;
-#else
-    struct stat left_stat;
-    struct stat right_stat;
-    return stat(left, &left_stat) == 0 && stat(right, &right_stat) == 0 &&
-           left_stat.st_dev == right_stat.st_dev && left_stat.st_ino == right_stat.st_ino;
-#endif
-}
-
-static void memory_raw_stage_dispose(memory_raw_stage_t *stage, bool rollback_installed) {
-    if (!stage) {
-        return;
-    }
-    /* Only remove a promoted target while it is still the hard link owned by
-     * this stage. A concurrent/pre-existing immutable object is never deleted. */
-    if (rollback_installed && stage->installed && stage->staged_exists &&
-        memory_paths_are_same_file(stage->staged, stage->target)) {
-        (void)cbm_unlink(stage->target);
-        (void)sync_parent_directory(stage->target);
-    }
-    if (stage->staged_exists) {
-        (void)cbm_unlink(stage->staged);
-    }
-    if (stage->root[0]) {
-        (void)cbm_rmdir(stage->root);
-    }
-    if (rollback_installed && stage->target_parent_created && stage->target_parent[0]) {
-        /* Non-recursive and therefore safe when the prefix pre-existed or a
-         * concurrent ingest populated it. */
-        (void)cbm_rmdir(stage->target_parent);
-    }
-    memset(stage, 0, sizeof(*stage));
-}
-
-static int memory_create_directory_no_replace(const char *path) {
-#ifdef _WIN32
-    wchar_t *wide = cbm_utf8_to_wide(path);
-    if (!wide) {
-        return -1;
-    }
-    BOOL created = CreateDirectoryW(wide, NULL);
-    DWORD error = created ? ERROR_SUCCESS : GetLastError();
-    free(wide);
-    if (created) {
-        return 0;
-    }
-    return error == ERROR_ALREADY_EXISTS ? 1 : -1;
-#else
-    if (mkdir(path, 0700) == 0) {
-        return 0;
-    }
-    return errno == EEXIST ? 1 : -1;
-#endif
-}
-
-static int memory_raw_stage_create(cbm_memory_t *m, const char *target, const char *target_parent,
-                                   const unsigned char *bytes, size_t len, const char *hash,
-                                   memory_raw_stage_t *stage) {
-    memset(stage, 0, sizeof(*stage));
-    if (snprintf(stage->target, sizeof(stage->target), "%s", target) >=
-            (int)sizeof(stage->target) ||
-        snprintf(stage->target_parent, sizeof(stage->target_parent), "%s", target_parent) >=
-            (int)sizeof(stage->target_parent) ||
-        snprintf(stage->root, sizeof(stage->root), "%s/.ingest-staging", m->home) >=
-            (int)sizeof(stage->root)) {
-        return -1;
-    }
-    if (cbm_file_exists(target)) {
-        return raw_object_matches(target, bytes, len, hash) ? 0 : -1;
-    }
-    if (!cbm_mkdir_p(stage->root, 0700)) {
-        return -1;
-    }
-#ifndef _WIN32
-    if (chmod(stage->root, 0700) != 0) {
-        memory_raw_stage_dispose(stage, false);
-        return -1;
-    }
-#endif
-    static atomic_uint_fast64_t sequence = 1;
-    FILE *fp = NULL;
-    for (unsigned int attempt = 0; attempt < 32 && !fp; attempt++) {
-        uint64_t seq = atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
-        int n = snprintf(stage->staged, sizeof(stage->staged), "%s/ingest-%ld-%" PRIu64 "-%u",
-                         stage->root, (long)getpid(), seq, attempt);
-        if (n < 0 || n >= (int)sizeof(stage->staged)) {
-            memory_raw_stage_dispose(stage, false);
-            return -1;
-        }
-        fp = cbm_fopen(stage->staged, "wbx");
-        if (!fp && errno != EEXIST) {
-            memory_raw_stage_dispose(stage, false);
-            return -1;
-        }
-    }
-    if (!fp) {
-        memory_raw_stage_dispose(stage, false);
-        return -1;
-    }
-    stage->staged_exists = true;
-    size_t written = len ? fwrite(bytes, 1, len, fp) : 0;
-    int flush_rc = written == len ? durable_flush(fp) : -1;
-    int close_rc = fclose(fp);
-#ifndef _WIN32
-    int mode_rc = chmod(stage->staged, 0600);
-#else
-    int mode_rc = 0;
-#endif
-    if (flush_rc != 0 || close_rc != 0 || mode_rc != 0 ||
-        !raw_object_matches(stage->staged, bytes, len, hash) ||
-        sync_parent_directory(stage->staged) != 0) {
-        memory_raw_stage_dispose(stage, false);
-        return -1;
-    }
-    return 0;
-}
-
-static int memory_raw_stage_promote(memory_raw_stage_t *stage, const unsigned char *bytes,
-                                    size_t len, const char *hash) {
-    if (!stage->staged_exists) {
-        return raw_object_matches(stage->target, bytes, len, hash) ? 0 : -1;
-    }
-    int directory_rc = memory_create_directory_no_replace(stage->target_parent);
-    if (directory_rc < 0 || (directory_rc == 1 && !memory_directory_exists(stage->target_parent))) {
-        return -1;
-    }
-    stage->target_parent_created = directory_rc == 0;
-#ifndef _WIN32
-    if (chmod(stage->target_parent, 0700) != 0) {
-        return -1;
-    }
-#endif
-    int install_rc = memory_link_no_replace(stage->staged, stage->target);
-    if (install_rc == 0) {
-        stage->installed = true;
-        return raw_object_matches(stage->target, bytes, len, hash) &&
-                       sync_parent_directory(stage->target) == 0
-                   ? 0
-                   : -1;
-    }
-    return install_rc == 1 && raw_object_matches(stage->target, bytes, len, hash) ? 0 : -1;
 }
 
 static bool safe_path_component(const char *value) {
@@ -1789,7 +1325,61 @@ static char *ingest_result_json(cbm_memory_t *m, const char *source_id, const ch
     return out;
 }
 
-static char *memory_source_existing(cbm_memory_t *m, const char *hash) {
+static bool memory_existing_raw_matches(cbm_memory_t *m, const char *relative,
+                                        const unsigned char *bytes, size_t len,
+                                        const char *expected_hash) {
+    unsigned char *stored = NULL;
+    size_t stored_len = 0;
+    if (!m || !relative || !expected_hash || (len > 0 && !bytes) ||
+        memory_read_canonical_raw_object(m, relative, &stored, &stored_len) != 0 ||
+        stored_len != len) {
+        free(stored);
+        return false;
+    }
+    char actual_hash[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(stored, stored_len, actual_hash);
+    bool matches =
+        strcmp(actual_hash, expected_hash) == 0 && (len == 0 || memcmp(stored, bytes, len) == 0);
+    free(stored);
+    return matches;
+}
+
+static bool memory_repair_existing_raw(cbm_memory_t *m, const char *relative,
+                                       const unsigned char *bytes, size_t len,
+                                       const char *expected_hash) {
+    if (!m || !relative || !expected_hash || (len > 0 && !bytes)) {
+        return false;
+    }
+    char target[MEM_PATH_MAX];
+    char target_parent[MEM_PATH_MAX];
+    int n = snprintf(target, sizeof(target), "%s/%s", m->home, relative);
+    if (n < 0 || n >= (int)sizeof(target) ||
+        snprintf(target_parent, sizeof(target_parent), "%s", target) >=
+            (int)sizeof(target_parent)) {
+        return false;
+    }
+    char *slash = strrchr(target_parent, '/');
+    if (!slash || slash == target_parent) {
+        return false;
+    }
+    *slash = '\0';
+    for (int attempt = 0; attempt < 2; attempt++) {
+        cbm_memory_raw_stage_t *stage = NULL;
+        if (cbm_memory_raw_stage_create_repair(m->home, target, target_parent, bytes, len,
+                                               expected_hash, &stage) != 0) {
+            return false;
+        }
+        int repair_rc = cbm_memory_raw_stage_repair_promote(stage, bytes, len, expected_hash);
+        cbm_memory_raw_stage_dispose(stage, repair_rc != 0);
+        if (repair_rc == 0 && memory_existing_raw_matches(m, relative, bytes, len, expected_hash)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static char *memory_source_existing(cbm_memory_t *m, const char *hash, const unsigned char *bytes,
+                                    size_t len) {
     sqlite3_stmt *stmt = NULL;
     if (memory_prepare(m,
                        "SELECT source_id,object_relpath,title,origin FROM memory_sources"
@@ -1798,16 +1388,34 @@ static char *memory_source_existing(cbm_memory_t *m, const char *hash) {
         return NULL;
     }
     bind_text_or_null(stmt, 1, hash);
-    char *out = NULL;
+    char *source_id = NULL;
+    char *relpath = NULL;
+    char *display = NULL;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *source_id = (const char *)sqlite3_column_text(stmt, 0);
-        const char *relpath = (const char *)sqlite3_column_text(stmt, 1);
+        source_id = mem_strdup((const char *)sqlite3_column_text(stmt, 0));
+        relpath = mem_strdup((const char *)sqlite3_column_text(stmt, 1));
         const char *title = (const char *)sqlite3_column_text(stmt, 2);
         const char *origin = (const char *)sqlite3_column_text(stmt, 3);
-        out = ingest_result_json(m, source_id, hash, relpath, title && title[0] ? title : origin,
-                                 true, cbm_memory_snapshot_epoch(m));
+        display = mem_strdup(title && title[0] ? title : origin);
     }
     sqlite3_finalize(stmt);
+    if (!source_id || !relpath || !display) {
+        free(source_id);
+        free(relpath);
+        free(display);
+        return NULL;
+    }
+    bool raw_valid = memory_existing_raw_matches(m, relpath, bytes, len, hash) ||
+                     memory_repair_existing_raw(m, relpath, bytes, len, hash);
+    char *out = raw_valid
+                    ? ingest_result_json(m, source_id, hash, relpath, display, true,
+                                         cbm_memory_snapshot_epoch(m))
+                    : json_error("raw_store_failed",
+                                 "existing source row has a missing or corrupt raw object that "
+                                 "could not be repaired");
+    free(source_id);
+    free(relpath);
+    free(display);
     return out;
 }
 
@@ -1831,20 +1439,21 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
     const unsigned char *bytes = NULL;
     size_t len = 0;
     if (path) {
-        int authorization = memory_read_authorized_ingest_path(path, &owned_bytes, &len);
-        if (authorization == -2) {
+        cbm_memory_raw_read_result_t authorization =
+            cbm_memory_raw_read_authorized_path(path, &owned_bytes, &len);
+        if (authorization == CBM_MEMORY_RAW_READ_AUTHORITY_REQUIRED) {
             yyjson_doc_free(doc);
             return json_error(
                 "path_ingest_disabled",
                 "path ingest requires CBM_MEMORY_INGEST_ROOTS or explicit unsafe opt-in");
         }
-        if (authorization == -1) {
+        if (authorization == CBM_MEMORY_RAW_READ_DENIED) {
             yyjson_doc_free(doc);
             return json_error("source_path_not_allowed",
                               "source path must be a regular non-symlink file within an allowed "
                               "ingest root");
         }
-        if (authorization != 0 || !owned_bytes) {
+        if (authorization != CBM_MEMORY_RAW_READ_OK || !owned_bytes) {
             yyjson_doc_free(doc);
             return json_error("source_read_failed",
                               "cannot read source path or source is too large");
@@ -1854,7 +1463,7 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
         bytes = (const unsigned char *)content;
         yyjson_val *content_val = yyjson_obj_get(root, "content");
         len = yyjson_get_len(content_val);
-        if (len > MEM_MAX_SOURCE_BYTES) {
+        if (len > CBM_MEMORY_RAW_MAX_SOURCE_BYTES) {
             yyjson_doc_free(doc);
             return json_error("source_too_large", "source exceeds 16 MiB");
         }
@@ -1906,7 +1515,7 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
         return json_error("invalid_source", "source object path is too long");
     }
 
-    char *existing = memory_source_existing(m, hash);
+    char *existing = memory_source_existing(m, hash, bytes, len);
     if (existing) {
         free(metadata);
         free(owned_bytes);
@@ -1914,9 +1523,9 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
         return existing;
     }
 
-    memory_raw_stage_t raw_stage;
-    if (memory_raw_stage_create(m, final_path, prefix_dir, bytes, len, hash, &raw_stage) != 0) {
-        memory_raw_stage_dispose(&raw_stage, false);
+    cbm_memory_raw_stage_t *raw_stage = NULL;
+    if (cbm_memory_raw_stage_create(m->home, final_path, prefix_dir, bytes, len, hash,
+                                    &raw_stage) != 0) {
         free(metadata);
         free(owned_bytes);
         yyjson_doc_free(doc);
@@ -1924,7 +1533,7 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
     }
 
     if (memory_begin(m) != 0) {
-        memory_raw_stage_dispose(&raw_stage, false);
+        cbm_memory_raw_stage_dispose(raw_stage, false);
         free(metadata);
         free(owned_bytes);
         yyjson_doc_free(doc);
@@ -2011,7 +1620,7 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
      * so expose the staged inode after canonical writes and immediately before
      * rebuilding derived state. It remains linked to the private stage until
      * COMMIT, allowing identity-checked rollback below. */
-    if (canonical_ready && memory_raw_stage_promote(&raw_stage, bytes, len, hash) != 0) {
+    if (canonical_ready && cbm_memory_raw_stage_promote(raw_stage, bytes, len, hash) != 0) {
         (void)snprintf(m->error, sizeof(m->error), "%s",
                        "failed to promote immutable source object");
         canonical_ready = false;
@@ -2023,20 +1632,20 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
 
     if (!canonical_ready) {
         memory_rollback(m);
-        memory_raw_stage_dispose(&raw_stage, true);
-        char *race = memory_source_existing(m, hash);
+        cbm_memory_raw_stage_dispose(raw_stage, true);
+        char *race = memory_source_existing(m, hash, bytes, len);
         free(owned_bytes);
         yyjson_doc_free(doc);
         return race ? race : json_error("ingest_failed", m->error);
     }
     if (memory_commit_tx(m) != 0) {
         memory_rollback(m);
-        memory_raw_stage_dispose(&raw_stage, true);
+        cbm_memory_raw_stage_dispose(raw_stage, true);
         free(owned_bytes);
         yyjson_doc_free(doc);
         return json_error("ingest_failed", m->error);
     }
-    memory_raw_stage_dispose(&raw_stage, false);
+    cbm_memory_raw_stage_dispose(raw_stage, false);
 
     char *out = ingest_result_json(m, source_id, hash, relpath, title && title[0] ? title : origin,
                                    false, epoch);
@@ -3684,12 +3293,10 @@ static int project_source_bodies(cbm_memory_t *m) {
         char *origin = mem_strdup((const char *)sqlite3_column_text(stmt, 3));
         char *metadata = mem_strdup((const char *)sqlite3_column_text(stmt, 4));
         char *expected_hash = mem_strdup((const char *)sqlite3_column_text(stmt, 5));
-        char path[MEM_PATH_MAX];
         unsigned char *bytes = NULL;
         size_t len = 0;
         if (!id || !rel || !title || !origin || !metadata || !expected_hash ||
-            snprintf(path, sizeof(path), "%s/%s", m->home, rel) >= (int)sizeof(path) ||
-            read_file_bytes(path, &bytes, &len) != 0) {
+            memory_read_canonical_raw_object(m, rel, &bytes, &len) != 0) {
             rc = -1;
         } else {
             char actual_hash[CBM_SHA256_HEX_LEN + 1];
@@ -5341,32 +4948,28 @@ char *cbm_memory_lint_json(cbm_memory_t *m, const char *args_json) {
             const char *id = (const char *)sqlite3_column_text(source_stmt, 0);
             const char *rel = (const char *)sqlite3_column_text(source_stmt, 1);
             const char *expected_hash = (const char *)sqlite3_column_text(source_stmt, 2);
-            char path[MEM_PATH_MAX];
-            int n = snprintf(path, sizeof(path), "%s/%s", m->home, rel ? rel : "");
-            if (n < 0 || n >= (int)sizeof(path) || !cbm_file_exists(path)) {
+            unsigned char *bytes = NULL;
+            size_t len = 0;
+            if (memory_read_canonical_raw_object(m, rel ? rel : "", &bytes, &len) != 0) {
                 if (lint_check_selected(requested_checks, "missing_raw_object")) {
                     lint_add_issue(doc, issues, "missing_raw_object", "error", "source", id,
-                                   "canonical raw source object is missing");
+                                   "canonical raw source object is missing or unsafe");
                     issue_count++;
-                }
-            } else if (lint_check_selected(requested_checks, "raw_object_hash_mismatch")) {
-                unsigned char *bytes = NULL;
-                size_t len = 0;
-                if (read_file_bytes(path, &bytes, &len) != 0) {
+                } else if (lint_check_selected(requested_checks, "raw_object_hash_mismatch")) {
                     lint_add_issue(doc, issues, "raw_object_hash_mismatch", "error", "source", id,
                                    "canonical raw source object cannot be verified");
                     issue_count++;
-                } else {
-                    char actual_hash[CBM_SHA256_HEX_LEN + 1] = "";
-                    cbm_sha256_hex(bytes, len, actual_hash);
-                    if (!expected_hash || strcmp(actual_hash, expected_hash) != 0) {
-                        lint_add_issue(doc, issues, "raw_object_hash_mismatch", "error", "source",
-                                       id, "canonical raw source bytes do not match content_hash");
-                        issue_count++;
-                    }
                 }
-                free(bytes);
+            } else if (lint_check_selected(requested_checks, "raw_object_hash_mismatch")) {
+                char actual_hash[CBM_SHA256_HEX_LEN + 1] = "";
+                cbm_sha256_hex(bytes, len, actual_hash);
+                if (!expected_hash || strcmp(actual_hash, expected_hash) != 0) {
+                    lint_add_issue(doc, issues, "raw_object_hash_mismatch", "error", "source", id,
+                                   "canonical raw source bytes do not match content_hash");
+                    issue_count++;
+                }
             }
+            free(bytes);
         }
         sqlite3_finalize(source_stmt);
     }

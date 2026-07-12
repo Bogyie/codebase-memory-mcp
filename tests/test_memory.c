@@ -2,10 +2,11 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 
-#include "memory/memory.h"
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
+#include "memory/memory.h"
+#include "memory/memory_raw.h"
 #include "store/store.h"
 
 #include <sqlite3.h>
@@ -20,6 +21,10 @@
 #include <time.h>
 
 #ifndef _WIN32
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -129,6 +134,68 @@ static char *memory_read_text(const char *path) {
     return body;
 }
 
+#ifndef _WIN32
+static int memory_directory_entry_count(const char *path) {
+    DIR *directory = opendir(path);
+    if (!directory) {
+        return -1;
+    }
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+            count++;
+        }
+    }
+    closedir(directory);
+    return count;
+}
+
+typedef struct {
+    const char *relative;
+} memory_gc_reference_t;
+
+static bool memory_gc_reference_matches(const char *relative, void *opaque) {
+    memory_gc_reference_t *reference = opaque;
+    return reference && reference->relative && relative &&
+           strcmp(reference->relative, relative) == 0;
+}
+
+typedef struct {
+    const char *home;
+    const char *candidate_relative;
+    int calls;
+    int gc_rc;
+    size_t removed;
+} memory_gc_commit_hook_t;
+
+static bool memory_gc_commit_reference(const char *relative, void *opaque) {
+    memory_gc_commit_hook_t *hook = opaque;
+    return !hook || !hook->candidate_relative || !relative ||
+           strcmp(relative, hook->candidate_relative) != 0;
+}
+
+static bool memory_gc_never_referenced(const char *relative, void *opaque) {
+    (void)relative;
+    (void)opaque;
+    return false;
+}
+
+static int memory_gc_during_commit(void *opaque) {
+    memory_gc_commit_hook_t *hook = opaque;
+    size_t staging_removed = 0;
+    size_t orphans_removed = 0;
+    hook->calls++;
+    if (hook->calls > 1) {
+        return 0;
+    }
+    hook->gc_rc = cbm_memory_raw_gc(hook->home, 0, memory_gc_commit_reference, hook,
+                                     &staging_removed, &orphans_removed);
+    hook->removed += orphans_removed;
+    return 0;
+}
+#endif
+
 static char *memory_propose_commit(cbm_memory_t *memory, const char *proposal_id,
                                    const char *operation_id, const char *operations,
                                    const char *expected_revisions) {
@@ -218,6 +285,27 @@ typedef struct {
     atomic_bool *go;
     char *result;
 } memory_ingest_task_t;
+
+#ifndef _WIN32
+typedef struct {
+    const char *path;
+    long delay_ns;
+} memory_fifo_release_task_t;
+
+static void *memory_fifo_release_thread(void *opaque) {
+    memory_fifo_release_task_t *task = opaque;
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = task->delay_ns};
+    struct timespec remaining;
+    while (nanosleep(&delay, &remaining) != 0 && errno == EINTR) {
+        delay = remaining;
+    }
+    int fd = open(task->path, O_WRONLY | O_NONBLOCK);
+    if (fd >= 0) {
+        (void)close(fd);
+    }
+    return NULL;
+}
+#endif
 
 static void *memory_ingest_thread(void *opaque) {
     memory_ingest_task_t *task = opaque;
@@ -333,15 +421,41 @@ TEST(memory_ingest_deduplicates) {
     ASSERT_NOT_NULL(second);
     ASSERT_NOT_NULL(strstr(first, "\"deduplicated\":false"));
     ASSERT_NOT_NULL(strstr(second, "\"deduplicated\":true"));
+    char object_relpath[MEMORY_TEST_PATH];
+    ASSERT_TRUE(
+        memory_result_copy_string(first, "object_path", object_relpath, sizeof(object_relpath)));
     ASSERT_EQ(cbm_memory_snapshot_epoch(memory), 1);
     free(first);
     free(second);
+
+    char object_path[MEMORY_TEST_PATH];
+    snprintf(object_path, sizeof(object_path), "%s/%s", home, object_relpath);
+    ASSERT_EQ(cbm_unlink(object_path), 0);
+    char *repaired_missing = cbm_memory_ingest_json(memory, args);
+    ASSERT_TRUE(memory_result_ok(repaired_missing));
+    ASSERT_NOT_NULL(strstr(repaired_missing, "\"deduplicated\":true"));
+    free(repaired_missing);
+    char *restored = memory_read_text(object_path);
+    ASSERT_NOT_NULL(restored);
+    ASSERT_STR_EQ(restored, "immutable fact");
+    free(restored);
+#ifndef _WIN32
+    ASSERT_EQ(th_write_file(object_path, "corrupt raw bytes"), 0);
+    char *repaired_corrupt = cbm_memory_ingest_json(memory, args);
+    ASSERT_TRUE(memory_result_ok(repaired_corrupt));
+    ASSERT_NOT_NULL(strstr(repaired_corrupt, "\"deduplicated\":true"));
+    free(repaired_corrupt);
+    restored = memory_read_text(object_path);
+    ASSERT_NOT_NULL(restored);
+    ASSERT_STR_EQ(restored, "immutable fact");
+    free(restored);
+#endif
     cbm_memory_close(memory);
     th_rmtree(home);
     PASS();
 }
 
-TEST(memory_ingest_commit_failure_removes_only_its_staged_raw_object) {
+TEST(memory_ingest_commit_failure_leaves_safe_content_addressed_orphan) {
     char home[MEMORY_TEST_PATH];
     char final_path[MEMORY_TEST_PATH];
     char prefix_path[MEMORY_TEST_PATH];
@@ -359,6 +473,71 @@ TEST(memory_ingest_commit_failure_removes_only_its_staged_raw_object) {
     snprintf(final_path, sizeof(final_path), "%s/%s.txt", prefix_path, hash);
     snprintf(staging_path, sizeof(staging_path), "%s/.ingest-staging", home);
 
+#ifndef _WIN32
+    char outside_file[MEMORY_TEST_PATH];
+    char outside_parent[MEMORY_TEST_PATH];
+    char outside_target[MEMORY_TEST_PATH];
+    char outside_staging[MEMORY_TEST_PATH];
+    snprintf(outside_file, sizeof(outside_file), "%s/outside-object.txt", temporary);
+    snprintf(outside_parent, sizeof(outside_parent), "%s/outside-parent", temporary);
+    snprintf(outside_target, sizeof(outside_target), "%s/%s.txt", outside_parent, hash);
+    snprintf(outside_staging, sizeof(outside_staging), "%s/outside-staging", temporary);
+    ASSERT_EQ(th_write_file(outside_file, content), 0);
+    ASSERT_TRUE(cbm_mkdir_p(prefix_path, 0700));
+    ASSERT_EQ(symlink(outside_file, final_path), 0);
+    char *linked_target =
+        cbm_memory_ingest_json(memory, "{\"content\":\"raw object must follow canonical commit\"}");
+    ASSERT_FALSE(memory_result_ok(linked_target));
+    ASSERT_TRUE(memory_result_string_is(linked_target, "error", "raw_store_failed"));
+    free(linked_target);
+    ASSERT_EQ(cbm_unlink(final_path), 0);
+    ASSERT_EQ(cbm_rmdir(prefix_path), 0);
+
+    ASSERT_TRUE(cbm_mkdir_p(prefix_path, 0700));
+    ASSERT_EQ(mkfifo(final_path, 0600), 0);
+    memory_fifo_release_task_t target_fifo_task = {
+        .path = final_path,
+        .delay_ns = 500000000L,
+    };
+    cbm_thread_t target_fifo_thread;
+    ASSERT_EQ(
+        cbm_thread_create(&target_fifo_thread, 0, memory_fifo_release_thread, &target_fifo_task),
+        0);
+    struct timespec target_fifo_start;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &target_fifo_start);
+    char *fifo_target =
+        cbm_memory_ingest_json(memory, "{\"content\":\"raw object must follow canonical commit\"}");
+    int64_t target_fifo_elapsed = memory_test_elapsed_ms(target_fifo_start);
+    ASSERT_EQ(cbm_thread_join(&target_fifo_thread), 0);
+    ASSERT_FALSE(memory_result_ok(fifo_target));
+    ASSERT_TRUE(memory_result_string_is(fifo_target, "error", "raw_store_failed"));
+    ASSERT_LT(target_fifo_elapsed, 400);
+    free(fifo_target);
+    ASSERT_EQ(cbm_unlink(final_path), 0);
+    ASSERT_EQ(cbm_rmdir(prefix_path), 0);
+
+    ASSERT_TRUE(cbm_mkdir_p(outside_parent, 0700));
+    ASSERT_EQ(symlink(outside_parent, prefix_path), 0);
+    char *linked_parent =
+        cbm_memory_ingest_json(memory, "{\"content\":\"raw object must follow canonical commit\"}");
+    ASSERT_FALSE(memory_result_ok(linked_parent));
+    ASSERT_TRUE(memory_result_string_is(linked_parent, "error", "raw_store_failed"));
+    free(linked_parent);
+    ASSERT_FALSE(cbm_file_exists(outside_target));
+    ASSERT_EQ(cbm_unlink(prefix_path), 0);
+
+    ASSERT_TRUE(cbm_mkdir_p(outside_staging, 0700));
+    ASSERT_EQ(symlink(outside_staging, staging_path), 0);
+    char *linked_staging =
+        cbm_memory_ingest_json(memory, "{\"content\":\"raw object must follow canonical commit\"}");
+    ASSERT_FALSE(memory_result_ok(linked_staging));
+    ASSERT_TRUE(memory_result_string_is(linked_staging, "error", "raw_store_failed"));
+    free(linked_staging);
+    ASSERT_EQ(memory_directory_entry_count(outside_staging), 0);
+    ASSERT_EQ(cbm_unlink(staging_path), 0);
+    ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_sources;"), 0);
+#endif
+
     sqlite3 *db = cbm_memory_db(memory);
     ASSERT_NOT_NULL(db);
     sqlite3_commit_hook(db, memory_test_reject_commit, NULL);
@@ -372,9 +551,13 @@ TEST(memory_ingest_commit_failure_removes_only_its_staged_raw_object) {
     free(failed);
     ASSERT_EQ(sqlite3_get_autocommit(db), 1);
     ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_sources;"), 0);
-    ASSERT_FALSE(cbm_file_exists(final_path));
-    ASSERT_FALSE(cbm_file_exists(prefix_path));
+    ASSERT_TRUE(cbm_file_exists(final_path));
+    ASSERT_TRUE(cbm_file_exists(prefix_path));
     ASSERT_FALSE(cbm_file_exists(staging_path));
+    char *orphan = memory_read_text(final_path);
+    ASSERT_NOT_NULL(orphan);
+    ASSERT_STR_EQ(orphan, content);
+    free(orphan);
 
     char *retry =
         cbm_memory_ingest_json(memory, "{\"content\":\"raw object must follow canonical commit\","
@@ -385,9 +568,123 @@ TEST(memory_ingest_commit_failure_removes_only_its_staged_raw_object) {
     ASSERT_FALSE(cbm_file_exists(staging_path));
     ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_sources;"), 1);
 
+#ifndef _WIN32
+    char referenced_relative[MEMORY_TEST_PATH];
+    snprintf(referenced_relative, sizeof(referenced_relative), "raw/objects/%.2s/%s.txt", hash,
+             hash);
+    char orphan_hash[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex("unreferenced gc object", strlen("unreferenced gc object"), orphan_hash);
+    char orphan_path[MEMORY_TEST_PATH];
+    snprintf(orphan_path, sizeof(orphan_path), "%s/raw/objects/%.2s/%s.txt", home, orphan_hash,
+             orphan_hash);
+    char ingest_stale[MEMORY_TEST_PATH];
+    char import_stale[MEMORY_TEST_PATH];
+    snprintf(ingest_stale, sizeof(ingest_stale), "%s/.ingest-staging/ingest-stale", home);
+    snprintf(import_stale, sizeof(import_stale), "%s/.import-staging/import-stale/object-0", home);
+    ASSERT_EQ(th_write_file(orphan_path, "unreferenced gc object"), 0);
+    ASSERT_EQ(th_write_file(ingest_stale, "stale ingest stage"), 0);
+    ASSERT_EQ(th_write_file(import_stale, "stale import stage"), 0);
+    memory_gc_reference_t reference = {.relative = referenced_relative};
+    size_t staging_removed = 0;
+    size_t orphans_removed = 0;
+    ASSERT_EQ(cbm_memory_raw_gc(home, 0, memory_gc_reference_matches, &reference, &staging_removed,
+                                &orphans_removed),
+              0);
+    ASSERT_EQ(staging_removed, 2);
+    ASSERT_EQ(orphans_removed, 1);
+    ASSERT_TRUE(cbm_file_exists(final_path));
+    ASSERT_FALSE(cbm_file_exists(orphan_path));
+    ASSERT_FALSE(cbm_file_exists(ingest_stale));
+    ASSERT_FALSE(cbm_file_exists(import_stale));
+#endif
+
     cbm_memory_close(memory);
     th_rmtree(home);
     PASS();
+}
+
+TEST(memory_raw_gc_respects_live_ingest_leases_and_stage_owners) {
+#ifdef _WIN32
+    PASS();
+#else
+    char home[MEMORY_TEST_PATH];
+    char *temporary = th_mktempdir("cbm_memory_gc_lease");
+    ASSERT_NOT_NULL(temporary);
+    snprintf(home, sizeof(home), "%s", temporary);
+    cbm_memory_t *memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+
+    const char *new_content = "gc must not remove a promoted live inode";
+    char new_hash[CBM_SHA256_HEX_LEN + 1];
+    char new_path[MEMORY_TEST_PATH];
+    char new_relative[MEMORY_TEST_PATH];
+    cbm_sha256_hex(new_content, strlen(new_content), new_hash);
+    snprintf(new_path, sizeof(new_path), "%s/raw/objects/%.2s/%s.txt", home, new_hash, new_hash);
+    snprintf(new_relative, sizeof(new_relative), "raw/objects/%.2s/%s.txt", new_hash, new_hash);
+    memory_gc_commit_hook_t new_hook = {
+        .home = home,
+        .candidate_relative = new_relative,
+        .gc_rc = -1,
+    };
+    sqlite3_commit_hook(cbm_memory_db(memory), memory_gc_during_commit, &new_hook);
+    char *new_result = cbm_memory_ingest_json(memory, "{\"content\":\"gc must not remove a "
+                                                      "promoted live inode\"}");
+    sqlite3_commit_hook(cbm_memory_db(memory), NULL, NULL);
+    ASSERT_TRUE(memory_result_ok(new_result));
+    ASSERT_GT(new_hook.calls, 0);
+    ASSERT_EQ(new_hook.gc_rc, 0);
+    ASSERT_EQ(new_hook.removed, 0);
+    ASSERT_TRUE(cbm_file_exists(new_path));
+    free(new_result);
+
+    const char *orphan_content = "old orphan reused by an ingest transaction";
+    char orphan_hash[CBM_SHA256_HEX_LEN + 1];
+    char orphan_path[MEMORY_TEST_PATH];
+    char orphan_relative[MEMORY_TEST_PATH];
+    cbm_sha256_hex(orphan_content, strlen(orphan_content), orphan_hash);
+    snprintf(orphan_path, sizeof(orphan_path), "%s/raw/objects/%.2s/%s.txt", home, orphan_hash,
+             orphan_hash);
+    snprintf(orphan_relative, sizeof(orphan_relative), "raw/objects/%.2s/%s.txt", orphan_hash,
+             orphan_hash);
+    ASSERT_EQ(th_write_file(orphan_path, orphan_content), 0);
+    memory_gc_commit_hook_t reuse_hook = {
+        .home = home,
+        .candidate_relative = orphan_relative,
+        .gc_rc = -1,
+    };
+    sqlite3_commit_hook(cbm_memory_db(memory), memory_gc_during_commit, &reuse_hook);
+    char *reuse_result = cbm_memory_ingest_json(
+        memory, "{\"content\":\"old orphan reused by an ingest transaction\"}");
+    sqlite3_commit_hook(cbm_memory_db(memory), NULL, NULL);
+    ASSERT_TRUE(memory_result_ok(reuse_result));
+    ASSERT_GT(reuse_hook.calls, 0);
+    ASSERT_EQ(reuse_hook.gc_rc, 0);
+    ASSERT_EQ(reuse_hook.removed, 0);
+    ASSERT_TRUE(cbm_file_exists(orphan_path));
+    free(reuse_result);
+
+    char live_ingest[MEMORY_TEST_PATH];
+    char live_import[MEMORY_TEST_PATH];
+    snprintf(live_ingest, sizeof(live_ingest), "%s/.ingest-staging/ingest-%ld-live", home,
+             (long)getpid());
+    snprintf(live_import, sizeof(live_import),
+             "%s/.import-staging/import-%ld-live/object-0", home, (long)getpid());
+    ASSERT_EQ(th_write_file(live_ingest, "live ingest staging"), 0);
+    ASSERT_EQ(th_write_file(live_import, "live import staging"), 0);
+    size_t staging_removed = 0;
+    size_t orphans_removed = 0;
+    ASSERT_EQ(cbm_memory_raw_gc(home, 0, memory_gc_never_referenced, NULL, &staging_removed,
+                                &orphans_removed),
+              0);
+    ASSERT_TRUE(cbm_file_exists(live_ingest));
+    ASSERT_TRUE(cbm_file_exists(live_import));
+    ASSERT_EQ(cbm_unlink(live_ingest), 0);
+    ASSERT_EQ(cbm_unlink(live_import), 0);
+
+    cbm_memory_close(memory);
+    th_rmtree(home);
+    PASS();
+#endif
 }
 
 TEST(memory_concurrent_ingest_rollback_never_deletes_winner_object) {
@@ -495,6 +792,22 @@ TEST(memory_path_ingest_requires_explicit_file_authority) {
     ASSERT_TRUE(memory_result_string_is(outside, "error", "source_path_not_allowed"));
     free(outside);
 
+    /* A candidate shorter than the configured canonical root must be rejected
+     * before prefix comparison.  This is also an ASan regression for the old
+     * root-length strncmp and boundary-byte read. */
+    char longer_root[MEMORY_TEST_PATH];
+    snprintf(longer_root, sizeof(longer_root), "%s/allowed/a-much-longer-authority-root",
+             temporary);
+    ASSERT_TRUE(cbm_mkdir_p(longer_root, 0700));
+    cbm_setenv("CBM_MEMORY_INGEST_ROOTS", longer_root, 1);
+    unsigned char *short_candidate_bytes = NULL;
+    size_t short_candidate_len = 0;
+    ASSERT_EQ(cbm_memory_raw_read_authorized_path(outside_file, &short_candidate_bytes,
+                                                  &short_candidate_len),
+              CBM_MEMORY_RAW_READ_DENIED);
+    ASSERT_NULL(short_candidate_bytes);
+    cbm_setenv("CBM_MEMORY_INGEST_ROOTS", allowed_dir, 1);
+
     n = snprintf(directory_args, sizeof(directory_args), "{\"path\":\"%s\"}", allowed_dir);
     ASSERT_GTE(n, 0);
     ASSERT_LT(n, (int)sizeof(directory_args));
@@ -532,6 +845,73 @@ TEST(memory_path_ingest_requires_explicit_file_authority) {
     ASSERT_FALSE(memory_result_ok(escaped));
     ASSERT_TRUE(memory_result_string_is(escaped, "error", "source_path_not_allowed"));
     free(escaped);
+
+    char fifo_path[MEMORY_TEST_PATH];
+    snprintf(fifo_path, sizeof(fifo_path), "%s/allowed/source.fifo", temporary);
+    ASSERT_EQ(mkfifo(fifo_path, 0600), 0);
+    memory_fifo_release_task_t source_fifo_task = {
+        .path = fifo_path,
+        .delay_ns = 500000000L,
+    };
+    cbm_thread_t source_fifo_thread;
+    ASSERT_EQ(
+        cbm_thread_create(&source_fifo_thread, 0, memory_fifo_release_thread, &source_fifo_task),
+        0);
+    n = snprintf(path_args, sizeof(path_args), "{\"path\":\"%s\"}", fifo_path);
+    ASSERT_GTE(n, 0);
+    ASSERT_LT(n, (int)sizeof(path_args));
+    struct timespec source_fifo_start;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &source_fifo_start);
+    char *fifo_source = cbm_memory_ingest_json(memory, path_args);
+    int64_t source_fifo_elapsed = memory_test_elapsed_ms(source_fifo_start);
+    ASSERT_EQ(cbm_thread_join(&source_fifo_thread), 0);
+    ASSERT_FALSE(memory_result_ok(fifo_source));
+    ASSERT_TRUE(memory_result_string_is(fifo_source, "error", "source_path_not_allowed"));
+    ASSERT_LT(source_fifo_elapsed, 400);
+    free(fifo_source);
+    ASSERT_EQ(cbm_unlink(fifo_path), 0);
+
+    /* On POSIX, a literal backslash is part of a component, not a separator.
+     * The in-root hard link makes the old normalize-and-stat implementation
+     * pass its inode check while the requested path remains outside authority. */
+    char backslash_dir[MEMORY_TEST_PATH];
+    char backslash_file[MEMORY_TEST_PATH];
+    char in_root_alias_dir[MEMORY_TEST_PATH];
+    char in_root_alias[MEMORY_TEST_PATH];
+    snprintf(backslash_dir, sizeof(backslash_dir), "%s/allowed\\escape", temporary);
+    snprintf(backslash_file, sizeof(backslash_file), "%s/source.txt", backslash_dir);
+    snprintf(in_root_alias_dir, sizeof(in_root_alias_dir), "%s/allowed/escape", temporary);
+    snprintf(in_root_alias, sizeof(in_root_alias), "%s/source.txt", in_root_alias_dir);
+    ASSERT_EQ(th_write_file(backslash_file, "literal backslash is outside the allowed root"), 0);
+    ASSERT_TRUE(cbm_mkdir_p(in_root_alias_dir, 0700));
+    ASSERT_EQ(link(backslash_file, in_root_alias), 0);
+    n = snprintf(path_args, sizeof(path_args), "{\"path\":\"%s/allowed\\\\escape/source.txt\"}",
+                 temporary);
+    ASSERT_GTE(n, 0);
+    ASSERT_LT(n, (int)sizeof(path_args));
+    char *backslash_escape = cbm_memory_ingest_json(memory, path_args);
+    ASSERT_FALSE(memory_result_ok(backslash_escape));
+    ASSERT_TRUE(memory_result_string_is(backslash_escape, "error", "source_path_not_allowed"));
+    free(backslash_escape);
+
+    char raw_helper_home[MEMORY_TEST_PATH];
+    char raw_helper_expected[MEMORY_TEST_PATH];
+    char raw_helper_canonical[MEMORY_TEST_PATH];
+    char raw_helper_concatenated[MEMORY_TEST_PATH];
+    char raw_helper_result[MEMORY_TEST_PATH];
+    snprintf(raw_helper_home, sizeof(raw_helper_home), "%s/raw-helper-home\\", temporary);
+    snprintf(raw_helper_expected, sizeof(raw_helper_expected), "%s/.literal-staging",
+             raw_helper_home);
+    snprintf(raw_helper_concatenated, sizeof(raw_helper_concatenated),
+             "%s/raw-helper-home\\.literal-staging", temporary);
+    ASSERT_TRUE(cbm_mkdir_p(raw_helper_home, 0700));
+    ASSERT_EQ(cbm_memory_raw_ensure_private_subdir(raw_helper_home, ".literal-staging",
+                                                   raw_helper_result, sizeof(raw_helper_result)),
+              0);
+    ASSERT_TRUE(cbm_canonical_path(raw_helper_expected, raw_helper_canonical,
+                                   sizeof(raw_helper_canonical)));
+    ASSERT_STR_EQ(raw_helper_result, raw_helper_canonical);
+    ASSERT_FALSE(cbm_file_exists(raw_helper_concatenated));
 #endif
 
     cbm_unsetenv("CBM_MEMORY_INGEST_ROOTS");
@@ -1340,6 +1720,13 @@ TEST(memory_rebuild_projection_restores_graph_and_search) {
     snprintf(home, sizeof(home), "%s", temporary);
     cbm_memory_t *memory = cbm_memory_open(home);
     ASSERT_NOT_NULL(memory);
+    char *ingested = cbm_memory_ingest_json(
+        memory, "{\"content\":\"projection source evidence\",\"origin\":\"projection-test\"}");
+    ASSERT_TRUE(memory_result_ok(ingested));
+    char object_relpath[MEMORY_TEST_PATH];
+    ASSERT_TRUE(memory_result_copy_string(ingested, "object_path", object_relpath,
+                                          sizeof(object_relpath)));
+    free(ingested);
     const char *operations = "[{\"type\":\"upsert_page\",\"page_id\":\"page:projection\","
                              "\"slug\":\"projection\",\"title\":\"Projection Recovery\","
                              "\"markdown\":\"# Projection Recovery\\nRebuild derived state.\"},"
@@ -1368,6 +1755,23 @@ TEST(memory_rebuild_projection_restores_graph_and_search) {
     ASSERT_GT(memory_result_int(query, "count"), 0);
     ASSERT_NOT_NULL(strstr(query, "page:projection"));
     free(query);
+
+#ifndef _WIN32
+    char raw_path[MEMORY_TEST_PATH];
+    char symlink_source[MEMORY_TEST_PATH];
+    snprintf(raw_path, sizeof(raw_path), "%s/%s", home, object_relpath);
+    snprintf(symlink_source, sizeof(symlink_source), "%s/projection-source-link-target", home);
+    ASSERT_EQ(th_write_file(symlink_source, "projection source evidence"), 0);
+    ASSERT_EQ(cbm_unlink(raw_path), 0);
+    ASSERT_EQ(symlink(symlink_source, raw_path), 0);
+    ASSERT_EQ(cbm_memory_rebuild_projection(memory), -1);
+    char *unsafe_raw_lint = cbm_memory_lint_json(memory, "{\"checks\":[\"missing_raw_object\"]}");
+    ASSERT_TRUE(memory_result_ok(unsafe_raw_lint));
+    ASSERT_EQ(memory_result_int(unsafe_raw_lint, "issue_count"), 1);
+    ASSERT_NOT_NULL(strstr(unsafe_raw_lint, "\"code\":\"missing_raw_object\""));
+    free(unsafe_raw_lint);
+#endif
+
     cbm_memory_close(memory);
     th_rmtree(home);
     PASS();
@@ -1460,7 +1864,8 @@ SUITE(memory) {
     RUN_TEST(memory_status_reports_entities_maintenance_and_projection);
     RUN_TEST(memory_projection_scaling_benchmark_opt_in);
     RUN_TEST(memory_ingest_deduplicates);
-    RUN_TEST(memory_ingest_commit_failure_removes_only_its_staged_raw_object);
+    RUN_TEST(memory_ingest_commit_failure_leaves_safe_content_addressed_orphan);
+    RUN_TEST(memory_raw_gc_respects_live_ingest_leases_and_stage_owners);
     RUN_TEST(memory_concurrent_ingest_rollback_never_deletes_winner_object);
     RUN_TEST(memory_path_ingest_requires_explicit_file_authority);
     RUN_TEST(memory_source_revision_dirties_supported_claim);

@@ -157,8 +157,20 @@ root boundary; regular-file and symlink checks still apply.
 
 Ingested bytes are durably written to private staging first. After the canonical database
 transaction begins, the staged inode is exposed through a no-replace hard link for projection
-verification and remains linked to staging until commit. On rollback, cleanup removes the target
-only when it is still the same inode, so a concurrent writer's immutable object is never deleted.
+verification and remains linked to staging until commit. Staging and raw-prefix directories must
+be plain directories inside canonical Memory home; symlink/reparse escapes are rejected. On
+rollback, the private stage is removed but an already promoted content-addressed target is retained
+as an orphan. This avoids a non-atomic check-then-unlink that could delete a concurrent writer's
+replacement; a later ingest verifies the object before reusing it.
+
+On POSIX, Memory startup also performs best-effort garbage collection with a 24-hour grace
+period. It traverses staging and raw-object directories relative to verified directory
+descriptors, keeps staging owned by a live process, and deletes an unreferenced raw object only
+after obtaining an exclusive inode lease. Ingest and import retain a conflicting shared lease and
+a private hard-link until their database transaction finishes, including when an older orphan is
+being reused. A database lookup error is fail-closed and retains the object. Automatic raw-object
+garbage collection is currently non-mutating on Windows; deployments that override
+`CBM_MEMORY_HOME` there should use a user-private ACL and monitor stale staging separately.
 
 ## Code graph integration
 
@@ -171,10 +183,11 @@ diagnostic query from becoming an implicit durable write.
 
 After a repository index completes, the indexer publishes an opaque graph generation only after
 file hashes, coverage metadata, and FTS are durable. Replacements are built in a sibling staging
-database and atomically installed only after the completion marker and checkpoint succeed. A
-failed rebuild therefore leaves the previous completed database at its published path. Long-running
-MCP readers keep serving that snapshot while a replacement is being built, then reopen after the
-completed file is installed. CodeRef validation runs against that completed graph. It updates only references
+database and copied into the live destination with a SQLite backup transaction only after the
+completion marker and checkpoint succeed. A failed rebuild therefore leaves the previous completed
+generation available. Existing readers retain a consistent SQLite snapshot during publication and
+later read transactions observe the completed generation; no pathname replacement or live-sidecar
+deletion is required. CodeRef validation runs against that completed graph. It updates only references
 whose resolved/missing result actually changed; a no-op reindex therefore does not create a Memory
 epoch or CodeRef revision. Connected memory is marked for review only when validation detects a
 real resolution change.
@@ -221,7 +234,9 @@ Imports validate raw hashes, canonical relation/revision integrity, merge logica
 transaction, rebuild the graph/FTS projection, and materialize current wiki revisions through the
 local outbox. Raw objects are decoded into a private staging directory first and promoted with
 no-replace semantics only after the database transaction begins. A rejected or failed import
-rolls back canonical rows and removes only objects newly installed by that attempt; pre-existing
-content-addressed objects remain untouched. The live database file is never replaced.
+rolls back canonical rows and removes private staging files. Already promoted content-addressed
+objects may remain as orphans rather than being conditionally unlinked; pre-existing
+objects remain untouched. Import staging and raw-prefix directories are canonical-home bounded and
+reject symlink/reparse entries. The live database file is never replaced.
 
 Remote ACLs, multi-user authorization, and a hosted database service are out of scope.

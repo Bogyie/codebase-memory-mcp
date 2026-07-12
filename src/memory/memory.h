@@ -77,7 +77,7 @@ int cbm_memory_validate_code_refs(cbm_memory_t *memory, cbm_store_t *code_store,
  * propose:{proposal_id?, base_epoch?, agent_id?, session_id?, reason?,
  *          expected_revisions?, operations:[...]}
  * commit: {proposal_id, operation_id, user_approved:true, agent_id?, session_id?}
- * lint:   {checks?:[...], limit?, apply?}
+ * lint:   {checks?:[...], limit?, current_project?}; apply is rejected
  * mark_code_changes:
  *         {project, files?:[...], qualified_names?:[...], deleted?:bool, reason?:string}
  */

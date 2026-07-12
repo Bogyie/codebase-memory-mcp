@@ -244,8 +244,10 @@ Available import policies are `reject`, `keep_local`, `keep_remote`, and `newest
 resolves disjoint or unchanged-base revisions; semantic conflicts remain proposals. Git is only
 transport—the live database is never replaced and Git text merge is not the conflict resolver.
 Raw objects are decoded into private staging, verified, and promoted without replacing existing
-objects only after the database transaction begins. If import fails, canonical rows roll back and
-only objects newly installed by that import are removed.
+objects only after the database transaction begins. Staging and raw-prefix directories must be
+plain directories inside canonical Memory home. If import fails, canonical rows and private
+staging roll back; an already promoted content-addressed object may remain as an orphan so
+cleanup never risks deleting a concurrent replacement.
 
 ## Storage and privacy
 
