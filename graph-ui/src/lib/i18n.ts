@@ -113,6 +113,9 @@ export const messages = {
       memoryEntities: "Entities",
       memoryReview: "Open review",
       memoryRefs: "Unresolved refs",
+      memoryOutbox: "Outbox pending",
+      memoryOutboxFailures: (failed: number, exhausted: number) =>
+        `${failed.toLocaleString()} failed outbox item(s); ${exhausted.toLocaleString()} exhausted the retry limit.`,
       memoryProjection: "Projection",
       memoryProjectionDetail: (strategy: string, ms: number, documents: number) =>
         `${strategy} · last rebuild ${ms} ms · ${documents.toLocaleString()} documents`,
@@ -262,6 +265,9 @@ export const messages = {
       memoryEntities: "实体",
       memoryReview: "待审查",
       memoryRefs: "未解析引用",
+      memoryOutbox: "发件箱待处理",
+      memoryOutboxFailures: (failed: number, exhausted: number) =>
+        `${failed.toLocaleString()} 个发件箱项目失败；${exhausted.toLocaleString()} 个已达到重试上限。`,
       memoryProjection: "投影视图",
       memoryProjectionDetail: (strategy: string, ms: number, documents: number) =>
         `${strategy} · 最近重建 ${ms} 毫秒 · ${documents.toLocaleString()} 个文档`,
