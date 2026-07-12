@@ -1,6 +1,6 @@
 # codebase-memory-mcp
 
-> An open-source Model Context Protocol (MCP) server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, cross-service links, and repository design context. AI coding agents query the graph instead of reading files one by one, answering structural questions with roughly 120x fewer tokens (~3,400 vs ~412,000 across five structural queries). Parses 158 languages via vendored tree-sitter grammars, with Hybrid LSP semantic type resolution for Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, and Rust. It also generates semantic graph edges (SEMANTICALLY_RELATED for vocabulary-mismatch matches, SIMILAR_TO for near-clone detection), indexes DESIGN.md/DTCG/CSS design semantics read-only, and supports semantic vector search via bundled nomic-embed-code embeddings compiled into the binary — no API key, no Ollama, no Docker. Ships as a single static C binary (zero runtime dependencies) for macOS, Linux, and Windows. All processing is local — the embeddings run on-device; there is no embedded LLM and no API key.
+> A local Model Context Protocol (MCP) server that indexes codebases into persistent knowledge graphs, indexes repository design context read-only, and maintains Global Memory across repositories and agent sessions. Global Memory retains immutable raw sources and a revisioned wiki of claims, decisions, experiences, preferences, relations, and symbolic code references. Retrieval reports applicability, freshness, evidence lineage, conflicts, and a reuse/verify/experiment/deliberate/abstain route; revision-aware proposals and idempotent compare-and-swap commits prevent multi-agent last-write-wins. The code graph parses 158 languages, includes Hybrid LSP resolution and local semantic search, and answers structural questions with roughly 120x fewer tokens. DESIGN.md, DTCG tokens and resolver modes, CSS variables, and implementation usages form a project-local Design Context. Everything runs locally in a single static C binary with no embedded LLM or API key.
 
 ## Key facts
 
@@ -9,6 +9,10 @@
 - Hybrid LSP type resolution: 9 language families (Python, TypeScript/JavaScript/JSX/TSX, PHP, C#, Go, C/C++, Java, Kotlin, Rust) — a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers including tsserver, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer.
 - MCP tools: 23 (including search_graph with semantic_query, trace_path, query_graph, detect_changes, get_architecture, get_design_context, get_code_snippet, manage_adr, and Global Memory tools).
 - Design Context: project-local, read-only indexing of DESIGN.md, DTCG 2025.10 token and resolver JSON, CSS/SCSS custom properties, modes, aliases, generated assets, and implementation usages. Authoring and generation remain external.
+- Global Memory storage: immutable content-addressed raw sources plus revisioned wiki pages, claims, decisions, experiences, preferences, relations, and symbolic CodeRefs.
+- Safe retrieval: current-context applicability, bitemporal history, freshness and conflict warnings, evidence lineage, and a risk-adaptive route. Opposing-view search is not statically required.
+- Multi-agent updates: reasoning outside transactions, revision-aware proposals, idempotent operation IDs, entity compare-and-swap, and no last-write-wins.
+- Maintenance and sharing: epistemic/temporal/bias/CodeRef lint; deterministic export/import; optional Git or GitHub transport with explicit merge policy.
 - Semantic search: natural-language code discovery via bundled nomic-embed-code embeddings (768-dim, compiled into the binary); 11-signal combined scoring; fully local, no API key.
 - Semantic & similarity edges: SEMANTICALLY_RELATED (vocabulary-mismatch matches) and SIMILAR_TO (MinHash + LSH near-clone / duplicate detection).
 - Cross-repo intelligence: CROSS_* edges link nodes across multiple repos indexed in one store; multi-galaxy 3D layout and cross-repo architecture summary.
@@ -19,9 +23,11 @@
 
 ## Links
 
-- Homepage: https://deusdata.github.io/codebase-memory-mcp/
-- Source code (GitHub): https://github.com/DeusData/codebase-memory-mcp
-- Latest release: https://github.com/DeusData/codebase-memory-mcp/releases/latest
-- Benchmark report: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md
+- Homepage: https://bogyie.github.io/codebase-memory-mcp/
+- Source code (GitHub): https://github.com/bogyie/codebase-memory-mcp
+- Latest release: https://github.com/bogyie/codebase-memory-mcp/releases/latest
 - Design Context guide: https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/DESIGN_CONTEXT.md
+- Global Memory usage guide: https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/GLOBAL_MEMORY_GUIDE.md
+- Global Memory architecture: https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/GLOBAL_MEMORY.md
+- Benchmark report: https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/BENCHMARK.md
 - Research paper: https://arxiv.org/abs/2603.27277

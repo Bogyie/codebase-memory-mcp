@@ -121,6 +121,12 @@ codebase-memory-mcp --ui=true --port=9749
 
 Open `http://localhost:9749` in your browser. The UI runs as a background thread alongside the MCP server — it's available whenever your agent is connected.
 
+The **Memory** workspace is repository-independent and intentionally read-only. It shows Global
+Memory inventory, applicability-first search results, the recommended
+`reuse`/`verify`/`experiment`/`deliberate`/`abstain` route, freshness and conflict warnings, and an
+explicit lint audit. Durable changes remain behind the revision-safe
+`memory_propose` → `memory_commit` workflow.
+
 ### Auto-Index
 
 Enable automatic indexing on MCP session start:
@@ -428,6 +434,35 @@ codebase-memory-mcp cli query_graph '{"graph": "memory", "query": "MATCH (c:Clai
 codebase-memory-mcp cli --raw search_graph '{"project": "my-project", "label": "Function"}' | jq '.results[].name'
 ```
 
+## Global Memory quick start
+
+Global Memory is conditional context, not an automatic prompt dependency. Query it when prior
+cross-project facts, decisions, experiences, or preferences could materially affect the task, and
+always pass the current context for applicability checks:
+
+```bash
+codebase-memory-mcp cli memory_query '{
+  "query": "Which API compatibility rules apply?",
+  "current_context": {"project": "payments-service"},
+  "impact": "high",
+  "freshness": "require_current"
+}'
+```
+
+The result includes evidence and conflict context plus a route:
+`reuse`, `verify`, `experiment`, `deliberate`, or `abstain`. This is deliberately risk-adaptive;
+it does not force an opposing-view search when applicable evidence is already strong.
+
+Writes require authorization and follow four explicit steps: ingest an immutable source, read the
+current snapshot/revisions, stage operations with `memory_propose`, then atomically apply them with
+an idempotent `memory_commit`. Same-entity races return a revision conflict instead of silently
+overwriting another agent.
+
+See [Using Global Memory](docs/GLOBAL_MEMORY_GUIDE.md) for end-to-end CLI examples, stale-fact
+handling, lint, the UI workspace, and secure export/sync guidance. The
+[Global Memory Architecture](docs/GLOBAL_MEMORY.md) defines the underlying epistemic, temporal,
+concurrency, and sharing contracts.
+
 ## MCP Tools
 
 ### Indexing
@@ -461,6 +496,7 @@ Global Memory is user-local and repository-independent. Immutable source objects
 `raw/`, committed wiki revisions are materialized under `wiki/`, and a hidden SQLite graph keeps
 provenance, bitemporal claim state, proposals, activities, and full-text search. Set
 `CBM_MEMORY_HOME` to override the platform data-directory default. See
+[Using Global Memory](docs/GLOBAL_MEMORY_GUIDE.md) for task-oriented workflows and
 [Global Memory Architecture](docs/GLOBAL_MEMORY.md) for its epistemic and concurrency contracts.
 
 | Tool | Description |
