@@ -609,6 +609,7 @@ TEST(cli_skill_files_content) {
     /* Exploring capabilities */
     ASSERT(strstr(sk[0].content, "search_graph") != NULL);
     ASSERT(strstr(sk[0].content, "get_graph_schema") != NULL);
+    ASSERT(strstr(sk[0].content, "source_state=\"current\"") != NULL);
 
     /* Tracing capabilities */
     ASSERT(strstr(sk[0].content, "trace_path") != NULL);
@@ -622,10 +623,16 @@ TEST(cli_skill_files_content) {
     /* Reference capabilities */
     ASSERT(strstr(sk[0].content, "query_graph") != NULL);
     ASSERT(strstr(sk[0].content, "Cypher") != NULL);
-    ASSERT(strstr(sk[0].content, "23 MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "24 MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "memory_status") != NULL);
+    ASSERT(strstr(sk[0].content, "DEFINES_TOKEN") != NULL);
+    ASSERT(strstr(sk[0].content, "OVERRIDES") != NULL);
+    ASSERT(strstr(sk[0].content, "IMPLEMENTS, OVERRIDE,") == NULL);
     ASSERT(strstr(sk[0].content, "get_design_context") != NULL);
     ASSERT(strstr(sk[0].content, "Global Memory Retrieval") != NULL);
     ASSERT(strstr(sk[0].content, "Do not search for an opposing view by default") != NULL);
+    ASSERT(strstr(sk[0].content, "user_approved=true") != NULL);
+    ASSERT(strstr(sk[0].content, "allow_external_path=true") != NULL);
 
     /* Gotchas section */
     ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
@@ -642,6 +649,8 @@ TEST(cli_codex_instructions) {
     ASSERT(codex == shared);
     ASSERT(strstr(codex, "Codebase Knowledge Graph") != NULL);
     ASSERT(strstr(codex, "Global Memory") != NULL);
+    ASSERT(strstr(codex, "user_approved=true") != NULL);
+    ASSERT(strstr(codex, "allow_external_path=true") != NULL);
     PASS();
 }
 

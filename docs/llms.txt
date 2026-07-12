@@ -1,23 +1,25 @@
 # codebase-memory-mcp
 
-> A local Model Context Protocol (MCP) server that indexes codebases into persistent knowledge graphs, indexes repository design context read-only, and maintains Global Memory across repositories and agent sessions. Global Memory retains immutable raw sources and a revisioned wiki of claims, decisions, experiences, preferences, relations, and symbolic code references. Retrieval reports applicability, freshness, evidence lineage, conflicts, and a reuse/verify/experiment/deliberate/abstain route; revision-aware proposals and idempotent compare-and-swap commits prevent multi-agent last-write-wins. The code graph parses 158 languages, includes Hybrid LSP resolution and local semantic search, and answers structural questions with roughly 120x fewer tokens. DESIGN.md, DTCG tokens and resolver modes, CSS variables, and implementation usages form a project-local Design Context. Everything runs locally in a single static C binary with no embedded LLM or API key.
+> A local Model Context Protocol (MCP) server that indexes codebases into persistent knowledge graphs, indexes repository design context read-only, and maintains Global Memory across repositories and agent sessions. Global Memory retains immutable raw sources and a revisioned wiki of claims, decisions, experiences, preferences, relations, and symbolic code references. Retrieval reports applicability, freshness, evidence lineage, conflicts, and a reuse/verify/experiment/deliberate/abstain route; revision-aware proposals and idempotent compare-and-swap commits prevent multi-agent last-write-wins. The code graph parses 158 languages, includes Hybrid LSP resolution and local semantic search, and answers structural questions with roughly 120x fewer tokens. DESIGN.md, DTCG tokens and resolver modes, CSS variables, and implementation usages form a project-local Design Context. Indexing, querying, and storage run locally in a single static C binary with no embedded LLM, API key, or telemetry. Explicit `memory_export` and `memory_sync` operations can share a bundle containing raw sources when authorized.
 
 ## Key facts
 
 - License: MIT, open source.
 - Languages: 158 (158 vendored tree-sitter grammars compiled into the binary).
 - Hybrid LSP type resolution: 9 language families (Python, TypeScript/JavaScript/JSX/TSX, PHP, C#, Go, C/C++, Java, Kotlin, Rust) — a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers including tsserver, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer.
-- MCP tools: 23 (including search_graph with semantic_query and value-free YAML config_path filtering, trace_path, query_graph, detect_changes, memory_status, get_architecture, get_design_context, get_code_snippet, manage_adr, and Global Memory tools).
+- MCP tools: 24 (including search_graph with semantic_query and value-free YAML config_path filtering, trace_path, query_graph, detect_changes, memory_status, get_architecture, get_design_context, get_code_snippet, manage_adr, and Global Memory tools).
 - Design Context: project-local, read-only indexing of DESIGN.md, DTCG 2025.10 token and resolver JSON, CSS/SCSS custom properties, modes, aliases, generated assets, and implementation usages. Authoring and generation remain external.
 - Global Memory storage: immutable content-addressed raw sources plus revisioned wiki pages, claims, decisions, experiences, preferences, relations, and symbolic CodeRefs.
 - Safe retrieval: current-context applicability, bitemporal history, freshness and conflict warnings, evidence lineage, and a risk-adaptive route. Opposing-view search is not statically required.
-- Multi-agent updates: reasoning outside transactions, revision-aware proposals, idempotent operation IDs, entity compare-and-swap, and no last-write-wins.
-- Maintenance and sharing: epistemic/temporal/bias/CodeRef lint; deterministic export/import; optional Git or GitHub transport with explicit merge policy.
+- Multi-agent updates: reasoning outside transactions, revision-aware proposals, idempotent operation IDs, entity compare-and-swap, explicit `user_approved:true` on `memory_commit`, and no last-write-wins.
+- Maintenance and sharing: epistemic/temporal/bias/CodeRef lint; deterministic export/import; optional Git or GitHub transport with explicit merge policy. External export/import paths require `allow_external_path:true` plus `user_approved:true`; replacing an export also requires `overwrite:true`.
+- Snippet freshness: `get_code_snippet.source_state` is one of `current`, `stale_worktree`, `missing_worktree`, `range_unavailable`, `metadata_match`, or `unknown`; only `current` proves a live content-hash match.
+- Graph publication: completed staging generations are installed into the live destination through a SQLite backup transaction, preserving consistent readers without pathname replacement.
 - Semantic search: natural-language code discovery via bundled nomic-embed-code embeddings (768-dim, compiled into the binary); 11-signal combined scoring; fully local, no API key.
 - Semantic & similarity edges: SEMANTICALLY_RELATED (vocabulary-mismatch matches) and SIMILAR_TO (MinHash + LSH near-clone / duplicate detection).
 - Cross-repo intelligence: CROSS_* edges link nodes across multiple repos indexed in one store; multi-galaxy 3D layout and cross-repo architecture summary.
 - Cross-service linking: HTTP route ↔ call-site matching, plus gRPC/GraphQL/tRPC detection and pub/sub channels (EMITS/LISTENS_ON for Socket.IO, EventEmitter, generic buses).
-- Supported agents: 11 (Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, Kiro).
+- Supported agents: 13 (Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, OpenClaw, Kiro, Junie).
 - Performance: Linux kernel (28M LOC, 75K files) full index in 3 minutes → 4.81M nodes, 7.72M edges; Cypher queries in under 1ms.
 - Distribution: single static C binary; also npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, and `go install`.
 

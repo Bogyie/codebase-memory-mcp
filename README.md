@@ -10,18 +10,18 @@
 [![Tests](https://img.shields.io/badge/tests-5604_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
 [![Languages](https://img.shields.io/badge/languages-158-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
-[![Agents](https://img.shields.io/badge/agents-11-purple)](https://github.com/DeusData/codebase-memory-mcp)
+[![Agents](https://img.shields.io/badge/agents-13-purple)](https://github.com/DeusData/codebase-memory-mcp)
 [![Pure C](https://img.shields.io/badge/pure_C-zero_dependencies-blue)](https://github.com/DeusData/codebase-memory-mcp)
 [![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/bogyie/codebase-memory-mcp/releases/latest)
 [![arXiv](https://img.shields.io/badge/arXiv-2603.27277-b31b1b?logo=arxiv)](https://arxiv.org/abs/2603.27277)
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, cross-service links, and repository design context. 23 MCP tools. Zero dependencies. Plug and play across 11 coding agents.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, cross-service links, and repository design context. 24 MCP tools. Zero dependencies. Plug and play across 13 coding agents.
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
-> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. Fork releases are built from this repository by GitHub Actions and include SHA-256 checksums. All processing happens 100% locally; your code never leaves your machine. Found a security issue? See [SECURITY.md](SECURITY.md).
+> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. Fork releases are built from this repository by GitHub Actions and include SHA-256 checksums. Indexing, querying, and Global Memory storage run locally and collect no telemetry. An explicitly approved `memory_export` can write a bundle containing raw sources outside the Memory home, and `memory_sync` can send that bundle to a configured Git remote; review the destination before sharing. Found a security issue? See [SECURITY.md](SECURITY.md).
 
 <p align="center">
   <img src="docs/graph-ui-screenshot.png" alt="Graph visualization UI showing the codebase-memory-mcp knowledge graph" width="800">
@@ -35,11 +35,11 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys. Download → `install` → restart agent → done.
 - **158 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
-- **11 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro — configures MCP entries, instruction files, and pre-tool hooks for each.
+- **13 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, OpenClaw, Kiro, and Junie — and installs each supported MCP, instruction, and hook integration.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
 - **Design Context** — read-only indexing for `DESIGN.md`, DTCG tokens/resolvers, CSS custom properties, modes, aliases, generated assets, and implementation usage. See the [Design Context guide](docs/DESIGN_CONTEXT.md).
-- **23 MCP tools** — search, trace, architecture, design context, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, Global Memory status and management, and more.
+- **24 MCP tools** — search, trace, architecture, design context, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, Global Memory status and management, and more.
 
 ## Quick Start
 
@@ -189,7 +189,7 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 - **Cross-repo architecture summary** combining services, routes, and dependencies across the indexed fleet
 
 ### Edge types (selected)
-- `CALLS`, `IMPORTS`, `DEFINES`, `IMPLEMENTS`, `INHERITS`
+- `CALLS`, `IMPORTS`, `DEFINES`, `DEFINES_TOKEN`, `IMPLEMENTS`, `INHERITS`
 - `HTTP_CALLS`, `ASYNC_CALLS` (cross-service)
 - `EMITS`, `LISTENS_ON` (channels)
 - `DATA_FLOWS` with arg-to-param mapping + field access chains
@@ -262,7 +262,7 @@ Benchmarked on Apple M3 Pro:
 
 ## Troubleshooting & Diagnostics
 
-codebase-memory-mcp runs **100% locally and collects no telemetry** — your code, queries, environment, and usage never leave your machine. That privacy guarantee also means that when you hit something we can't reproduce on our side (a slow memory climb over hours, a performance regression, a leak that only appears after days of real use), **we have no data at all unless you choose to send it.** Here is how to capture it yourself.
+Indexing, querying, diagnostics, and Global Memory storage run **locally and collect no telemetry**. The server sends no code, queries, environment, or usage data on its own. The explicit sharing tools are the exception: `memory_export` bundles immutable raw sources, and `memory_sync push` can send that bundle to a configured Git remote. That privacy model means that when you hit something we can't reproduce on our side (a slow memory climb over hours, a performance regression, a leak that only appears after days of real use), **we have no diagnostic data unless you choose to send it.** Here is how to capture it yourself.
 
 ### Capture a diagnostics log
 
@@ -378,7 +378,7 @@ Add to `~/.claude/.mcp.json` (global) or project `.mcp.json`:
 }
 ```
 
-Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 23 tools.
+Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 24 tools.
 
 </details>
 
@@ -397,8 +397,10 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 | Aider | — | `CONVENTIONS.md` | — |
 | KiloCode | `mcp_settings.json` | `~/.kilocode/rules/` | — |
 | VS Code | `Code/User/mcp.json` | — | — |
+| Cursor | `~/.cursor/mcp.json` | — | — |
 | OpenClaw | `openclaw.json` | — | — |
 | Kiro | `.kiro/settings/mcp.json` | — | — |
+| Junie | `~/.junie/mcp/mcp.json` | — | — |
 
 Managed instruction blocks cover both code-graph discovery and conditional Global Memory use.
 `install` and `update` replace only the `codebase-memory-mcp` marker block and preserve content
@@ -461,8 +463,9 @@ it does not force an opposing-view search when applicable evidence is already st
 
 Writes require authorization and follow four explicit steps: ingest an immutable source, read the
 current snapshot/revisions, stage operations with `memory_propose`, then atomically apply them with
-an idempotent `memory_commit`. Same-entity races return a revision conflict instead of silently
-overwriting another agent.
+an idempotent `memory_commit`. A commit is rejected unless the current task explicitly authorized
+the write and the call includes `user_approved: true`. Same-entity races return a revision conflict
+instead of silently overwriting another agent.
 
 See [Using Global Memory](docs/GLOBAL_MEMORY_GUIDE.md) for end-to-end CLI examples, stale-fact
 handling, lint, the UI workspace, and secure export/sync guidance. The
@@ -489,7 +492,7 @@ concurrency, and sharing contracts.
 | `detect_changes` | Read-only mapping from git diff to affected symbols + blast radius. Never writes Global Memory. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
-| `get_code_snippet` | Read bounded live source by qualified name, with indexed-range provenance and explicit current, stale, missing, or unknown worktree state. |
+| `get_code_snippet` | Read bounded live source by qualified name, with indexed-range provenance and an explicit `source_state` freshness contract. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `get_design_context` | Paginated project-local design systems, tokens, components, mode-specific values, aliases, guidance, and usages. |
 | `search_code` | Grep-like text search within indexed project files. |
@@ -508,9 +511,12 @@ provenance, bitemporal claim state, proposals, activities, and full-text search.
 Code discovery and durable memory writes have separate contracts. `detect_changes` is strictly
 observational. After a successful repository index, CodeRefs are validated against the completed
 graph directly; unchanged resolution is a no-op and does not create a Memory epoch or revision.
-Project graph replacements are built at a sibling staging path. Readers switch generations only
-after hashes, coverage, FTS, the completion marker, and an atomic install have succeeded,
-and `index_status` exposes `snapshot_complete` plus the opaque `index_generation`.
+Project graph replacements are completed in a staging database only after hashes, coverage, FTS,
+and the completion marker succeed. Publication then copies that completed generation into the live
+destination through a SQLite backup transaction. Existing readers retain a consistent SQLite
+snapshot while later reads observe the completed generation; publication does not depend on a
+pathname rename or sidecar deletion. `index_status` exposes `snapshot_complete` plus the opaque
+`index_generation`.
 
 Projection rebuild timing is exposed through `memory_status`. The opt-in scaling gate and the
 current decision thresholds are documented in
@@ -522,11 +528,18 @@ current decision thresholds are documented in
 | `memory_query` | Applicability-first search, lookup, timeline, and as-of retrieval. |
 | `memory_status` | Read-only epoch, entity, maintenance, CodeRef, and projection counters. |
 | `memory_propose` | Stage revision-aware page, claim, decision, experience, preference, relation, or CodeRef operations. |
-| `memory_commit` | Atomically commit a proposal using entity revisions and an idempotent operation ID. |
+| `memory_commit` | Atomically commit a proposal using entity revisions and an idempotent operation ID; requires explicit `user_approved: true`. |
 | `memory_lint` | Check epistemic, temporal, graph, materialization, bias, and CodeRef health. |
-| `memory_export` | Write a deterministic portable logical bundle. |
-| `memory_import` | Merge a bundle with an explicit conflict policy; never swaps the live database. |
+| `memory_export` | Write a deterministic portable logical bundle. External paths require `allow_external_path: true` plus `user_approved: true`; replacing any existing bundle also requires `overwrite: true` plus approval. |
+| `memory_import` | Merge a bundle with an explicit conflict policy; never swaps the live database. External paths require `allow_external_path: true` plus `user_approved: true`. |
 | `memory_sync` | Use Git (including an optional GitHub remote) as bundle transport. |
+
+Without a `path`, export and import use the managed bundle under the Global Memory home. An
+explicit path outside that home is accepted only when both `allow_external_path: true` and
+`user_approved: true` are present. Export never replaces an existing file unless both
+`overwrite: true` and `user_approved: true` are present. Bundles include the retained raw source
+objects, so inspect the destination or Git remote before exporting or synchronizing sensitive
+memory.
 
 ## Graph Data Model
 
@@ -536,11 +549,21 @@ current decision thresholds are documented in
 
 ### Edge Types
 
-`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`, `PROVIDES`, `ALIASES_TO`, `OVERRIDES`, `USES_TOKEN`, `DOCUMENTED_BY`, `GUIDED_BY`, `GENERATED_AS`
+`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `DEFINES_TOKEN`, `IMPORTS`, `CALLS`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`, `PROVIDES`, `ALIASES_TO`, `OVERRIDES`, `USES_TOKEN`, `DOCUMENTED_BY`, `GUIDED_BY`, `GENERATED_AS`
 
 ### Qualified Names
 
 `get_code_snippet` uses qualified names: `<project>.<path_parts>.<name>`. Use `search_graph` to discover them first.
+
+Its `source_state` reports how safely the graph-derived line range can be applied to the live
+worktree:
+
+- `current`: the live file content hash matches the indexed hash and the requested range was read.
+- `stale_worktree`: the content hash differs, or a legacy index without a hash has different file metadata; the returned live range may no longer represent the symbol.
+- `missing_worktree`: the indexed file is no longer available in the live worktree.
+- `range_unavailable`: the file exists, but the indexed range could not be returned.
+- `metadata_match`: the file and range are available and legacy metadata matches, but no content-hash proof is available; re-index to establish `current`.
+- `unknown`: the index has no usable file-version record, so freshness cannot be established.
 
 ### Supported Cypher (openCypher read subset)
 
@@ -577,11 +600,15 @@ codebase-memory-mcp config reset auto_index              # reset to default
 | `CBM_ALLOWED_ROOT` | *(unset)* | Restrict `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused; unset imposes no restriction. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the database storage directory. All project indexes and config are stored here. |
 | `CBM_MEMORY_HOME` | *(platform user-data directory)* | Override the Global Memory root containing immutable `raw/` sources, materialized `wiki/` pages, its hidden database, exports, and Git sync worktree. This is intentionally separate from the disposable project-index cache. |
+| `CBM_MEMORY_INGEST_ROOTS` | *(unset; path ingest disabled)* | Platform path-list (`:` on POSIX, `;` on Windows) of roots from which `memory_ingest` may read a regular, non-symlink file by `path`. Inline `content` ingest is unaffected. |
+| `CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST` | `false` | Set to `1`/`true` only as an operator-level opt-in to allow `memory_ingest` path reads outside an allowlist. Canonicalization and regular non-symlink checks still apply. |
+| `CBM_GIT_BIN` | trusted `git` from `PATH` | On POSIX, select an absolute executable for `memory_sync`; relative/current-directory executable lookup is rejected. |
 | `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable periodic diagnostics output to `/tmp/cbm-diagnostics-<pid>.json`. |
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
 | `CBM_LOG_LEVEL` | `info` | Set the minimum log level. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none` — or their numeric equivalents `0`–`4` matching the internal enum. Logs go to stderr; stdout is reserved for MCP JSON-RPC. |
 | `CBM_WORKERS` | *(detected)* | Override the parallel-indexing worker count returned by `cbm_default_worker_count`. Useful inside containers where `sysconf(_SC_NPROCESSORS_ONLN)` reports host CPUs rather than the cgroup's effective quota. Range 1–256; invalid values are ignored with a warning. |
 | `CBM_MEM_BUDGET_MB` | *(detected)* | Override the in-memory graph budget with an explicit cap in MiB, taking precedence over the `ram_fraction × total_RAM` default. Useful on bare-metal hosts without a cgroup limit, or to pin a budget *below* the cgroup limit so headroom is left for sibling processes. Must be a positive integer; it is clamped to detected total RAM (logged as `mem.budget.clamped`), and non-numeric or non-positive values are ignored with a warning (`mem.budget.env.invalid`). |
+| `CBM_SQLITE_MMAP_SIZE` | `67108864` | SQLite mapping size in bytes for on-disk stores. Set a negative value to disable mmap; malformed values use the 64 MiB default. |
 | `CBM_DUMP_VERIFY_MIN_RATIO` | `0.5` | After indexing, compare persisted SQLite node count to the in-memory dump count. When persisted nodes fall below this fraction of committed nodes (and committed > 50), `index_repository` returns `status:"degraded"` instead of silent `indexed`. Range 0–1; set `0` to disable. Invalid values are ignored with a warning. |
 
 ```bash
@@ -677,9 +704,9 @@ Also supported (not yet benchmarked): Ada, Agda, Apex, Assembly (NASM), Astro, A
 ```
 src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
-  mcp/                MCP server (23 tools, JSON-RPC 2.0, session detection, auto-index)
+  mcp/                MCP server (24 tools, JSON-RPC 2.0, session detection, auto-index)
   memory/             User-global raw sources, wiki graph, retrieval, maintenance, and sharing
-  cli/                Install/uninstall/update/config (11 agents, hooks, instructions)
+  cli/                Install/uninstall/update/config (13 agents, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)
   cypher/             Cypher query lexer, parser, planner, executor
