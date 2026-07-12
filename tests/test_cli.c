@@ -25,6 +25,12 @@
 
 /* Internal migration helper kept out of the public CLI API. */
 extern int cbm_cleanup_legacy_codex_instructions(const char *home, bool dry_run);
+extern int cbm_cli_download_to_fd_for_test(const char *url, int output_fd, size_t max_bytes);
+extern char *cbm_cli_parse_latest_tag_for_test(const char *headers, size_t header_len);
+#ifdef __APPLE__
+extern int cbm_cli_resolve_apple_tool_for_test(const char *name, const char *env_name, char *out,
+                                               size_t out_size);
+#endif
 
 /* Exact Go-era generated file written to
  * ~/.codex/instructions/codebase-memory-mcp.md. Its byte hash is used by the
@@ -1377,6 +1383,34 @@ TEST(cli_install_same_file_guard_issue472) {
     PASS();
 }
 
+TEST(cli_install_binary_copy_preserves_nul_bytes) {
+    char tmpdir[1024];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-binary-nul-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char src[512];
+    char dst[512];
+    snprintf(src, sizeof(src), "%s/source", tmpdir);
+    snprintf(dst, sizeof(dst), "%s/installed", tmpdir);
+    static const unsigned char expected[] = {'M', 'Z', 0x00, 0x7f, 'B', 0x00, 'X'};
+    FILE *source = fopen(src, "wb");
+    ASSERT_NOT_NULL(source);
+    ASSERT_EQ(fwrite(expected, 1, sizeof(expected), source), sizeof(expected));
+    ASSERT_EQ(fclose(source), 0);
+
+    ASSERT_EQ(cbm_copy_binary_to_target(src, dst), 0);
+    unsigned char actual[sizeof(expected) + 1U] = {0};
+    FILE *installed = fopen(dst, "rb");
+    ASSERT_NOT_NULL(installed);
+    size_t actual_len = fread(actual, 1, sizeof(actual), installed);
+    ASSERT_EQ(fclose(installed), 0);
+    ASSERT_EQ(actual_len, sizeof(expected));
+    ASSERT_MEM_EQ(actual, expected, sizeof(expected));
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_update_target_uses_official_install_receipt) {
     char home[256];
     snprintf(home, sizeof(home), "/tmp/cli-update-receipt-XXXXXX");
@@ -1403,8 +1437,7 @@ TEST(cli_update_target_uses_official_install_receipt) {
     write_test_file(receipt, body);
 
     char out[1024];
-    ASSERT_EQ(cbm_resolve_update_target(home, managed, out, sizeof(out)),
-              0);
+    ASSERT_EQ(cbm_resolve_update_target(home, managed, out, sizeof(out)), 0);
     ASSERT_STR_EQ(out, managed);
 
     test_rmdir_r(home);
@@ -3258,7 +3291,7 @@ TEST(cli_config_persists) {
 
 TEST(replace_binary_overwrites_readonly) {
     /* Simulate #114: existing binary has mode 0500 (no write permission).
-     * cbm_replace_binary must unlink first, then create with 0755. */
+     * Atomic rename must replace it without opening the target for writes. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-replace-XXXXXX");
     if (!cbm_mkdtemp(tmpdir)) {
@@ -3298,6 +3331,30 @@ TEST(replace_binary_overwrites_readonly) {
     PASS();
 }
 
+TEST(replace_binary_replaces_symlink_not_target) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-replace-link-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char outside[512];
+    char target[512];
+    snprintf(outside, sizeof(outside), "%s/user-owned", tmpdir);
+    snprintf(target, sizeof(target), "%s/codebase-memory-mcp", tmpdir);
+    write_test_file(outside, "must survive");
+    ASSERT_EQ(symlink(outside, target), 0);
+
+    static const unsigned char replacement[] = "new executable";
+    ASSERT_EQ(cbm_replace_binary(target, replacement, (int)sizeof(replacement) - 1, 0755), 0);
+    ASSERT_STR_EQ(read_test_file(outside), "must survive");
+    ASSERT_STR_EQ(read_test_file(target), "new executable");
+    struct stat st;
+    ASSERT_EQ(lstat(target, &st), 0);
+    ASSERT_TRUE(S_ISREG(st.st_mode));
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(replace_binary_creates_new_file) {
     /* If no existing file, cbm_replace_binary should create it. */
     char tmpdir[256];
@@ -3322,6 +3379,27 @@ TEST(replace_binary_creates_new_file) {
 
     remove(path);
     rmdir(tmpdir);
+    PASS();
+}
+
+TEST(replace_binary_failure_keeps_target_and_cleans_staging) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-replace-fail-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char target[512];
+    snprintf(target, sizeof(target), "%s/existing-directory", tmpdir);
+    ASSERT_EQ(mkdir(target, 0700), 0);
+    static const unsigned char replacement[] = "must not publish";
+    ASSERT_NEQ(cbm_replace_binary(target, replacement, (int)sizeof(replacement) - 1, 0755), 0);
+
+    struct stat st;
+    ASSERT_EQ(lstat(target, &st), 0);
+    ASSERT_TRUE(S_ISDIR(st.st_mode));
+    ASSERT_EQ(rmdir(target), 0);
+    /* The parent can be removed only if the unique .new staging file was
+     * cleaned on the failed rename path. */
+    ASSERT_EQ(rmdir(tmpdir), 0);
     PASS();
 }
 
@@ -3505,6 +3583,176 @@ TEST(cli_release_checksum_requires_exact_valid_entry) {
     PASS();
 }
 
+TEST(cli_latest_tag_parser_is_bounded_and_strict) {
+    const char short_headers[] = "L\nLoc\nLocation\n";
+    ASSERT_NULL(cbm_cli_parse_latest_tag_for_test(short_headers, sizeof(short_headers) - 1U));
+
+    const char valid_headers[] =
+        "HTTP/2 302\r\nLoCaTiOn:\thttps://github.com/DustinBrett/daedalOS/releases/tag/"
+        "v1.2.3-rc.1+build\t\r\n\r\n";
+    char *tag = cbm_cli_parse_latest_tag_for_test(valid_headers, sizeof(valid_headers) - 1U);
+    ASSERT_NOT_NULL(tag);
+    ASSERT_STR_EQ(tag, "v1.2.3-rc.1+build");
+    free(tag);
+
+    const char traversal[] = "Location: https://example.invalid/tag/v1.2.3?asset=../../evil\r\n";
+    ASSERT_NULL(cbm_cli_parse_latest_tag_for_test(traversal, sizeof(traversal) - 1U));
+
+    const char embedded_nul[] = {'L', 'o', 'c', 'a', 't', 'i', 'o', 'n', ':', ' ', 'v', '1', '\0',
+                                 'L', 'o', 'c', 'a', 't', 'i', 'o', 'n', ':', ' ', 'v', '9', '\n'};
+    ASSERT_NULL(cbm_cli_parse_latest_tag_for_test(embedded_nul, sizeof(embedded_nul)));
+    PASS();
+}
+
+TEST(cli_update_download_uses_private_bounded_descriptor) {
+#ifdef _WIN32
+    SKIP_PLATFORM(
+        "POSIX executable fixture; Windows absolute curl resolution is reviewed statically");
+#else
+    const char *prior = getenv("CBM_CURL_BIN");
+    char *saved = prior ? strdup(prior) : NULL;
+    const char *prior_path = getenv("PATH");
+    char *saved_path = prior_path ? strdup(prior_path) : NULL;
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-curl-fd-XXXXXX");
+    bool setup_ok = cbm_mkdtemp(tmpdir) != NULL;
+    char fake_curl[512];
+    char path_curl[512];
+    char output_path[512];
+    snprintf(fake_curl, sizeof(fake_curl), "%s/fake-curl", tmpdir);
+    snprintf(path_curl, sizeof(path_curl), "%s/curl", tmpdir);
+    snprintf(output_path, sizeof(output_path), "%s/output-XXXXXX", tmpdir);
+    if (setup_ok) {
+        write_test_file(fake_curl, "#!/bin/sh\nprintf 'stderr-must-not-be-captured' >&2\n"
+                                   "printf 'private-download'\n");
+        write_test_file(path_curl, "#!/bin/sh\nprintf 'path-fallback-must-not-run'\n");
+        setup_ok = chmod(fake_curl, 0700) == 0 && chmod(path_curl, 0700) == 0 &&
+                   cbm_setenv("CBM_CURL_BIN", fake_curl, 1) == 0;
+    }
+    int fd = setup_ok ? cbm_mkstemp(output_path) : -1;
+    if (fd >= 0) {
+        static const char stale[] = "stale-trailing-bytes-that-must-be-truncated";
+        setup_ok = write(fd, stale, sizeof(stale) - 1U) == (ssize_t)(sizeof(stale) - 1U);
+    }
+    int first_rc =
+        fd >= 0 ? cbm_cli_download_to_fd_for_test("https://unused.invalid", fd, 64) : -99;
+    char payload[64] = {0};
+    ssize_t payload_len = -1;
+    if (fd >= 0 && lseek(fd, 0, SEEK_SET) == 0) {
+        payload_len = read(fd, payload, sizeof(payload) - 1U);
+    }
+    if (fd >= 0) {
+        close(fd);
+        unlink(output_path);
+    }
+
+    snprintf(output_path, sizeof(output_path), "%s/invalid-override-XXXXXX", tmpdir);
+    fd = setup_ok ? cbm_mkstemp(output_path) : -1;
+    bool invalid_setup = fd >= 0 && cbm_setenv("PATH", tmpdir, 1) == 0 &&
+                         cbm_setenv("CBM_CURL_BIN", "relative-curl", 1) == 0;
+    int invalid_override_rc =
+        invalid_setup ? cbm_cli_download_to_fd_for_test("https://unused.invalid", fd, 64) : 0;
+    if (fd >= 0) {
+        close(fd);
+        unlink(output_path);
+    }
+
+    if (setup_ok) {
+        write_test_file(fake_curl, "#!/bin/sh\nprintf '01234567890123456789'\n");
+        (void)chmod(fake_curl, 0700);
+        setup_ok = cbm_setenv("CBM_CURL_BIN", fake_curl, 1) == 0;
+    }
+    snprintf(output_path, sizeof(output_path), "%s/capped-XXXXXX", tmpdir);
+    fd = setup_ok ? cbm_mkstemp(output_path) : -1;
+    int capped_rc = fd >= 0 ? cbm_cli_download_to_fd_for_test("https://unused.invalid", fd, 5) : 0;
+    if (fd >= 0) {
+        close(fd);
+        unlink(output_path);
+    }
+
+    if (saved) {
+        (void)cbm_setenv("CBM_CURL_BIN", saved, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CURL_BIN");
+    }
+    if (saved_path) {
+        (void)cbm_setenv("PATH", saved_path, 1);
+    } else {
+        (void)cbm_unsetenv("PATH");
+    }
+    free(saved);
+    free(saved_path);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_EQ(payload_len, (ssize_t)strlen("private-download"));
+    ASSERT_STR_EQ(payload, "private-download");
+    ASSERT_TRUE(invalid_setup);
+    ASSERT_NEQ(invalid_override_rc, 0);
+    ASSERT_NEQ(capped_rc, 0);
+    PASS();
+#endif
+}
+
+#ifdef __APPLE__
+TEST(cli_apple_system_tool_resolution_is_not_path_hijacked) {
+    const char *prior_override = getenv("CBM_XATTR_BIN");
+    char *saved_override = prior_override ? strdup(prior_override) : NULL;
+    const char *prior_path = getenv("PATH");
+    char *saved_path = prior_path ? strdup(prior_path) : NULL;
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-apple-tool-XXXXXX");
+    bool setup_ok = cbm_mkdtemp(tmpdir) != NULL;
+    char fake_xattr[512];
+    snprintf(fake_xattr, sizeof(fake_xattr), "%s/xattr", tmpdir);
+    if (setup_ok) {
+        setup_ok = write_test_file(fake_xattr, "#!/bin/sh\nexit 99\n") == 0 &&
+                   chmod(fake_xattr, 0700) == 0 && cbm_setenv("PATH", tmpdir, 1) == 0 &&
+                   cbm_unsetenv("CBM_XATTR_BIN") == 0;
+    }
+
+    char system_path[4096] = {0};
+    int system_rc = setup_ok ? cbm_cli_resolve_apple_tool_for_test("xattr", "CBM_XATTR_BIN",
+                                                                   system_path, sizeof(system_path))
+                             : -99;
+    int invalid_rc = setup_ok && cbm_setenv("CBM_XATTR_BIN", "relative-xattr", 1) == 0
+                         ? cbm_cli_resolve_apple_tool_for_test("xattr", "CBM_XATTR_BIN",
+                                                               system_path, sizeof(system_path))
+                         : 0;
+    char override_path[4096] = {0};
+    int override_rc = setup_ok && cbm_setenv("CBM_XATTR_BIN", fake_xattr, 1) == 0
+                          ? cbm_cli_resolve_apple_tool_for_test(
+                                "xattr", "CBM_XATTR_BIN", override_path, sizeof(override_path))
+                          : -99;
+
+    if (saved_override) {
+        (void)cbm_setenv("CBM_XATTR_BIN", saved_override, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_XATTR_BIN");
+    }
+    if (saved_path) {
+        (void)cbm_setenv("PATH", saved_path, 1);
+    } else {
+        (void)cbm_unsetenv("PATH");
+    }
+    free(saved_override);
+    free(saved_path);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_EQ(system_rc, 0);
+    ASSERT_STR_NEQ(system_path, fake_xattr);
+    ASSERT_EQ(system_path[0], '/');
+    ASSERT_NEQ(invalid_rc, 0);
+    ASSERT_EQ(override_rc, 0);
+    ASSERT_STR_NEQ(override_path, system_path);
+    ASSERT_NOT_NULL(strstr(override_path, "/cli-apple-tool-"));
+    PASS();
+}
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Suite definition
  * ═══════════════════════════════════════════════════════════════════ */
@@ -3512,6 +3760,11 @@ TEST(cli_release_checksum_requires_exact_valid_entry) {
 SUITE(cli) {
     RUN_TEST(cli_sha256_file_matches_known_vector);
     RUN_TEST(cli_release_checksum_requires_exact_valid_entry);
+    RUN_TEST(cli_latest_tag_parser_is_bounded_and_strict);
+    RUN_TEST(cli_update_download_uses_private_bounded_descriptor);
+#ifdef __APPLE__
+    RUN_TEST(cli_apple_system_tool_resolution_is_not_path_hijacked);
+#endif
     /* Version (2 tests — selfupdate_test.go) */
     RUN_TEST(cli_compare_versions);
     RUN_TEST(cli_version_get_set);
@@ -3595,6 +3848,7 @@ SUITE(cli) {
     /* Binary swap on install --force (#472) */
     RUN_TEST(cli_install_copies_binary_to_target_issue472);
     RUN_TEST(cli_install_same_file_guard_issue472);
+    RUN_TEST(cli_install_binary_copy_preserves_nul_bytes);
     RUN_TEST(cli_update_target_uses_official_install_receipt);
     RUN_TEST(cli_update_target_rejects_unmanaged_binary);
     RUN_TEST(cli_update_target_rejects_stale_official_receipt);
@@ -3683,6 +3937,8 @@ SUITE(cli) {
 #ifndef _WIN32
     RUN_TEST(replace_binary_overwrites_readonly);
     RUN_TEST(replace_binary_creates_new_file);
+    RUN_TEST(replace_binary_replaces_symlink_not_target);
+    RUN_TEST(replace_binary_failure_keeps_target_and_cleans_staging);
 #endif
 
     /* CLI tool-argument flags / per-tool --help (#680) */
