@@ -80,7 +80,7 @@ export interface SchemaInfo {
   total_edges: number;
 }
 
-export type TabId = "graph" | "stats" | "control";
+export type TabId = "graph" | "design" | "stats" | "control";
 
 export interface ProcessInfo {
   pid: number;

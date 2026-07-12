@@ -2,10 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import { GraphTab } from "./components/GraphTab";
 import { StatsTab } from "./components/StatsTab";
 import { ControlTab } from "./components/ControlTab";
+import { DesignTab } from "./components/DesignTab";
 import type { TabId } from "./lib/types";
 import { useUiMessages } from "./lib/i18n";
 
-const TAB_IDS: TabId[] = ["graph", "stats", "control"];
+const TAB_IDS: TabId[] = ["graph", "design", "stats", "control"];
 
 interface RouteState {
   tab: TabId;
@@ -59,6 +60,7 @@ export function App() {
 
   const tabs: { id: TabId; label: string }[] = [
     { id: "graph", label: t.tabs.graph },
+    { id: "design", label: t.tabs.design },
     { id: "stats", label: t.tabs.projects },
     { id: "control", label: t.tabs.control },
   ];
@@ -78,7 +80,7 @@ export function App() {
           {/* Tabs inline in header */}
           <nav className="flex items-center gap-0.5">
             {tabs.map((tab) => {
-              const disabled = tab.id === "graph" && !selectedProject;
+              const disabled = (tab.id === "graph" || tab.id === "design") && !selectedProject;
               return (
                 <button
                   key={tab.id}
@@ -122,6 +124,8 @@ export function App() {
       <main className="flex-1 min-h-0">
         {activeTab === "graph" ? (
           <GraphTab project={selectedProject} />
+        ) : activeTab === "design" ? (
+          <DesignTab project={selectedProject} />
         ) : activeTab === "control" ? (
           <ControlTab />
         ) : (
