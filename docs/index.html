@@ -812,6 +812,10 @@
                 <p>Index portable design intent, DTCG tokens and modes, CSS custom properties, aliases, generated outputs, and code usage without adding an authoring-tool runtime dependency.</p>
             </div>
             <div class="feature">
+                <h3>Value-free YAML path search</h3>
+                <p>Find nested keys such as <code>services.api.timeout</code> through <code>search_graph</code> without indexing scalar values. Paths are bounded per file, and Helm values files retain their top-level-only guard.</p>
+            </div>
+            <div class="feature">
                 <h3>Auto-sync</h3>
                 <p>A background watcher detects changes and re-indexes incrementally. No manual reindex after editing files.</p>
             </div>

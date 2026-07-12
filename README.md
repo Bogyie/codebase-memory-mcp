@@ -169,7 +169,7 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 ### Search
 - **Semantic search** (`semantic_query`): vector search across the entire graph, powered by bundled Nomic `nomic-embed-code` embeddings (40K tokens, 768d int8) compiled into the binary — no API key, no Ollama, no Docker. 11-signal combined scoring (TF-IDF, RRI, API/Type/Decorator signatures, AST profiles, data flow, Halstead-lite, MinHash, module proximity, graph diffusion).
 - **BM25 full-text search** via SQLite FTS5 with `cbm_camel_split` tokenizer (camelCase / snake_case aware). Source files receive soft priority over equivalent test and vendored/generated hits; lower-priority results remain searchable and are tagged with `source_scope`.
-- **Structural search** (`search_graph`): regex name patterns, label filters, min/max degree, file scoping
+- **Structural search** (`search_graph`): regex name patterns, label filters, min/max degree, file scoping, and value-free [nested YAML path search](docs/CONFIG_PATH_SEARCH.md)
 - **Code search** (`search_code`): graph-augmented grep over indexed files only
 
 ### Cross-service linking
@@ -478,7 +478,7 @@ concurrency, and sharing contracts.
 
 | Tool | Description |
 |------|-------------|
-| `search_graph` | Structured search by label, name pattern, file pattern, degree filters. Pagination via limit/offset. |
+| `search_graph` | Structured search by label, name pattern, file pattern, YAML `config_path`, and degree filters. Pagination via limit/offset. |
 | `trace_path` | BFS traversal — who calls a function and what it calls (alias: `trace_call_path`). Depth 1-5. |
 | `detect_changes` | Read-only mapping from git diff to affected symbols + blast radius. Never writes Global Memory. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
