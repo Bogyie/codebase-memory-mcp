@@ -266,10 +266,8 @@ TEST(design_pass_rebuild_removes_stale_incremental_context) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", base);
     ASSERT_NOT_NULL(gb);
     design_add_file_node(gb, "test", file.rel_path);
-    cbm_pipeline_ctx_t ctx = {.project_name = "test",
-                              .repo_path = base,
-                              .gbuf = gb,
-                              .mode = CBM_MODE_INCREMENTAL};
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test", .repo_path = base, .gbuf = gb, .mode = CBM_MODE_FULL};
     ASSERT_EQ(cbm_pipeline_pass_design(&ctx, &file, 1), 0);
     ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.token.root.space.sm"));
     ASSERT_EQ(cbm_pipeline_pass_design(&ctx, NULL, 0), 0);
