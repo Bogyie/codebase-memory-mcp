@@ -500,6 +500,22 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"Aspects to include. 'all' = everything; 'overview' = compact summary "
      "(all except file_tree); omit = all.\"}},\"required\":[\"project\"]}"},
 
+    {"get_design_context", "Get design context",
+     "Get repository-local semantic design context: design systems, tokens, components, aliases, "
+     "guidance, generated artifacts, and code/CSS usages. Reads the project graph only; Global "
+     "Memory is intentionally separate and is never injected automatically. Filter by scope, "
+     "token, or component to keep the response compact.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"scope\":{\"type\":\"string\",\"description\":\"Exact scope, e.g. root or "
+     "packages.app\"},\"token\":{\"type\":\"string\",\"description\":\"Token name/path "
+     "substring\"},\"component\":{\"type\":\"string\",\"description\":\"Component name "
+     "substring\"},\"include_usages\":{\"type\":\"boolean\",\"default\":true},"
+     "\"include_guidance\":{\"type\":\"boolean\",\"default\":true},\"limit\":{\"type\":"
+     "\"integer\",\"minimum\":1,\"maximum\":1000,\"default\":200},\"offset\":{\"type\":"
+     "\"integer\",\"minimum\":0,\"default\":0},\"relation_offset\":{\"type\":\"integer\","
+     "\"minimum\":0,\"default\":0}},\"required\":["
+     "\"project\"]}"},
+
     {"search_code", "Search code",
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
      "the knowledge graph: deduplicates matches into containing functions, ranks by structural "
@@ -1701,6 +1717,337 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     free(project);
 
     char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
+static bool design_bool_arg_default(const char *args, const char *key, bool default_value) {
+    yyjson_doc *doc = yyjson_read(args ? args : "{}", args ? strlen(args) : 2, 0);
+    if (!doc) {
+        return default_value;
+    }
+    yyjson_val *value = yyjson_obj_get(yyjson_doc_get_root(doc), key);
+    bool result = yyjson_is_bool(value) ? yyjson_get_bool(value) : default_value;
+    yyjson_doc_free(doc);
+    return result;
+}
+
+static bool design_node_matches(const cbm_node_t *node, const char *scope, const char *needle) {
+    if (!node) {
+        return false;
+    }
+    if (scope && scope[0]) {
+        bool scope_match = false;
+        yyjson_doc *props =
+            yyjson_read(node->properties_json ? node->properties_json : "{}",
+                        node->properties_json ? strlen(node->properties_json) : 2, 0);
+        if (props) {
+            yyjson_val *value = yyjson_obj_get(yyjson_doc_get_root(props), "scope");
+            scope_match = yyjson_is_str(value) && strcmp(yyjson_get_str(value), scope) == 0;
+            yyjson_doc_free(props);
+        }
+        if (!scope_match) {
+            return false;
+        }
+    }
+    if (needle && needle[0] && (!node->name || !strstr(node->name, needle)) &&
+        (!node->qualified_name || !strstr(node->qualified_name, needle)) &&
+        (!node->properties_json || !strstr(node->properties_json, needle))) {
+        return false;
+    }
+    return true;
+}
+
+static int design_node_qn_compare(const void *lhs, const void *rhs) {
+    const cbm_node_t *a = (const cbm_node_t *)lhs;
+    const cbm_node_t *b = (const cbm_node_t *)rhs;
+    return strcmp(a->qualified_name ? a->qualified_name : "",
+                  b->qualified_name ? b->qualified_name : "");
+}
+
+static void design_add_properties(yyjson_mut_doc *doc, yyjson_mut_val *item,
+                                  const char *properties_json) {
+    yyjson_doc *props_doc = yyjson_read(properties_json ? properties_json : "{}",
+                                        properties_json ? strlen(properties_json) : 2, 0);
+    if (props_doc) {
+        yyjson_mut_val *copy = yyjson_val_mut_copy(doc, yyjson_doc_get_root(props_doc));
+        if (copy) {
+            yyjson_mut_obj_add_val(doc, item, "properties", copy);
+        }
+        yyjson_doc_free(props_doc);
+    }
+}
+
+static int design_add_nodes(yyjson_mut_doc *doc, yyjson_mut_val *array, const cbm_node_t *nodes,
+                            int count, const char *scope, const char *needle, int offset, int limit,
+                            int *filtered_total) {
+    int added = 0;
+    int matched = 0;
+    for (int i = 0; i < count; i++) {
+        if (!design_node_matches(&nodes[i], scope, needle)) {
+            continue;
+        }
+        if (matched++ < offset || added >= limit) {
+            continue;
+        }
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_sint(doc, item, "id", nodes[i].id);
+        yyjson_mut_obj_add_str(doc, item, "name", nodes[i].name ? nodes[i].name : "");
+        yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                               nodes[i].qualified_name ? nodes[i].qualified_name : "");
+        yyjson_mut_obj_add_str(doc, item, "file_path",
+                               nodes[i].file_path ? nodes[i].file_path : "");
+        yyjson_mut_obj_add_int(doc, item, "line", nodes[i].start_line);
+        design_add_properties(doc, item, nodes[i].properties_json);
+        yyjson_mut_arr_add_val(array, item);
+        added++;
+    }
+    if (filtered_total) {
+        *filtered_total = matched;
+    }
+    return added;
+}
+
+static bool design_relation_endpoint_matches(cbm_store_t *store, const cbm_edge_t *edge,
+                                             const char *scope, const char *needle,
+                                             cbm_node_t *source, cbm_node_t *target) {
+    memset(source, 0, sizeof(*source));
+    memset(target, 0, sizeof(*target));
+    if (cbm_store_find_node_by_id(store, edge->source_id, source) != 0 ||
+        cbm_store_find_node_by_id(store, edge->target_id, target) != 0) {
+        cbm_node_free_fields(source);
+        cbm_node_free_fields(target);
+        return false;
+    }
+    bool scope_match = !scope || !scope[0] || design_node_matches(source, scope, NULL) ||
+                       design_node_matches(target, scope, NULL);
+    bool needle_match = !needle || !needle[0] || design_node_matches(source, NULL, needle) ||
+                        design_node_matches(target, NULL, needle);
+    return scope_match && needle_match;
+}
+
+static int design_add_relations(yyjson_mut_doc *doc, yyjson_mut_val *array, cbm_store_t *store,
+                                const char *project, const char *type, const char *scope,
+                                const char *needle, int *skip, int remaining, int *filtered_total) {
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    if (cbm_store_find_edges_by_type(store, project, type, &edges, &count) != 0) {
+        return 0;
+    }
+    int added = 0;
+    for (int i = 0; i < count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        if (!design_relation_endpoint_matches(store, &edges[i], scope, needle, &source, &target)) {
+            cbm_node_free_fields(&source);
+            cbm_node_free_fields(&target);
+            continue;
+        }
+        if (filtered_total) {
+            (*filtered_total)++;
+        }
+        if (skip && *skip > 0) {
+            (*skip)--;
+            cbm_node_free_fields(&source);
+            cbm_node_free_fields(&target);
+            continue;
+        }
+        if (added >= remaining) {
+            cbm_node_free_fields(&source);
+            cbm_node_free_fields(&target);
+            continue;
+        }
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, item, "type", type);
+        yyjson_mut_obj_add_strcpy(doc, item, "source",
+                                  source.qualified_name ? source.qualified_name : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "source_label", source.label ? source.label : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "target",
+                                  target.qualified_name ? target.qualified_name : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "target_label", target.label ? target.label : "");
+        if (edges[i].properties_json && strcmp(edges[i].properties_json, "{}") != 0) {
+            design_add_properties(doc, item, edges[i].properties_json);
+        }
+        yyjson_mut_arr_add_val(array, item);
+        added++;
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    cbm_store_free_edges(edges, count);
+    return added;
+}
+
+static char *handle_get_design_context(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+    char *scope = cbm_mcp_get_string_arg(args, "scope");
+    char *token = cbm_mcp_get_string_arg(args, "token");
+    char *component = cbm_mcp_get_string_arg(args, "component");
+    int limit = cbm_mcp_get_int_arg(args, "limit", 200);
+    int offset = cbm_mcp_get_int_arg(args, "offset", 0);
+    int relation_offset = cbm_mcp_get_int_arg(args, "relation_offset", 0);
+    if (limit < 1) {
+        limit = 1;
+    } else if (limit > 1000) {
+        limit = 1000;
+    }
+    if (offset < 0) {
+        offset = 0;
+    }
+    if (relation_offset < 0) {
+        relation_offset = 0;
+    }
+    bool include_usages = design_bool_arg_default(args, "include_usages", true);
+    bool include_guidance = design_bool_arg_default(args, "include_guidance", true);
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
+        free(project);
+        free(scope);
+        free(token);
+        free(component);
+        return cbm_mcp_text_result("project is required and must be indexed", true);
+    }
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        free(scope);
+        free(token);
+        free(component);
+        return not_indexed;
+    }
+
+    cbm_node_t *systems = NULL;
+    cbm_node_t *tokens = NULL;
+    cbm_node_t *components = NULL;
+    cbm_node_t *modes = NULL;
+    int system_count = 0, token_count = 0, component_count = 0, mode_count = 0;
+    (void)cbm_store_find_nodes_by_label(store, project, "DesignSystem", &systems, &system_count);
+    (void)cbm_store_find_nodes_by_label(store, project, "DesignToken", &tokens, &token_count);
+    (void)cbm_store_find_nodes_by_label(store, project, "DesignComponent", &components,
+                                        &component_count);
+    (void)cbm_store_find_nodes_by_label(store, project, "DesignMode", &modes, &mode_count);
+    if (system_count > 1) {
+        qsort(systems, (size_t)system_count, sizeof(*systems), design_node_qn_compare);
+    }
+    if (token_count > 1) {
+        qsort(tokens, (size_t)token_count, sizeof(*tokens), design_node_qn_compare);
+    }
+    if (component_count > 1) {
+        qsort(components, (size_t)component_count, sizeof(*components), design_node_qn_compare);
+    }
+    if (mode_count > 1) {
+        qsort(modes, (size_t)mode_count, sizeof(*modes), design_node_qn_compare);
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "project", project ? project : "");
+    yyjson_mut_obj_add_str(doc, root, "boundary",
+                           "project-local; query Global Memory separately when relevant");
+    if (system_count == 0 && token_count == 0 && component_count == 0) {
+        yyjson_mut_obj_add_str(doc, root, "status", "no_design_context");
+        yyjson_mut_obj_add_str(
+            doc, root, "hint",
+            "Add DESIGN.md and/or *.tokens.json, then re-index. See docs/DESIGN_CONTEXT.md.");
+    } else {
+        yyjson_mut_obj_add_str(doc, root, "status", "ready");
+    }
+    yyjson_mut_val *counts = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, counts, "systems", system_count);
+    yyjson_mut_obj_add_int(doc, counts, "tokens", token_count);
+    yyjson_mut_obj_add_int(doc, counts, "components", component_count);
+    yyjson_mut_obj_add_int(doc, counts, "modes", mode_count);
+    yyjson_mut_obj_add_val(doc, root, "total", counts);
+
+    int filtered_systems = 0, filtered_tokens = 0, filtered_components = 0, filtered_modes = 0;
+    yyjson_mut_val *system_array = yyjson_mut_arr(doc);
+    int returned_systems = design_add_nodes(doc, system_array, systems, system_count, scope, NULL,
+                                            offset, limit, &filtered_systems);
+    yyjson_mut_obj_add_val(doc, root, "systems", system_array);
+    yyjson_mut_val *token_array = yyjson_mut_arr(doc);
+    int returned_tokens = design_add_nodes(doc, token_array, tokens, token_count, scope, token,
+                                           offset, limit, &filtered_tokens);
+    yyjson_mut_obj_add_val(doc, root, "tokens", token_array);
+    yyjson_mut_val *component_array = yyjson_mut_arr(doc);
+    int returned_components =
+        design_add_nodes(doc, component_array, components, component_count, scope, component,
+                         offset, limit, &filtered_components);
+    yyjson_mut_obj_add_val(doc, root, "components", component_array);
+    yyjson_mut_val *mode_array = yyjson_mut_arr(doc);
+    int returned_modes = design_add_nodes(doc, mode_array, modes, mode_count, scope, NULL, offset,
+                                          limit, &filtered_modes);
+    yyjson_mut_obj_add_val(doc, root, "modes", mode_array);
+
+    yyjson_mut_val *returned = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, returned, "systems", returned_systems);
+    yyjson_mut_obj_add_int(doc, returned, "tokens", returned_tokens);
+    yyjson_mut_obj_add_int(doc, returned, "components", returned_components);
+    yyjson_mut_obj_add_int(doc, returned, "modes", returned_modes);
+    yyjson_mut_obj_add_val(doc, root, "returned", returned);
+    yyjson_mut_val *filtered = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, filtered, "systems", filtered_systems);
+    yyjson_mut_obj_add_int(doc, filtered, "tokens", filtered_tokens);
+    yyjson_mut_obj_add_int(doc, filtered, "components", filtered_components);
+    yyjson_mut_obj_add_int(doc, filtered, "modes", filtered_modes);
+    yyjson_mut_obj_add_val(doc, root, "filtered_total", filtered);
+    yyjson_mut_obj_add_int(doc, root, "offset", offset);
+    yyjson_mut_val *more = yyjson_mut_obj(doc);
+    bool more_systems = offset + returned_systems < filtered_systems;
+    bool more_tokens = offset + returned_tokens < filtered_tokens;
+    bool more_components = offset + returned_components < filtered_components;
+    bool more_modes = offset + returned_modes < filtered_modes;
+    yyjson_mut_obj_add_bool(doc, more, "systems", more_systems);
+    yyjson_mut_obj_add_bool(doc, more, "tokens", more_tokens);
+    yyjson_mut_obj_add_bool(doc, more, "components", more_components);
+    yyjson_mut_obj_add_bool(doc, more, "modes", more_modes);
+    yyjson_mut_obj_add_val(doc, root, "has_more_by_type", more);
+    yyjson_mut_obj_add_bool(doc, root, "has_more",
+                            more_systems || more_tokens || more_components || more_modes);
+
+    const char *relation_filter = token && token[0] ? token : component;
+    yyjson_mut_val *relations = yyjson_mut_arr(doc);
+    int relation_limit = limit * 4;
+    int relation_count = 0;
+    int filtered_relations = 0;
+    int relation_skip = relation_offset;
+    static const char *const core_types[] = {"ALIASES_TO", "OVERRIDES", "PROVIDES", "GENERATED_AS",
+                                             "IMPLEMENTED_BY"};
+    for (int i = 0; i < (int)(sizeof(core_types) / sizeof(core_types[0])); i++) {
+        relation_count += design_add_relations(
+            doc, relations, store, project, core_types[i], scope, relation_filter, &relation_skip,
+            relation_limit - relation_count, &filtered_relations);
+    }
+    if (include_guidance) {
+        relation_count += design_add_relations(
+            doc, relations, store, project, "DOCUMENTED_BY", scope, relation_filter, &relation_skip,
+            relation_limit - relation_count, &filtered_relations);
+        relation_count += design_add_relations(
+            doc, relations, store, project, "GUIDED_BY", scope, relation_filter, &relation_skip,
+            relation_limit - relation_count, &filtered_relations);
+    }
+    if (include_usages) {
+        relation_count += design_add_relations(
+            doc, relations, store, project, "USES_TOKEN", scope, relation_filter, &relation_skip,
+            relation_limit - relation_count, &filtered_relations);
+    }
+    yyjson_mut_obj_add_val(doc, root, "relations", relations);
+    yyjson_mut_obj_add_int(doc, root, "returned_relations", relation_count);
+    yyjson_mut_obj_add_int(doc, root, "filtered_total_relations", filtered_relations);
+    yyjson_mut_obj_add_int(doc, root, "relation_offset", relation_offset);
+    yyjson_mut_obj_add_bool(doc, root, "has_more_relations",
+                            relation_offset + relation_count < filtered_relations);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_store_free_nodes(systems, system_count);
+    cbm_store_free_nodes(tokens, token_count);
+    cbm_store_free_nodes(components, component_count);
+    cbm_store_free_nodes(modes, mode_count);
+    free(project);
+    free(scope);
+    free(token);
+    free(component);
+    char *result = cbm_mcp_text_result(json ? json : "out of memory", json == NULL);
     free(json);
     return result;
 }
@@ -7246,6 +7593,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "get_architecture") == 0) {
         return handle_get_architecture(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_design_context") == 0) {
+        return handle_get_design_context(srv, args_json);
     }
 
     /* Pipeline-dependent tools */

@@ -12,6 +12,10 @@ const LABEL_COLORS: Record<string, string> = {
   Method: "#06b6d4",
   Route: "#eab308",
   Variable: "#64748b",
+  DesignSystem: "#2dd4bf",
+  DesignToken: "#60a5fa",
+  DesignComponent: "#f472b6",
+  DesignMode: "#fbbf24",
 };
 
 const DEFAULT_COLOR = "#94a3b8";

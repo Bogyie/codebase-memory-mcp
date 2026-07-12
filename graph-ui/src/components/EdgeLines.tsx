@@ -47,6 +47,14 @@ const EDGE_TYPE_COLORS: Record<string, string> = {
   CROSS_CHANNEL: "#fdba74",
   MEMBER_OF: "#64748b",
   TESTS_FILE: "#06b6d4",
+  PROVIDES: "#2dd4bf",
+  ALIASES_TO: "#60a5fa",
+  OVERRIDES: "#fbbf24",
+  USES_TOKEN: "#f472b6",
+  IMPLEMENTED_BY: "#c084fc",
+  GUIDED_BY: "#34d399",
+  DOCUMENTED_BY: "#94a3b8",
+  GENERATED_AS: "#fb923c",
 };
 
 const DEFAULT_EDGE_COLOR = "#1C8585";

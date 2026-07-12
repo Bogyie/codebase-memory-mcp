@@ -7,7 +7,7 @@ This page documents the configuration files that `codebase-memory-mcp` reads or 
 | Purpose | Path | Format | Notes |
 |---|---|---|---|
 | Global custom extension mapping | `$XDG_CONFIG_HOME/codebase-memory-mcp/config.json` | JSON | Falls back to `~/.config/codebase-memory-mcp/config.json` when `XDG_CONFIG_HOME` is unset. |
-| Per-project custom extension mapping | `{repo_root}/.codebase-memory.json` | JSON | Overrides conflicting global `extra_extensions` entries. |
+| Per-project extension and design discovery | `{repo_root}/.codebase-memory.json` | JSON | Overrides conflicting global `extra_extensions` entries and optionally classifies design sources. |
 | CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. |
 | UI settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json` | JSON | Stores `ui_enabled` and `ui_port`. |
 
@@ -57,7 +57,29 @@ Notes:
 - Missing files are ignored.
 - If the same extension appears in both files, the per-project file wins.
 
-## 2. CLI-Managed Runtime Settings
+## 2. Design Context Discovery
+
+The repository-root `.codebase-memory.json` may also customize read-only Design Context indexing:
+
+```json
+{
+  "design": {
+    "documents": ["DESIGN.md", "packages/**/DESIGN.md"],
+    "token_sources": ["design/**/*.tokens.json"],
+    "resolvers": ["design/**/*.resolver.json"],
+    "authoritative": ["DESIGN.md", "design/**/*.json"],
+    "generated": ["src/styles/generated/**", "dist/**/*.css"]
+  }
+}
+```
+
+All keys are optional arrays of repository-relative `*`, `**`, and `?` patterns. Without this
+section, the index discovers `DESIGN.md`, `*.tokens.json`, `*.resolver.json`, CSS, and SCSS by
+convention. `authoritative` and `generated` classify provenance only; no design file is written or
+generated. See [Design Context and Token Guide](DESIGN_CONTEXT.md) for ownership, layout, supported
+formats, security boundaries, and query examples.
+
+## 3. CLI-Managed Runtime Settings
 
 The `config` subcommand stores runtime settings in a small SQLite database:
 
@@ -82,7 +104,7 @@ Current keys:
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
 
-## 3. UI Settings
+## 4. UI Settings
 
 The optional built-in graph UI stores its settings in:
 
@@ -104,7 +126,7 @@ Notes:
 - If the UI-enabled binary has embedded assets and no UI config file exists yet, the UI auto-enables on first run.
 - `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
 
-## 4. Environment Variables
+## 5. Environment Variables
 
 These environment variables affect runtime behavior:
 
@@ -117,7 +139,7 @@ These environment variables affect runtime behavior:
 | `CBM_LOG_LEVEL` | `info` | Set stderr log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). |
 | `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
 
-## 5. Agent and Editor Integration Files
+## 6. Agent and Editor Integration Files
 
 The `install` command can also write MCP entries and instruction blocks into agent/editor config files such as Claude Code, Codex, Gemini, VS Code, Cursor, Zed, and others.
 

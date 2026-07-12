@@ -593,8 +593,8 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
 }
 
 /* Run post-extraction passes (tests, decorator tags, configlink). */
-static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
-                           const char *project) {
+static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
+                          cbm_file_info_t *all_files, int all_file_count, const char *project) {
     struct timespec t;
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -605,6 +605,14 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
     cbm_pipeline_pass_decorator_tags(ctx->gbuf, project);
     cbm_log_info("pass.timing", "pass", "incr_decorator_tags", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    int design_rc = cbm_pipeline_pass_design(ctx, all_files, all_file_count);
+    cbm_log_info("pass.timing", "pass", "incr_design_context", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
+    if (design_rc != 0) {
+        return design_rc;
+    }
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_pipeline_pass_configlink(ctx);
@@ -623,6 +631,7 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
         cbm_log_info("pass.timing", "pass", "incr_semantic_edges", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
     }
+    return 0;
 }
 /* Delete old DB and dump merged graph + hashes to disk.
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
@@ -856,7 +865,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     run_extract_resolve(&ctx, changed_files, ci);
     cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
-    run_postpasses(&ctx, changed_files, ci, project);
+    int postpass_rc = run_postpasses(&ctx, changed_files, ci, files, file_count, project);
+    if (postpass_rc != 0) {
+        cbm_log_error("incremental.err", "msg", "design_context_failed");
+        free(changed_files);
+        cbm_registry_free(registry);
+        cbm_path_alias_collection_free(path_aliases);
+        incr_free_edge_capture(&edge_cap);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_store_free_coverage(old_cov, old_cov_count);
+        cbm_gbuf_free(existing);
+        return postpass_rc;
+    }
 
     /* Coverage rows (#963): merge = previous FAILURE rows for files NOT
      * re-extracted this run + this run's fresh entries (changed files replace

@@ -56,7 +56,8 @@
       "featureList": [
         "Indexes 158 programming languages via vendored tree-sitter grammars",
         "Hybrid LSP semantic type resolution for Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, and Rust",
-        "22 MCP tools for structural search, call-path tracing, Cypher graph queries, and Global Memory",
+        "23 MCP tools for structural search, call-path tracing, Design Context, Cypher graph queries, and Global Memory",
+        "Read-only semantic indexing for DESIGN.md, DTCG tokens and resolver modes, CSS variables, and implementation usages",
         "Global Memory with immutable raw sources and a revisioned cross-project wiki",
         "Applicability-first retrieval with freshness, evidence, conflict, and route signals",
         "Conflict-safe multi-agent proposals and revision compare-and-swap commits",
@@ -484,6 +485,7 @@
             <a href="#install">Install</a>
             <a href="#hybrid-lsp">Hybrid LSP</a>
             <a href="#semantic-search">Semantic search</a>
+            <a href="#design-context">Design Context</a>
             <a href="#releases">Releases</a>
             <a href="#faq">FAQ</a>
             <a class="nav-cta nav-star" href="https://github.com/bogyie/codebase-memory-mcp" title="Star codebase-memory-mcp on GitHub" aria-label="Star this project on GitHub">★ Star on GitHub</a>
@@ -537,7 +539,7 @@
         <p class="lead">
             codebase-memory-mcp is an open-source <a href="https://modelcontextprotocol.io/">Model Context
             Protocol (MCP)</a> server that indexes a codebase into a persistent knowledge graph of functions,
-            classes, call chains, HTTP routes, and cross-service links. Instead of reading files one at a time,
+            classes, call chains, HTTP routes, cross-service links, and repository design context. Instead of reading files one at a time,
             an AI coding agent queries the graph — answering structural questions with roughly 120x fewer
             tokens. It parses 158 languages and ships as a single static C binary with zero runtime dependencies.
         </p>
@@ -748,6 +750,27 @@
         <p><cite>Source: project Performance benchmarks, measured on Apple M3 Pro.</cite></p>
     </section>
 
+    <section id="design-context">
+        <h2>Can it understand design tokens and design intent?</h2>
+        <p class="lead">
+            Yes. Design Context adds a semantic, read-only layer for <code>DESIGN.md</code>, DTCG
+            <code>*.tokens.json</code> and <code>*.resolver.json</code>, CSS custom properties, aliases,
+            generated assets, theme modes, and implementation usage.
+        </p>
+        <p>
+            Dedicated design tools remain responsible for authoring and CSS generation. The indexer reads the
+            artifacts committed to the repository, connects them as <code>DesignSystem</code>,
+            <code>DesignToken</code>, <code>DesignComponent</code>, and <code>DesignMode</code> nodes, and exposes
+            them through the paginated <code>get_design_context</code> API and the UI's Design tab. Mode-specific
+            values stay attached to <code>OVERRIDES</code> relationships, while DTCG <code>$ref</code> and
+            <code>$extends</code> remain structural metadata rather than triggering a token build. It never fetches
+            remote resolver sources and never copies project design data into Global Memory automatically.
+        </p>
+        <p style="margin-top: 16px;">
+            <a href="https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/DESIGN_CONTEXT.md">Read the repository layout and adoption guide →</a>
+        </p>
+    </section>
+
     <section id="features">
         <h2>Features</h2>
         <div class="features">
@@ -780,6 +803,10 @@
                 <p>Dockerfiles, Kubernetes manifests, and Kustomize overlays become graph nodes with cross-references to the resources they configure.</p>
             </div>
             <div class="feature">
+                <h3>Design Context</h3>
+                <p>Index portable design intent, DTCG tokens and modes, CSS custom properties, aliases, generated outputs, and code usage without adding an authoring-tool runtime dependency.</p>
+            </div>
+            <div class="feature">
                 <h3>Auto-sync</h3>
                 <p>A background watcher detects changes and re-indexes incrementally. No manual reindex after editing files.</p>
             </div>
@@ -792,8 +819,8 @@
                 <p>An optional UI binary serves an interactive 3D graph at <code>localhost:9749</code> to explore nodes, edges, and clusters visually.</p>
             </div>
             <div class="feature">
-                <h3>22 MCP tools</h3>
-                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_code_snippet</code>, <code>manage_adr</code>, and 15 more.</p>
+                <h3>23 MCP tools</h3>
+                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_design_context</code>, <code>manage_adr</code>, and 16 more.</p>
             </div>
             <div class="feature">
                 <h3>Global Memory</h3>
@@ -873,6 +900,11 @@
            no-op when nothing changed. You only run a manual index for the first build or after a large
            <code>git pull</code>.</p>
 
+        <h3>Does it replace Figma or my design-token build pipeline?</h3>
+        <p>No. Design authoring, review, token transformation, and CSS generation stay in external tools. The
+           Design Context index is a local, read-only semantic view of the documents and outputs already committed
+           to the repository.</p>
+
         <h3>Why is there no built-in LLM?</h3>
         <p>Other code-graph tools embed an LLM to translate natural language into graph queries, which means
            extra API keys and cost. With MCP, the agent you are already talking to is the query translator —
@@ -891,6 +923,7 @@
             <a href="https://github.com/bogyie/codebase-memory-mcp">GitHub</a> &middot;
             <a href="https://github.com/bogyie/codebase-memory-mcp/releases/latest">Releases</a> &middot;
             <a href="https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/BENCHMARK.md">Benchmarks</a> &middot;
+            <a href="https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/DESIGN_CONTEXT.md">Design Context</a> &middot;
             <a href="https://arxiv.org/abs/2603.27277">Paper</a>
         </p>
     </div>

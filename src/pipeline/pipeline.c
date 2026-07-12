@@ -1302,6 +1302,13 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return rc;
     }
 
+    CBM_PROF_START(t_design);
+    rc = cbm_pipeline_pass_design(ctx, files, file_count);
+    CBM_PROF_END_N("pipeline", "pass_design_context", t_design, file_count);
+    if (rc != 0 || check_cancel(p)) {
+        return rc != 0 ? rc : CBM_NOT_FOUND;
+    }
+
     CBM_PROF_START(t_predump);
     run_predump_passes(p, ctx);
     CBM_PROF_END("pipeline", "3_predump_passes_total", t_predump);
