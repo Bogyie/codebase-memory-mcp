@@ -253,6 +253,154 @@ TEST(design_indexes_dtcg_resolver_modes_without_following_remote_or_parent_refs)
     PASS();
 }
 
+TEST(design_preserves_mode_specific_values_for_same_token_path) {
+    char *base_raw = th_mktempdir("cbm_design_mode_values");
+    ASSERT_NOT_NULL(base_raw);
+    char base[1024];
+    snprintf(base, sizeof(base), "%s", base_raw);
+    const char *light = "{\"color\":{\"surface\":{\"$type\":\"color\",\"$value\":\"#ffffff\"}}}";
+    const char *dark = "{\"color\":{\"surface\":{\"$type\":\"color\",\"$value\":\"#111111\"}}}";
+    const char *resolver =
+        "{\"version\":\"2025.10\",\"modifiers\":{\"theme\":{\"default\":\"light\","
+        "\"contexts\":{\"light\":[{\"$ref\":\"theme/light.tokens.json\"}],"
+        "\"dark\":[{\"$ref\":\"theme/dark.tokens.json\"}]}}},"
+        "\"resolutionOrder\":[{\"$ref\":\"#/modifiers/theme\"}]}";
+    ASSERT_EQ(th_write_file(TH_PATH(base, "design/theme/light.tokens.json"), light), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(base, "design/theme/dark.tokens.json"), dark), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(base, "design/theme.resolver.json"), resolver), 0);
+
+    char p0[1024], p1[1024], p2[1024];
+    snprintf(p0, sizeof(p0), "%s/design/theme/light.tokens.json", base);
+    snprintf(p1, sizeof(p1), "%s/design/theme/dark.tokens.json", base);
+    snprintf(p2, sizeof(p2), "%s/design/theme.resolver.json", base);
+    cbm_file_info_t files[] = {
+        {.path = p0,
+         .rel_path = "design/theme/light.tokens.json",
+         .language = CBM_LANG_JSON,
+         .size = (int64_t)strlen(light)},
+        {.path = p1,
+         .rel_path = "design/theme/dark.tokens.json",
+         .language = CBM_LANG_JSON,
+         .size = (int64_t)strlen(dark)},
+        {.path = p2,
+         .rel_path = "design/theme.resolver.json",
+         .language = CBM_LANG_JSON,
+         .size = (int64_t)strlen(resolver)},
+    };
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", base);
+    ASSERT_NOT_NULL(gb);
+    cbm_design_index_opts_t opts = {.project_name = "test",
+                                    .repo_path = base,
+                                    .gbuf = gb,
+                                    .files = files,
+                                    .file_count = 3,
+                                    .mode = CBM_MODE_FULL};
+    ASSERT_EQ(cbm_design_index(&opts), 0);
+    const cbm_gbuf_node_t *token = cbm_gbuf_find_by_qn(gb, "test.design.token.root.color.surface");
+    const cbm_gbuf_node_t *light_mode =
+        cbm_gbuf_find_by_qn(gb, "test.design.mode.root.theme.light");
+    const cbm_gbuf_node_t *dark_mode = cbm_gbuf_find_by_qn(gb, "test.design.mode.root.theme.dark");
+    ASSERT_NOT_NULL(token);
+    ASSERT_NOT_NULL(light_mode);
+    ASSERT_NOT_NULL(dark_mode);
+    const cbm_gbuf_edge_t **light_edges = NULL;
+    const cbm_gbuf_edge_t **dark_edges = NULL;
+    int light_count = 0, dark_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, light_mode->id, "OVERRIDES", &light_edges,
+                                                 &light_count),
+              0);
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, dark_mode->id, "OVERRIDES", &dark_edges,
+                                                 &dark_count),
+              0);
+    ASSERT_EQ(light_count, 1);
+    ASSERT_EQ(dark_count, 1);
+    ASSERT_EQ(light_edges[0]->target_id, token->id);
+    ASSERT_EQ(dark_edges[0]->target_id, token->id);
+    ASSERT_NOT_NULL(strstr(light_edges[0]->properties_json, "#ffffff"));
+    ASSERT_NOT_NULL(strstr(light_edges[0]->properties_json, "\"default\":true"));
+    ASSERT_NOT_NULL(strstr(dark_edges[0]->properties_json, "#111111"));
+    ASSERT_NOT_NULL(strstr(dark_edges[0]->properties_json, "dark.tokens.json"));
+    cbm_gbuf_free(gb);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(design_indexes_dtcg_structural_references_and_root_tokens) {
+    char *base_raw = th_mktempdir("cbm_design_dtcg_structure");
+    ASSERT_NOT_NULL(base_raw);
+    char base[1024];
+    snprintf(base, sizeof(base), "%s", base_raw);
+    const char *tokens = "{\"base\":{\"$type\":\"color\",\"$value\":\"#123456\"},"
+                         "\"alias\":{\"$type\":\"color\",\"$ref\":\"#/base\"},"
+                         "\"semantic\":{\"$type\":\"color\",\"$extends\":\"#/base-group\","
+                         "\"$root\":{\"$value\":\"#ffffff\"},\"muted\":{\"$value\":\"#eeeeee\"}}}";
+    ASSERT_EQ(th_write_file(TH_PATH(base, "design/core.tokens.json"), tokens), 0);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/design/core.tokens.json", base);
+    cbm_file_info_t file = {.path = path,
+                            .rel_path = "design/core.tokens.json",
+                            .language = CBM_LANG_JSON,
+                            .size = (int64_t)strlen(tokens)};
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", base);
+    ASSERT_NOT_NULL(gb);
+    cbm_design_index_opts_t opts = {.project_name = "test",
+                                    .repo_path = base,
+                                    .gbuf = gb,
+                                    .files = &file,
+                                    .file_count = 1,
+                                    .mode = CBM_MODE_FULL};
+    ASSERT_EQ(cbm_design_index(&opts), 0);
+    const cbm_gbuf_node_t *alias = cbm_gbuf_find_by_qn(gb, "test.design.token.root.alias");
+    const cbm_gbuf_node_t *root =
+        cbm_gbuf_find_by_qn(gb, "test.design.token.root.semantic.dollar-root");
+    const cbm_gbuf_node_t *muted = cbm_gbuf_find_by_qn(gb, "test.design.token.root.semantic.muted");
+    ASSERT_NOT_NULL(alias);
+    ASSERT_NOT_NULL(root);
+    ASSERT_NOT_NULL(muted);
+    ASSERT_NOT_NULL(strstr(alias->properties_json, "\"reference\":\"#/base\""));
+    ASSERT_NOT_NULL(strstr(root->properties_json, "\"token_path\":\"semantic.$root\""));
+    ASSERT_NOT_NULL(strstr(root->properties_json, "\"extends\":\"#/base-group\""));
+    ASSERT_NOT_NULL(strstr(muted->properties_json, "\"extends\":\"#/base-group\""));
+    cbm_gbuf_free(gb);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(design_indexes_google_typography_as_composite_token) {
+    char *base_raw = th_mktempdir("cbm_design_typography");
+    ASSERT_NOT_NULL(base_raw);
+    char base[1024];
+    snprintf(base, sizeof(base), "%s", base_raw);
+    const char *design_md = "---\nname: Type Test\ntypography:\n  h1:\n"
+                            "    fontFamily: Inter\n    fontSize: 32px\n    fontWeight: 700\n---\n";
+    ASSERT_EQ(th_write_file(TH_PATH(base, "DESIGN.md"), design_md), 0);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/DESIGN.md", base);
+    cbm_file_info_t file = {.path = path,
+                            .rel_path = "DESIGN.md",
+                            .language = CBM_LANG_MARKDOWN,
+                            .size = (int64_t)strlen(design_md)};
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", base);
+    ASSERT_NOT_NULL(gb);
+    cbm_design_index_opts_t opts = {.project_name = "test",
+                                    .repo_path = base,
+                                    .gbuf = gb,
+                                    .files = &file,
+                                    .file_count = 1,
+                                    .mode = CBM_MODE_FULL};
+    ASSERT_EQ(cbm_design_index(&opts), 0);
+    const cbm_gbuf_node_t *typography =
+        cbm_gbuf_find_by_qn(gb, "test.design.token.root.typography.h1");
+    ASSERT_NOT_NULL(typography);
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.token.root.typography.h1.fontFamily"));
+    ASSERT_NOT_NULL(strstr(typography->properties_json, "\"composite\":true"));
+    ASSERT_NOT_NULL(strstr(typography->properties_json, "fontFamily"));
+    ASSERT_NOT_NULL(strstr(typography->properties_json, "fontSize"));
+    cbm_gbuf_free(gb);
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(design_pass_rebuild_removes_stale_incremental_context) {
     char *base_raw = th_mktempdir("cbm_design_rebuild");
     ASSERT_NOT_NULL(base_raw);
@@ -273,6 +421,8 @@ TEST(design_pass_rebuild_removes_stale_incremental_context) {
         .project_name = "test", .repo_path = base, .gbuf = gb, .mode = CBM_MODE_FULL};
     ASSERT_EQ(cbm_pipeline_pass_design(&ctx, &file, 1), 0);
     ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.token.root.space.sm"));
+    ASSERT_EQ(cbm_pipeline_pass_design(&ctx, NULL, 1), -1);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.token.root.space.sm"));
     ASSERT_EQ(cbm_pipeline_pass_design(&ctx, NULL, 0), 0);
     ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.token.root.space.sm"));
     ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.system.root"));
@@ -286,5 +436,8 @@ void suite_design(void) {
     RUN_TEST(design_uses_nearest_nested_document_scope);
     RUN_TEST(design_generated_css_does_not_overwrite_authoritative_token);
     RUN_TEST(design_indexes_dtcg_resolver_modes_without_following_remote_or_parent_refs);
+    RUN_TEST(design_preserves_mode_specific_values_for_same_token_path);
+    RUN_TEST(design_indexes_dtcg_structural_references_and_root_tokens);
+    RUN_TEST(design_indexes_google_typography_as_composite_token);
     RUN_TEST(design_pass_rebuild_removes_stale_incremental_context);
 }

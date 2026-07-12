@@ -68,10 +68,35 @@ typedef struct {
 } design_documents_t;
 
 typedef struct {
+    int64_t token_id;
+    char *token_path;
+    char *type;
+    char *value;
+    char *description;
+    char *format;
+    char *provenance;
+    int start_line;
+} design_token_definition_t;
+
+typedef struct {
+    char *path;
+    design_token_definition_t *items;
+    int count;
+    int cap;
+} design_token_source_t;
+
+typedef struct {
+    design_token_source_t *items;
+    int count;
+    int cap;
+} design_token_sources_t;
+
+typedef struct {
     const cbm_design_index_opts_t *opts;
     design_config_t config;
     design_aliases_t aliases;
     design_documents_t documents;
+    design_token_sources_t token_sources;
     int token_count;
     int component_count;
     int mode_count;
@@ -137,6 +162,10 @@ static void design_normalize_segment(const char *in, char *out, size_t out_size)
         unsigned char c = (unsigned char)in[i];
         if (isalnum(c) || c == '_' || c == '-') {
             out[j++] = (char)c;
+            last_dot = false;
+        } else if (c == '$' && j + 7 < out_size) {
+            memcpy(out + j, "dollar-", 7);
+            j += 7;
             last_dot = false;
         } else if (!last_dot && j > 0) {
             out[j++] = '.';
@@ -358,7 +387,8 @@ static const char *design_provenance(const design_ctx_t *ctx, const char *path,
 
 static char *design_properties(const char *format, const char *source_path, const char *scope,
                                const char *token_path, const char *type, const char *value,
-                               const char *description, const char *provenance) {
+                               const char *description, const char *provenance,
+                               const char *reference, const char *extends, bool composite) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         return NULL;
@@ -381,6 +411,15 @@ static char *design_properties(const char *format, const char *source_path, cons
     if (description && description[0]) {
         yyjson_mut_obj_add_str(doc, root, "description", description);
     }
+    if (reference && reference[0]) {
+        yyjson_mut_obj_add_str(doc, root, "reference", reference);
+    }
+    if (extends && extends[0]) {
+        yyjson_mut_obj_add_str(doc, root, "extends", extends);
+    }
+    if (composite) {
+        yyjson_mut_obj_add_bool(doc, root, "composite", true);
+    }
     yyjson_mut_obj_add_bool(doc, root, "authoritative",
                             provenance && strcmp(provenance, "authoritative") == 0);
     yyjson_mut_obj_add_bool(doc, root, "generated",
@@ -399,10 +438,13 @@ static int64_t design_ensure_system(design_ctx_t *ctx, const char *scope, const 
         return existing->id;
     }
     char *props = design_properties("design-context", source_path, scope, NULL, NULL, NULL, NULL,
-                                    "authoritative");
+                                    "authoritative", NULL, NULL, false);
+    if (!props) {
+        return 0;
+    }
     int64_t id =
         cbm_gbuf_upsert_node(ctx->opts->gbuf, "DesignSystem", name && name[0] ? name : scope, qn,
-                             source_path ? source_path : "", 1, 1, props ? props : "{}");
+                             source_path ? source_path : "", 1, 1, props);
     free(props);
     return id;
 }
@@ -438,10 +480,13 @@ static int64_t design_upsert_component(design_ctx_t *ctx, const char *scope, con
     if (existing) {
         return existing->id;
     }
-    char *props =
-        design_properties("design-component", file_path, scope, NULL, NULL, NULL, NULL, provenance);
-    int64_t id = cbm_gbuf_upsert_node(ctx->opts->gbuf, "DesignComponent", name, qn, file_path, 1, 1,
-                                      props ? props : "{}");
+    char *props = design_properties("design-component", file_path, scope, NULL, NULL, NULL, NULL,
+                                    provenance, NULL, NULL, false);
+    if (!props) {
+        return 0;
+    }
+    int64_t id =
+        cbm_gbuf_upsert_node(ctx->opts->gbuf, "DesignComponent", name, qn, file_path, 1, 1, props);
     free(props);
     if (id > 0 && system_id > 0) {
         cbm_gbuf_insert_edge(ctx->opts->gbuf, system_id, id, "PROVIDES", "{}");
@@ -452,10 +497,65 @@ static int64_t design_upsert_component(design_ctx_t *ctx, const char *scope, con
     return id;
 }
 
+static design_token_source_t *design_token_source_get(design_ctx_t *ctx, const char *path) {
+    for (int i = 0; i < ctx->token_sources.count; i++) {
+        if (strcmp(ctx->token_sources.items[i].path, path) == 0) {
+            return &ctx->token_sources.items[i];
+        }
+    }
+    if (ctx->token_sources.count == ctx->token_sources.cap) {
+        int cap = ctx->token_sources.cap ? ctx->token_sources.cap * 2 : 16;
+        design_token_source_t *grown = (design_token_source_t *)realloc(
+            ctx->token_sources.items, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return NULL;
+        }
+        ctx->token_sources.items = grown;
+        ctx->token_sources.cap = cap;
+    }
+    design_token_source_t *source = &ctx->token_sources.items[ctx->token_sources.count++];
+    memset(source, 0, sizeof(*source));
+    source->path = design_strdup(path);
+    return source->path ? source : NULL;
+}
+
+static int design_token_definition_add(design_ctx_t *ctx, const char *file_path, int64_t token_id,
+                                       const char *token_path, const char *type, const char *value,
+                                       const char *description, const char *format,
+                                       const char *provenance, int start_line) {
+    design_token_source_t *source = design_token_source_get(ctx, file_path);
+    if (!source) {
+        return -1;
+    }
+    if (source->count == source->cap) {
+        int cap = source->cap ? source->cap * 2 : 16;
+        design_token_definition_t *grown =
+            (design_token_definition_t *)realloc(source->items, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return -1;
+        }
+        source->items = grown;
+        source->cap = cap;
+    }
+    design_token_definition_t *definition = &source->items[source->count++];
+    memset(definition, 0, sizeof(*definition));
+    definition->token_id = token_id;
+    definition->token_path = design_strdup(token_path);
+    definition->type = design_strdup(type);
+    definition->value = design_strdup(value);
+    definition->description = design_strdup(description);
+    definition->format = design_strdup(format);
+    definition->provenance = design_strdup(provenance);
+    definition->start_line = start_line;
+    return definition->token_path && (!value || definition->value) ? 0 : -1;
+}
+
 static int64_t design_upsert_token(design_ctx_t *ctx, const char *scope, const char *token_path,
                                    const char *type, const char *value, const char *description,
                                    const char *file_path, const char *format,
-                                   const char *provenance, int start_line, int64_t system_id) {
+                                   const char *provenance, const char *reference,
+                                   const char *extends, bool composite, int start_line,
+                                   int64_t system_id) {
     char qn[DESIGN_QN_CAP];
     design_token_qn(ctx, scope, token_path, qn, sizeof(qn));
     const cbm_gbuf_node_t *existing = cbm_gbuf_find_by_qn(ctx->opts->gbuf, qn);
@@ -476,17 +576,25 @@ static int64_t design_upsert_token(design_ctx_t *ctx, const char *scope, const c
         return existing->id;
     }
     char *props = design_properties(format, file_path, scope, token_path, type, value, description,
-                                    provenance);
+                                    provenance, reference, extends, composite);
+    if (!props) {
+        return 0;
+    }
     const char *name = strrchr(token_path, '.');
     name = name ? name + 1 : token_path;
     int64_t id = cbm_gbuf_upsert_node(ctx->opts->gbuf, "DesignToken", name, qn, file_path,
-                                      start_line, start_line, props ? props : "{}");
+                                      start_line, start_line, props);
     free(props);
     if (id > 0 && system_id > 0) {
         cbm_gbuf_insert_edge(ctx->opts->gbuf, system_id, id, "PROVIDES", "{}");
     }
     if (!existing && id > 0) {
         ctx->token_count++;
+    }
+    if (id > 0 && !incoming_generated && !incoming_css &&
+        design_token_definition_add(ctx, file_path, id, token_path, type, value, description,
+                                    format, provenance, start_line) != 0) {
+        return 0;
     }
     if (value && value[0] == '{') {
         size_t n = strlen(value);
@@ -495,7 +603,10 @@ static int64_t design_upsert_token(design_ctx_t *ctx, const char *scope, const c
             if (target) {
                 memcpy(target, value + 1, n - 2);
                 target[n - 2] = '\0';
-                (void)design_alias_add(ctx, id, scope, target);
+                if (design_alias_add(ctx, id, scope, target) != 0) {
+                    free(target);
+                    return 0;
+                }
                 free(target);
             }
         }
@@ -526,12 +637,12 @@ static void design_join_path(const char *prefix, const char *name, char *out, si
     }
 }
 
-/* Recursively visit a DTCG document. Group `$type` is inherited. `$root` is
- * represented at the group's path, matching DTCG's group-root semantics. */
+/* Recursively visit a DTCG document. Group `$type` is inherited. Structural
+ * `$ref`/`$extends` metadata is preserved but deliberately not evaluated. */
 static int design_parse_dtcg_object(design_ctx_t *ctx, yyjson_val *object, const char *prefix,
-                                    const char *inherited_type, const char *scope,
-                                    const char *file_path, const char *provenance,
-                                    int64_t system_id) {
+                                    const char *inherited_type, const char *inherited_extends,
+                                    const char *scope, const char *file_path,
+                                    const char *provenance, int64_t system_id) {
     if (!yyjson_is_obj(object)) {
         return 0;
     }
@@ -540,23 +651,31 @@ static int design_parse_dtcg_object(design_ctx_t *ctx, yyjson_val *object, const
     if (yyjson_is_str(type_value)) {
         group_type = yyjson_get_str(type_value);
     }
+    const char *group_extends = inherited_extends;
+    yyjson_val *extends_value = yyjson_obj_get(object, "$extends");
+    if (yyjson_is_str(extends_value)) {
+        group_extends = yyjson_get_str(extends_value);
+    }
 
     yyjson_val *value = yyjson_obj_get(object, "$value");
-    if (value && prefix && prefix[0]) {
+    yyjson_val *reference_value = yyjson_obj_get(object, "$ref");
+    const char *reference = yyjson_is_str(reference_value) ? yyjson_get_str(reference_value) : NULL;
+    if ((value || reference) && prefix && prefix[0]) {
         const char *token_type = group_type;
         const char *description = NULL;
         yyjson_val *description_value = yyjson_obj_get(object, "$description");
         if (yyjson_is_str(description_value)) {
             description = yyjson_get_str(description_value);
         }
-        char *serialized = design_json_value_string(value);
+        char *serialized = value ? design_json_value_string(value) : design_strdup(reference);
         if (!serialized) {
             return -1;
         }
-        (void)design_upsert_token(ctx, scope, prefix, token_type, serialized, description,
-                                  file_path, "dtcg", provenance, 1, system_id);
+        int64_t token_id = design_upsert_token(
+            ctx, scope, prefix, token_type, serialized, description, file_path, "dtcg", provenance,
+            reference, group_extends, yyjson_is_obj(value), 1, system_id);
         free(serialized);
-        return 0;
+        return token_id > 0 ? 0 : -1;
     }
 
     yyjson_obj_iter iter;
@@ -569,14 +688,10 @@ static int design_parse_dtcg_object(design_ctx_t *ctx, yyjson_val *object, const
             continue;
         }
         char path[DESIGN_PATH_CAP];
-        if (strcmp(name, "$root") == 0) {
-            snprintf(path, sizeof(path), "%s", prefix);
-        } else {
-            design_join_path(prefix, name, path, sizeof(path));
-        }
+        design_join_path(prefix, name, path, sizeof(path));
         if (yyjson_is_obj(child)) {
-            if (design_parse_dtcg_object(ctx, child, path, group_type, scope, file_path, provenance,
-                                         system_id) != 0) {
+            if (design_parse_dtcg_object(ctx, child, path, group_type, group_extends, scope,
+                                         file_path, provenance, system_id) != 0) {
                 return -1;
             }
         }
@@ -599,8 +714,8 @@ static int design_parse_dtcg(design_ctx_t *ctx, const cbm_file_info_t *file, con
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
     const char *provenance = design_provenance(ctx, file->rel_path, "authoritative");
-    int rc =
-        design_parse_dtcg_object(ctx, root, "", NULL, scope, file->rel_path, provenance, system_id);
+    int rc = design_parse_dtcg_object(ctx, root, "", NULL, NULL, scope, file->rel_path, provenance,
+                                      system_id);
     yyjson_doc_free(doc);
     return rc;
 }
@@ -609,6 +724,71 @@ typedef struct {
     int indent;
     char key[256];
 } design_yaml_level_t;
+
+typedef struct {
+    char token_path[DESIGN_PATH_CAP];
+    yyjson_mut_doc *doc;
+    yyjson_mut_val *value;
+    int start_line;
+} design_google_composite_t;
+
+typedef struct {
+    design_google_composite_t *items;
+    int count;
+    int cap;
+} design_google_composites_t;
+
+static void design_google_composites_free(design_google_composites_t *composites) {
+    for (int i = 0; i < composites->count; i++) {
+        yyjson_mut_doc_free(composites->items[i].doc);
+    }
+    free(composites->items);
+}
+
+static design_google_composite_t *design_google_composite_get(
+    design_google_composites_t *composites, const char *token_path, int start_line) {
+    for (int i = 0; i < composites->count; i++) {
+        if (strcmp(composites->items[i].token_path, token_path) == 0) {
+            return &composites->items[i];
+        }
+    }
+    if (composites->count == composites->cap) {
+        int cap = composites->cap ? composites->cap * 2 : 8;
+        design_google_composite_t *grown =
+            (design_google_composite_t *)realloc(composites->items, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return NULL;
+        }
+        composites->items = grown;
+        composites->cap = cap;
+    }
+    design_google_composite_t *composite = &composites->items[composites->count++];
+    memset(composite, 0, sizeof(*composite));
+    snprintf(composite->token_path, sizeof(composite->token_path), "%s", token_path);
+    composite->start_line = start_line;
+    composite->doc = yyjson_mut_doc_new(NULL);
+    if (!composite->doc) {
+        return NULL;
+    }
+    composite->value = yyjson_mut_obj(composite->doc);
+    yyjson_mut_doc_set_root(composite->doc, composite->value);
+    return composite;
+}
+
+static int design_google_composite_add(design_google_composites_t *composites,
+                                       const char *token_path, const char *field, const char *value,
+                                       int start_line) {
+    design_google_composite_t *composite =
+        design_google_composite_get(composites, token_path, start_line);
+    if (!composite || !composite->value) {
+        return -1;
+    }
+    yyjson_mut_val *field_copy = yyjson_mut_strcpy(composite->doc, field);
+    yyjson_mut_val *value_copy = yyjson_mut_strcpy(composite->doc, value);
+    return field_copy && value_copy && yyjson_mut_obj_add(composite->value, field_copy, value_copy)
+               ? 0
+               : -1;
+}
 
 static char *design_trim(char *s) {
     if (!s) {
@@ -658,6 +838,7 @@ static int design_parse_frontmatter(design_ctx_t *ctx, char *source, const cbm_f
     cursor++;
     design_yaml_level_t levels[32];
     int level_count = 0;
+    design_google_composites_t composites = {0};
     const char *provenance = design_provenance(ctx, file->rel_path, "authoritative");
     int line_no = 2;
 
@@ -713,20 +894,46 @@ static int design_parse_frontmatter(design_ctx_t *ctx, char *source, const cbm_f
                     if (strcmp(root_key, "components") == 0 && level_count >= 2) {
                         int64_t component_id = design_upsert_component(
                             ctx, scope, levels[1].key, file->rel_path, provenance, system_id);
-                        int64_t token_id = design_upsert_token(ctx, scope, token_path, NULL, value,
-                                                               NULL, file->rel_path, "design-md",
-                                                               provenance, line_no, system_id);
+                        int64_t token_id = design_upsert_token(
+                            ctx, scope, token_path, NULL, value, NULL, file->rel_path, "design-md",
+                            provenance, NULL, NULL, false, line_no, system_id);
+                        if (component_id <= 0 || token_id <= 0) {
+                            design_google_composites_free(&composites);
+                            return -1;
+                        }
                         if (component_id > 0 && token_id > 0) {
                             cbm_gbuf_insert_edge(ctx->opts->gbuf, component_id, token_id,
                                                  "PROVIDES", "{}");
+                        }
+                    } else if (strcmp(root_key, "typography") == 0 && level_count >= 2) {
+                        char composite_path[DESIGN_PATH_CAP];
+                        design_join_path(root_key, levels[1].key, composite_path,
+                                         sizeof(composite_path));
+                        char field_path[DESIGN_PATH_CAP] = {0};
+                        for (int i = 2; i < level_count; i++) {
+                            char field_joined[DESIGN_PATH_CAP];
+                            design_join_path(field_path, levels[i].key, field_joined,
+                                             sizeof(field_joined));
+                            snprintf(field_path, sizeof(field_path), "%s", field_joined);
+                        }
+                        char field_joined[DESIGN_PATH_CAP];
+                        design_join_path(field_path, key, field_joined, sizeof(field_joined));
+                        if (design_google_composite_add(&composites, composite_path, field_joined,
+                                                        value, line_no) != 0) {
+                            design_google_composites_free(&composites);
+                            return -1;
                         }
                     } else if (strcmp(root_key, "colors") == 0 ||
                                strcmp(root_key, "typography") == 0 ||
                                strcmp(root_key, "spacing") == 0 ||
                                strcmp(root_key, "rounded") == 0) {
-                        (void)design_upsert_token(
-                            ctx, scope, token_path, design_google_type(root_key), value, NULL,
-                            file->rel_path, "design-md", provenance, line_no, system_id);
+                        if (design_upsert_token(ctx, scope, token_path,
+                                                design_google_type(root_key), value, NULL,
+                                                file->rel_path, "design-md", provenance, NULL, NULL,
+                                                false, line_no, system_id) <= 0) {
+                            design_google_composites_free(&composites);
+                            return -1;
+                        }
                     }
                 }
             }
@@ -737,6 +944,19 @@ static int design_parse_frontmatter(design_ctx_t *ctx, char *source, const cbm_f
         cursor = line_end + 1;
         line_no++;
     }
+    for (int i = 0; i < composites.count; i++) {
+        char *serialized = yyjson_mut_write(composites.items[i].doc, 0, NULL);
+        if (!serialized ||
+            design_upsert_token(ctx, scope, composites.items[i].token_path, "typography",
+                                serialized, NULL, file->rel_path, "design-md", provenance, NULL,
+                                NULL, true, composites.items[i].start_line, system_id) <= 0) {
+            free(serialized);
+            design_google_composites_free(&composites);
+            return -1;
+        }
+        free(serialized);
+    }
+    design_google_composites_free(&composites);
     return 0;
 }
 
@@ -825,7 +1045,11 @@ static int design_parse_document(design_ctx_t *ctx, const cbm_file_info_t *file)
     }
     free(file_qn);
     if (source) {
-        (void)design_parse_frontmatter(ctx, source, file, scope, system_id, name, sizeof(name));
+        if (design_parse_frontmatter(ctx, source, file, scope, system_id, name, sizeof(name)) !=
+            0) {
+            free(source);
+            return -1;
+        }
         free(source);
     }
     if (design_documents_add(ctx, file->rel_path, scope, system_id) != 0) {
@@ -871,22 +1095,13 @@ static void design_scope_for_file(design_ctx_t *ctx, const char *path, char *sco
     *system_id = design_ensure_system(ctx, scope, path, "Repository Design");
 }
 
-typedef struct {
-    design_ctx_t *ctx;
-    int64_t mode_id;
-    const char *source_path;
-    int order;
-} design_mode_link_ctx_t;
-
-static void design_link_mode_token_visitor(const cbm_gbuf_node_t *node, void *userdata) {
-    design_mode_link_ctx_t *link = (design_mode_link_ctx_t *)userdata;
-    if (!node || !node->label || strcmp(node->label, "DesignToken") != 0 || !node->file_path ||
-        strcmp(node->file_path, link->source_path) != 0) {
-        return;
+static design_token_source_t *design_token_source_find(design_ctx_t *ctx, const char *path) {
+    for (int i = 0; i < ctx->token_sources.count; i++) {
+        if (strcmp(ctx->token_sources.items[i].path, path) == 0) {
+            return &ctx->token_sources.items[i];
+        }
     }
-    char props[64];
-    snprintf(props, sizeof(props), "{\"source_order\":%d}", link->order);
-    cbm_gbuf_insert_edge(link->ctx->opts->gbuf, link->mode_id, node->id, "OVERRIDES", props);
+    return NULL;
 }
 
 /* Resolve only repository-local references. Resolver documents may legally
@@ -956,7 +1171,8 @@ static bool design_resolver_local_path(const char *resolver_path, const char *re
 
 static char *design_mode_properties(yyjson_val *modifier, yyjson_val *sources,
                                     const char *resolver_path, const char *scope,
-                                    const char *modifier_name, const char *context_name) {
+                                    const char *modifier_name, const char *context_name,
+                                    int resolution_order) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         return NULL;
@@ -970,6 +1186,9 @@ static char *design_mode_properties(yyjson_val *modifier, yyjson_val *sources,
     yyjson_mut_obj_add_str(doc, root, "modifier", modifier_name);
     yyjson_mut_obj_add_str(doc, root, "context", context_name);
     yyjson_mut_obj_add_str(doc, root, "resolver_version", "2025.10");
+    if (resolution_order >= 0) {
+        yyjson_mut_obj_add_int(doc, root, "resolution_order", resolution_order);
+    }
     yyjson_val *description = yyjson_obj_get(modifier, "description");
     if (yyjson_is_str(description)) {
         yyjson_mut_obj_add_str(doc, root, "description", yyjson_get_str(description));
@@ -990,6 +1209,62 @@ static char *design_mode_properties(yyjson_val *modifier, yyjson_val *sources,
                 yyjson_mut_arr_add_str(doc, refs, yyjson_get_str(ref));
             }
         }
+    }
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+static int design_resolver_modifier_order(yyjson_val *root, const char *modifier_name) {
+    yyjson_val *order = yyjson_is_obj(root) ? yyjson_obj_get(root, "resolutionOrder") : NULL;
+    if (!yyjson_is_arr(order)) {
+        return -1;
+    }
+    size_t idx, max;
+    yyjson_val *entry;
+    yyjson_arr_foreach(order, idx, max, entry) {
+        yyjson_val *ref = yyjson_is_obj(entry) ? yyjson_obj_get(entry, "$ref") : NULL;
+        const char *text = yyjson_is_str(ref) ? yyjson_get_str(ref) : NULL;
+        const char *name = text ? strrchr(text, '/') : NULL;
+        name = name ? name + 1 : text;
+        if (name && strcmp(name, modifier_name) == 0) {
+            return (int)idx;
+        }
+    }
+    return -1;
+}
+
+static char *design_mode_override_properties(const design_token_definition_t *definition,
+                                             const char *source_path, int source_order,
+                                             int modifier_order, bool default_context) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_int(doc, root, "source_order", source_order);
+    if (modifier_order >= 0) {
+        yyjson_mut_obj_add_int(doc, root, "modifier_order", modifier_order);
+    }
+    yyjson_mut_obj_add_str(doc, root, "source_path", source_path);
+    yyjson_mut_obj_add_str(doc, root, "token_path", definition->token_path);
+    yyjson_mut_obj_add_int(doc, root, "line", definition->start_line);
+    yyjson_mut_obj_add_bool(doc, root, "default", default_context);
+    if (definition->type) {
+        yyjson_mut_obj_add_str(doc, root, "token_type", definition->type);
+    }
+    if (definition->value) {
+        yyjson_mut_obj_add_str(doc, root, "value", definition->value);
+    }
+    if (definition->description) {
+        yyjson_mut_obj_add_str(doc, root, "description", definition->description);
+    }
+    if (definition->format) {
+        yyjson_mut_obj_add_str(doc, root, "source_format", definition->format);
+    }
+    if (definition->provenance) {
+        yyjson_mut_obj_add_str(doc, root, "provenance", definition->provenance);
     }
     char *json = yyjson_mut_write(doc, 0, NULL);
     yyjson_mut_doc_free(doc);
@@ -1031,6 +1306,10 @@ static int design_parse_resolver(design_ctx_t *ctx, const cbm_file_info_t *file)
         if (!modifier_name || !yyjson_is_obj(contexts)) {
             continue;
         }
+        int modifier_order = design_resolver_modifier_order(root, modifier_name);
+        yyjson_val *default_value = yyjson_obj_get(modifier, "default");
+        const char *default_context =
+            yyjson_is_str(default_value) ? yyjson_get_str(default_value) : NULL;
         yyjson_obj_iter context_iter;
         yyjson_obj_iter_init(contexts, &context_iter);
         yyjson_val *context_key;
@@ -1045,14 +1324,22 @@ static int design_parse_resolver(design_ctx_t *ctx, const cbm_file_info_t *file)
             char display_name[512];
             snprintf(display_name, sizeof(display_name), "%s: %s", modifier_name, context_name);
             char *props = design_mode_properties(modifier, sources, file->rel_path, scope,
-                                                 modifier_name, context_name);
+                                                 modifier_name, context_name, modifier_order);
+            if (!props) {
+                yyjson_doc_free(doc);
+                return -1;
+            }
             int64_t mode_id = cbm_gbuf_upsert_node(ctx->opts->gbuf, "DesignMode", display_name, qn,
-                                                   file->rel_path, 1, 1, props ? props : "{}");
+                                                   file->rel_path, 1, 1, props);
             free(props);
             if (mode_id <= 0) {
-                continue;
+                yyjson_doc_free(doc);
+                return -1;
             }
-            cbm_gbuf_insert_edge(ctx->opts->gbuf, system_id, mode_id, "PROVIDES", "{}");
+            if (cbm_gbuf_insert_edge(ctx->opts->gbuf, system_id, mode_id, "PROVIDES", "{}") <= 0) {
+                yyjson_doc_free(doc);
+                return -1;
+            }
             ctx->mode_count++;
             size_t idx, max;
             yyjson_val *source_value;
@@ -1065,9 +1352,27 @@ static int design_parse_resolver(design_ctx_t *ctx, const cbm_file_info_t *file)
                                                 sizeof(source_path))) {
                     continue;
                 }
-                design_mode_link_ctx_t link = {
-                    .ctx = ctx, .mode_id = mode_id, .source_path = source_path, .order = (int)idx};
-                cbm_gbuf_foreach_node(ctx->opts->gbuf, design_link_mode_token_visitor, &link);
+                design_token_source_t *token_source = design_token_source_find(ctx, source_path);
+                if (!token_source) {
+                    continue;
+                }
+                for (int token_idx = 0; token_idx < token_source->count; token_idx++) {
+                    design_token_definition_t *definition = &token_source->items[token_idx];
+                    char *override_props = design_mode_override_properties(
+                        definition, source_path, (int)idx, modifier_order,
+                        default_context && strcmp(default_context, context_name) == 0);
+                    if (!override_props) {
+                        yyjson_doc_free(doc);
+                        return -1;
+                    }
+                    if (cbm_gbuf_insert_edge(ctx->opts->gbuf, mode_id, definition->token_id,
+                                             "OVERRIDES", override_props) <= 0) {
+                        free(override_props);
+                        yyjson_doc_free(doc);
+                        return -1;
+                    }
+                    free(override_props);
+                }
             }
         }
     }
@@ -1208,9 +1513,14 @@ static int design_parse_css(design_ctx_t *ctx, const cbm_file_info_t *file, bool
                 char *trimmed = design_trim(value);
                 char token_path[DESIGN_PATH_CAP];
                 design_css_name_to_path(name, token_path, sizeof(token_path));
-                (void)design_upsert_token(
-                    ctx, scope, token_path, design_infer_css_type(name, trimmed), trimmed, NULL,
-                    file->rel_path, "css", provenance, design_line_number(source, p), system_id);
+                if (design_upsert_token(ctx, scope, token_path,
+                                        design_infer_css_type(name, trimmed), trimmed, NULL,
+                                        file->rel_path, "css", provenance, NULL, NULL, false,
+                                        design_line_number(source, p), system_id) <= 0) {
+                    free(file_qn);
+                    free(source);
+                    return -1;
+                }
                 p = value_end;
                 continue;
             }
@@ -1319,6 +1629,20 @@ static void design_ctx_free(design_ctx_t *ctx) {
         free(ctx->documents.items[i].scope);
     }
     free(ctx->documents.items);
+    for (int i = 0; i < ctx->token_sources.count; i++) {
+        design_token_source_t *source = &ctx->token_sources.items[i];
+        free(source->path);
+        for (int j = 0; j < source->count; j++) {
+            free(source->items[j].token_path);
+            free(source->items[j].type);
+            free(source->items[j].value);
+            free(source->items[j].description);
+            free(source->items[j].format);
+            free(source->items[j].provenance);
+        }
+        free(source->items);
+    }
+    free(ctx->token_sources.items);
 }
 
 int cbm_design_index(const cbm_design_index_opts_t *opts) {
@@ -1361,20 +1685,29 @@ int cbm_design_index(const cbm_design_index_opts_t *opts) {
     for (int i = 0; i < opts->file_count; i++) {
         const char *path = opts->files[i].rel_path;
         if (design_has_suffix(path, ".css") || design_has_suffix(path, ".scss")) {
-            (void)design_parse_css(&ctx, &opts->files[i], true, false);
+            if (design_parse_css(&ctx, &opts->files[i], true, false) != 0) {
+                design_ctx_free(&ctx);
+                return -1;
+            }
         }
     }
     for (int i = 0; i < opts->file_count; i++) {
         const char *path = opts->files[i].rel_path;
         if (design_has_suffix(path, ".css") || design_has_suffix(path, ".scss")) {
-            (void)design_parse_css(&ctx, &opts->files[i], false, true);
+            if (design_parse_css(&ctx, &opts->files[i], false, true) != 0) {
+                design_ctx_free(&ctx);
+                return -1;
+            }
         }
     }
     /* Resolver metadata is indexed after token sources so mode-to-token
      * override edges can be connected without executing the resolver. */
     for (int i = 0; i < opts->file_count; i++) {
         if (design_is_resolver(&ctx, opts->files[i].rel_path)) {
-            (void)design_parse_resolver(&ctx, &opts->files[i]);
+            if (design_parse_resolver(&ctx, &opts->files[i]) != 0) {
+                design_ctx_free(&ctx);
+                return -1;
+            }
         }
     }
     design_resolve_aliases(&ctx);
