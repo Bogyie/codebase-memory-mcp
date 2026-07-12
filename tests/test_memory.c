@@ -2,9 +2,11 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 
-#include "memory/memory.h"
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
+#include "memory/memory.h"
+#include "memory/memory_raw.h"
 #include "store/store.h"
 
 #include <sqlite3.h>
@@ -17,6 +19,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifndef _WIN32
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 enum { MEMORY_TEST_PATH = 1024, MEMORY_TEST_JSON = 32768 };
 
@@ -67,6 +77,18 @@ static int64_t memory_result_int(const char *json, const char *key) {
     return result;
 }
 
+static int64_t memory_result_nested_int(const char *json, const char *object_key, const char *key) {
+    yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    if (!doc) {
+        return -1;
+    }
+    yyjson_val *object = yyjson_obj_get(yyjson_doc_get_root(doc), object_key);
+    yyjson_val *value = object && yyjson_is_obj(object) ? yyjson_obj_get(object, key) : NULL;
+    int64_t result = value && yyjson_is_num(value) ? yyjson_get_sint(value) : -1;
+    yyjson_doc_free(doc);
+    return result;
+}
+
 static int memory_sql_int(cbm_memory_t *memory, const char *sql) {
     sqlite3_stmt *stmt = NULL;
     int value = -1;
@@ -76,6 +98,11 @@ static int memory_sql_int(cbm_memory_t *memory, const char *sql) {
     }
     sqlite3_finalize(stmt);
     return value;
+}
+
+static int memory_test_reject_commit(void *opaque) {
+    (void)opaque;
+    return 1;
 }
 
 static char *memory_read_text(const char *path) {
@@ -107,6 +134,68 @@ static char *memory_read_text(const char *path) {
     return body;
 }
 
+#ifndef _WIN32
+static int memory_directory_entry_count(const char *path) {
+    DIR *directory = opendir(path);
+    if (!directory) {
+        return -1;
+    }
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+            count++;
+        }
+    }
+    closedir(directory);
+    return count;
+}
+
+typedef struct {
+    const char *relative;
+} memory_gc_reference_t;
+
+static bool memory_gc_reference_matches(const char *relative, void *opaque) {
+    memory_gc_reference_t *reference = opaque;
+    return reference && reference->relative && relative &&
+           strcmp(reference->relative, relative) == 0;
+}
+
+typedef struct {
+    const char *home;
+    const char *candidate_relative;
+    int calls;
+    int gc_rc;
+    size_t removed;
+} memory_gc_commit_hook_t;
+
+static bool memory_gc_commit_reference(const char *relative, void *opaque) {
+    memory_gc_commit_hook_t *hook = opaque;
+    return !hook || !hook->candidate_relative || !relative ||
+           strcmp(relative, hook->candidate_relative) != 0;
+}
+
+static bool memory_gc_never_referenced(const char *relative, void *opaque) {
+    (void)relative;
+    (void)opaque;
+    return false;
+}
+
+static int memory_gc_during_commit(void *opaque) {
+    memory_gc_commit_hook_t *hook = opaque;
+    size_t staging_removed = 0;
+    size_t orphans_removed = 0;
+    hook->calls++;
+    if (hook->calls > 1) {
+        return 0;
+    }
+    hook->gc_rc = cbm_memory_raw_gc(hook->home, 0, memory_gc_commit_reference, hook,
+                                     &staging_removed, &orphans_removed);
+    hook->removed += orphans_removed;
+    return 0;
+}
+#endif
+
 static char *memory_propose_commit(cbm_memory_t *memory, const char *proposal_id,
                                    const char *operation_id, const char *operations,
                                    const char *expected_revisions) {
@@ -125,7 +214,9 @@ static char *memory_propose_commit(cbm_memory_t *memory, const char *proposal_id
     }
     free(proposed);
     char commit[512];
-    n = snprintf(commit, sizeof(commit), "{\"proposal_id\":\"%s\",\"operation_id\":\"%s\"}",
+    n = snprintf(commit, sizeof(commit),
+                 "{\"proposal_id\":\"%s\",\"operation_id\":\"%s\","
+                 "\"user_approved\":true}",
                  proposal_id, operation_id);
     return n >= 0 && n < (int)sizeof(commit) ? cbm_memory_commit_json(memory, commit) : NULL;
 }
@@ -162,8 +253,7 @@ static bool memory_add_claim_batch(cbm_memory_t *memory, int start, int count, i
     char operation_id[64];
     snprintf(proposal_id, sizeof(proposal_id), "proposal:benchmark:%d", batch);
     snprintf(operation_id, sizeof(operation_id), "operation:benchmark:%d", batch);
-    char *result =
-        memory_propose_commit(memory, proposal_id, operation_id, operations_json, "{}");
+    char *result = memory_propose_commit(memory, proposal_id, operation_id, operations_json, "{}");
     free(operations_json);
     bool ok = memory_result_ok(result);
     free(result);
@@ -186,6 +276,58 @@ typedef struct {
     char *proposal_result;
     char *commit_result;
 } memory_writer_task_t;
+
+typedef struct {
+    const char *home;
+    const char *args_json;
+    bool reject_commit;
+    atomic_int *ready;
+    atomic_bool *go;
+    char *result;
+} memory_ingest_task_t;
+
+#ifndef _WIN32
+typedef struct {
+    const char *path;
+    long delay_ns;
+} memory_fifo_release_task_t;
+
+static void *memory_fifo_release_thread(void *opaque) {
+    memory_fifo_release_task_t *task = opaque;
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = task->delay_ns};
+    struct timespec remaining;
+    while (nanosleep(&delay, &remaining) != 0 && errno == EINTR) {
+        delay = remaining;
+    }
+    int fd = open(task->path, O_WRONLY | O_NONBLOCK);
+    if (fd >= 0) {
+        (void)close(fd);
+    }
+    return NULL;
+}
+#endif
+
+static void *memory_ingest_thread(void *opaque) {
+    memory_ingest_task_t *task = opaque;
+    cbm_memory_t *memory = cbm_memory_open(task->home);
+    if (!memory) {
+        atomic_fetch_add_explicit(task->ready, 1, memory_order_release);
+        return NULL;
+    }
+    if (task->reject_commit) {
+        sqlite3_commit_hook(cbm_memory_db(memory), memory_test_reject_commit, NULL);
+    }
+    atomic_fetch_add_explicit(task->ready, 1, memory_order_release);
+    while (!atomic_load_explicit(task->go, memory_order_acquire)) {
+        atomic_signal_fence(memory_order_seq_cst);
+    }
+    task->result = cbm_memory_ingest_json(memory, task->args_json);
+    if (task->reject_commit) {
+        sqlite3_commit_hook(cbm_memory_db(memory), NULL, NULL);
+    }
+    cbm_memory_close(memory);
+    return NULL;
+}
 
 static void *memory_writer_thread(void *opaque) {
     memory_writer_task_t *task = opaque;
@@ -212,6 +354,25 @@ static int memory_run_two_writers(memory_writer_task_t tasks[2]) {
         return -1;
     }
     if (cbm_thread_create(&threads[1], 0, memory_writer_thread, &tasks[1]) != 0) {
+        atomic_store_explicit(tasks[0].go, true, memory_order_release);
+        cbm_thread_join(&threads[0]);
+        return -1;
+    }
+    while (atomic_load_explicit(tasks[0].ready, memory_order_acquire) < 2) {
+        atomic_signal_fence(memory_order_seq_cst);
+    }
+    atomic_store_explicit(tasks[0].go, true, memory_order_release);
+    int first = cbm_thread_join(&threads[0]);
+    int second = cbm_thread_join(&threads[1]);
+    return first == 0 && second == 0 ? 0 : -1;
+}
+
+static int memory_run_two_ingests(memory_ingest_task_t tasks[2]) {
+    cbm_thread_t threads[2];
+    if (cbm_thread_create(&threads[0], 0, memory_ingest_thread, &tasks[0]) != 0) {
+        return -1;
+    }
+    if (cbm_thread_create(&threads[1], 0, memory_ingest_thread, &tasks[1]) != 0) {
         atomic_store_explicit(tasks[0].go, true, memory_order_release);
         cbm_thread_join(&threads[0]);
         return -1;
@@ -260,11 +421,522 @@ TEST(memory_ingest_deduplicates) {
     ASSERT_NOT_NULL(second);
     ASSERT_NOT_NULL(strstr(first, "\"deduplicated\":false"));
     ASSERT_NOT_NULL(strstr(second, "\"deduplicated\":true"));
+    char object_relpath[MEMORY_TEST_PATH];
+    ASSERT_TRUE(
+        memory_result_copy_string(first, "object_path", object_relpath, sizeof(object_relpath)));
     ASSERT_EQ(cbm_memory_snapshot_epoch(memory), 1);
     free(first);
     free(second);
+
+    char object_path[MEMORY_TEST_PATH];
+    snprintf(object_path, sizeof(object_path), "%s/%s", home, object_relpath);
+    ASSERT_EQ(cbm_unlink(object_path), 0);
+    char *repaired_missing = cbm_memory_ingest_json(memory, args);
+    ASSERT_TRUE(memory_result_ok(repaired_missing));
+    ASSERT_NOT_NULL(strstr(repaired_missing, "\"deduplicated\":true"));
+    free(repaired_missing);
+    char *restored = memory_read_text(object_path);
+    ASSERT_NOT_NULL(restored);
+    ASSERT_STR_EQ(restored, "immutable fact");
+    free(restored);
+#ifndef _WIN32
+    ASSERT_EQ(th_write_file(object_path, "corrupt raw bytes"), 0);
+    char *repaired_corrupt = cbm_memory_ingest_json(memory, args);
+    ASSERT_TRUE(memory_result_ok(repaired_corrupt));
+    ASSERT_NOT_NULL(strstr(repaired_corrupt, "\"deduplicated\":true"));
+    free(repaired_corrupt);
+    restored = memory_read_text(object_path);
+    ASSERT_NOT_NULL(restored);
+    ASSERT_STR_EQ(restored, "immutable fact");
+    free(restored);
+#endif
     cbm_memory_close(memory);
     th_rmtree(home);
+    PASS();
+}
+
+TEST(memory_ingest_commit_failure_leaves_safe_content_addressed_orphan) {
+    char home[MEMORY_TEST_PATH];
+    char final_path[MEMORY_TEST_PATH];
+    char prefix_path[MEMORY_TEST_PATH];
+    char staging_path[MEMORY_TEST_PATH];
+    char *temporary = th_mktempdir("cbm_memory_ingest_rollback");
+    ASSERT_NOT_NULL(temporary);
+    snprintf(home, sizeof(home), "%s", temporary);
+    cbm_memory_t *memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+
+    const char *content = "raw object must follow canonical commit";
+    char hash[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(content, strlen(content), hash);
+    snprintf(prefix_path, sizeof(prefix_path), "%s/raw/objects/%.2s", home, hash);
+    snprintf(final_path, sizeof(final_path), "%s/%s.txt", prefix_path, hash);
+    snprintf(staging_path, sizeof(staging_path), "%s/.ingest-staging", home);
+
+#ifndef _WIN32
+    char outside_file[MEMORY_TEST_PATH];
+    char outside_parent[MEMORY_TEST_PATH];
+    char outside_target[MEMORY_TEST_PATH];
+    char outside_staging[MEMORY_TEST_PATH];
+    snprintf(outside_file, sizeof(outside_file), "%s/outside-object.txt", temporary);
+    snprintf(outside_parent, sizeof(outside_parent), "%s/outside-parent", temporary);
+    snprintf(outside_target, sizeof(outside_target), "%s/%s.txt", outside_parent, hash);
+    snprintf(outside_staging, sizeof(outside_staging), "%s/outside-staging", temporary);
+    ASSERT_EQ(th_write_file(outside_file, content), 0);
+    ASSERT_TRUE(cbm_mkdir_p(prefix_path, 0700));
+    ASSERT_EQ(symlink(outside_file, final_path), 0);
+    char *linked_target =
+        cbm_memory_ingest_json(memory, "{\"content\":\"raw object must follow canonical commit\"}");
+    ASSERT_FALSE(memory_result_ok(linked_target));
+    ASSERT_TRUE(memory_result_string_is(linked_target, "error", "raw_store_failed"));
+    free(linked_target);
+    ASSERT_EQ(cbm_unlink(final_path), 0);
+    ASSERT_EQ(cbm_rmdir(prefix_path), 0);
+
+    ASSERT_TRUE(cbm_mkdir_p(prefix_path, 0700));
+    ASSERT_EQ(mkfifo(final_path, 0600), 0);
+    memory_fifo_release_task_t target_fifo_task = {
+        .path = final_path,
+        .delay_ns = 500000000L,
+    };
+    cbm_thread_t target_fifo_thread;
+    ASSERT_EQ(
+        cbm_thread_create(&target_fifo_thread, 0, memory_fifo_release_thread, &target_fifo_task),
+        0);
+    struct timespec target_fifo_start;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &target_fifo_start);
+    char *fifo_target =
+        cbm_memory_ingest_json(memory, "{\"content\":\"raw object must follow canonical commit\"}");
+    int64_t target_fifo_elapsed = memory_test_elapsed_ms(target_fifo_start);
+    ASSERT_EQ(cbm_thread_join(&target_fifo_thread), 0);
+    ASSERT_FALSE(memory_result_ok(fifo_target));
+    ASSERT_TRUE(memory_result_string_is(fifo_target, "error", "raw_store_failed"));
+    ASSERT_LT(target_fifo_elapsed, 400);
+    free(fifo_target);
+    ASSERT_EQ(cbm_unlink(final_path), 0);
+    ASSERT_EQ(cbm_rmdir(prefix_path), 0);
+
+    ASSERT_TRUE(cbm_mkdir_p(outside_parent, 0700));
+    ASSERT_EQ(symlink(outside_parent, prefix_path), 0);
+    char *linked_parent =
+        cbm_memory_ingest_json(memory, "{\"content\":\"raw object must follow canonical commit\"}");
+    ASSERT_FALSE(memory_result_ok(linked_parent));
+    ASSERT_TRUE(memory_result_string_is(linked_parent, "error", "raw_store_failed"));
+    free(linked_parent);
+    ASSERT_FALSE(cbm_file_exists(outside_target));
+    ASSERT_EQ(cbm_unlink(prefix_path), 0);
+
+    ASSERT_TRUE(cbm_mkdir_p(outside_staging, 0700));
+    ASSERT_EQ(symlink(outside_staging, staging_path), 0);
+    char *linked_staging =
+        cbm_memory_ingest_json(memory, "{\"content\":\"raw object must follow canonical commit\"}");
+    ASSERT_FALSE(memory_result_ok(linked_staging));
+    ASSERT_TRUE(memory_result_string_is(linked_staging, "error", "raw_store_failed"));
+    free(linked_staging);
+    ASSERT_EQ(memory_directory_entry_count(outside_staging), 0);
+    ASSERT_EQ(cbm_unlink(staging_path), 0);
+    ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_sources;"), 0);
+#endif
+
+    sqlite3 *db = cbm_memory_db(memory);
+    ASSERT_NOT_NULL(db);
+    sqlite3_commit_hook(db, memory_test_reject_commit, NULL);
+    char *failed =
+        cbm_memory_ingest_json(memory, "{\"content\":\"raw object must follow canonical commit\","
+                                       "\"origin\":\"commit-veto-test\"}");
+    sqlite3_commit_hook(db, NULL, NULL);
+    ASSERT_NOT_NULL(failed);
+    ASSERT_FALSE(memory_result_ok(failed));
+    ASSERT_TRUE(memory_result_string_is(failed, "error", "ingest_failed"));
+    free(failed);
+    ASSERT_EQ(sqlite3_get_autocommit(db), 1);
+    ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_sources;"), 0);
+    ASSERT_TRUE(cbm_file_exists(final_path));
+    ASSERT_TRUE(cbm_file_exists(prefix_path));
+    ASSERT_FALSE(cbm_file_exists(staging_path));
+    char *orphan = memory_read_text(final_path);
+    ASSERT_NOT_NULL(orphan);
+    ASSERT_STR_EQ(orphan, content);
+    free(orphan);
+
+    char *retry =
+        cbm_memory_ingest_json(memory, "{\"content\":\"raw object must follow canonical commit\","
+                                       "\"origin\":\"commit-veto-test\"}");
+    ASSERT_TRUE(memory_result_ok(retry));
+    free(retry);
+    ASSERT_TRUE(cbm_file_exists(final_path));
+    ASSERT_FALSE(cbm_file_exists(staging_path));
+    ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_sources;"), 1);
+
+#ifndef _WIN32
+    char referenced_relative[MEMORY_TEST_PATH];
+    snprintf(referenced_relative, sizeof(referenced_relative), "raw/objects/%.2s/%s.txt", hash,
+             hash);
+    char orphan_hash[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex("unreferenced gc object", strlen("unreferenced gc object"), orphan_hash);
+    char orphan_path[MEMORY_TEST_PATH];
+    snprintf(orphan_path, sizeof(orphan_path), "%s/raw/objects/%.2s/%s.txt", home, orphan_hash,
+             orphan_hash);
+    char ingest_stale[MEMORY_TEST_PATH];
+    char import_stale[MEMORY_TEST_PATH];
+    snprintf(ingest_stale, sizeof(ingest_stale), "%s/.ingest-staging/ingest-stale", home);
+    snprintf(import_stale, sizeof(import_stale), "%s/.import-staging/import-stale/object-0", home);
+    ASSERT_EQ(th_write_file(orphan_path, "unreferenced gc object"), 0);
+    ASSERT_EQ(th_write_file(ingest_stale, "stale ingest stage"), 0);
+    ASSERT_EQ(th_write_file(import_stale, "stale import stage"), 0);
+    memory_gc_reference_t reference = {.relative = referenced_relative};
+    size_t staging_removed = 0;
+    size_t orphans_removed = 0;
+    ASSERT_EQ(cbm_memory_raw_gc(home, 0, memory_gc_reference_matches, &reference, &staging_removed,
+                                &orphans_removed),
+              0);
+    ASSERT_EQ(staging_removed, 2);
+    ASSERT_EQ(orphans_removed, 1);
+    ASSERT_TRUE(cbm_file_exists(final_path));
+    ASSERT_FALSE(cbm_file_exists(orphan_path));
+    ASSERT_FALSE(cbm_file_exists(ingest_stale));
+    ASSERT_FALSE(cbm_file_exists(import_stale));
+#endif
+
+    cbm_memory_close(memory);
+    th_rmtree(home);
+    PASS();
+}
+
+TEST(memory_raw_gc_respects_live_ingest_leases_and_stage_owners) {
+#ifdef _WIN32
+    PASS();
+#else
+    char home[MEMORY_TEST_PATH];
+    char *temporary = th_mktempdir("cbm_memory_gc_lease");
+    ASSERT_NOT_NULL(temporary);
+    snprintf(home, sizeof(home), "%s", temporary);
+    cbm_memory_t *memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+
+    const char *new_content = "gc must not remove a promoted live inode";
+    char new_hash[CBM_SHA256_HEX_LEN + 1];
+    char new_path[MEMORY_TEST_PATH];
+    char new_relative[MEMORY_TEST_PATH];
+    cbm_sha256_hex(new_content, strlen(new_content), new_hash);
+    snprintf(new_path, sizeof(new_path), "%s/raw/objects/%.2s/%s.txt", home, new_hash, new_hash);
+    snprintf(new_relative, sizeof(new_relative), "raw/objects/%.2s/%s.txt", new_hash, new_hash);
+    memory_gc_commit_hook_t new_hook = {
+        .home = home,
+        .candidate_relative = new_relative,
+        .gc_rc = -1,
+    };
+    sqlite3_commit_hook(cbm_memory_db(memory), memory_gc_during_commit, &new_hook);
+    char *new_result = cbm_memory_ingest_json(memory, "{\"content\":\"gc must not remove a "
+                                                      "promoted live inode\"}");
+    sqlite3_commit_hook(cbm_memory_db(memory), NULL, NULL);
+    ASSERT_TRUE(memory_result_ok(new_result));
+    ASSERT_GT(new_hook.calls, 0);
+    ASSERT_EQ(new_hook.gc_rc, 0);
+    ASSERT_EQ(new_hook.removed, 0);
+    ASSERT_TRUE(cbm_file_exists(new_path));
+    free(new_result);
+
+    const char *orphan_content = "old orphan reused by an ingest transaction";
+    char orphan_hash[CBM_SHA256_HEX_LEN + 1];
+    char orphan_path[MEMORY_TEST_PATH];
+    char orphan_relative[MEMORY_TEST_PATH];
+    cbm_sha256_hex(orphan_content, strlen(orphan_content), orphan_hash);
+    snprintf(orphan_path, sizeof(orphan_path), "%s/raw/objects/%.2s/%s.txt", home, orphan_hash,
+             orphan_hash);
+    snprintf(orphan_relative, sizeof(orphan_relative), "raw/objects/%.2s/%s.txt", orphan_hash,
+             orphan_hash);
+    ASSERT_EQ(th_write_file(orphan_path, orphan_content), 0);
+    memory_gc_commit_hook_t reuse_hook = {
+        .home = home,
+        .candidate_relative = orphan_relative,
+        .gc_rc = -1,
+    };
+    sqlite3_commit_hook(cbm_memory_db(memory), memory_gc_during_commit, &reuse_hook);
+    char *reuse_result = cbm_memory_ingest_json(
+        memory, "{\"content\":\"old orphan reused by an ingest transaction\"}");
+    sqlite3_commit_hook(cbm_memory_db(memory), NULL, NULL);
+    ASSERT_TRUE(memory_result_ok(reuse_result));
+    ASSERT_GT(reuse_hook.calls, 0);
+    ASSERT_EQ(reuse_hook.gc_rc, 0);
+    ASSERT_EQ(reuse_hook.removed, 0);
+    ASSERT_TRUE(cbm_file_exists(orphan_path));
+    free(reuse_result);
+
+    char live_ingest[MEMORY_TEST_PATH];
+    char live_import[MEMORY_TEST_PATH];
+    snprintf(live_ingest, sizeof(live_ingest), "%s/.ingest-staging/ingest-%ld-live", home,
+             (long)getpid());
+    snprintf(live_import, sizeof(live_import),
+             "%s/.import-staging/import-%ld-live/object-0", home, (long)getpid());
+    ASSERT_EQ(th_write_file(live_ingest, "live ingest staging"), 0);
+    ASSERT_EQ(th_write_file(live_import, "live import staging"), 0);
+    size_t staging_removed = 0;
+    size_t orphans_removed = 0;
+    ASSERT_EQ(cbm_memory_raw_gc(home, 0, memory_gc_never_referenced, NULL, &staging_removed,
+                                &orphans_removed),
+              0);
+    ASSERT_TRUE(cbm_file_exists(live_ingest));
+    ASSERT_TRUE(cbm_file_exists(live_import));
+    ASSERT_EQ(cbm_unlink(live_ingest), 0);
+    ASSERT_EQ(cbm_unlink(live_import), 0);
+
+    cbm_memory_close(memory);
+    th_rmtree(home);
+    PASS();
+#endif
+}
+
+TEST(memory_concurrent_ingest_rollback_never_deletes_winner_object) {
+    char home[MEMORY_TEST_PATH];
+    char final_path[MEMORY_TEST_PATH];
+    char staging_path[MEMORY_TEST_PATH];
+    char *temporary = th_mktempdir("cbm_memory_ingest_race");
+    ASSERT_NOT_NULL(temporary);
+    snprintf(home, sizeof(home), "%s", temporary);
+    cbm_memory_t *bootstrap = cbm_memory_open(home);
+    ASSERT_NOT_NULL(bootstrap);
+    cbm_memory_close(bootstrap);
+
+    const char *content = "concurrent immutable source ownership";
+    char hash[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(content, strlen(content), hash);
+    snprintf(final_path, sizeof(final_path), "%s/raw/objects/%.2s/%s.txt", home, hash, hash);
+    snprintf(staging_path, sizeof(staging_path), "%s/.ingest-staging", home);
+    atomic_int ready = ATOMIC_VAR_INIT(0);
+    atomic_bool go = ATOMIC_VAR_INIT(false);
+    memory_ingest_task_t tasks[2] = {
+        {.home = home,
+         .args_json = "{\"content\":\"concurrent immutable source ownership\"}",
+         .reject_commit = true,
+         .ready = &ready,
+         .go = &go},
+        {.home = home,
+         .args_json = "{\"content\":\"concurrent immutable source ownership\"}",
+         .reject_commit = false,
+         .ready = &ready,
+         .go = &go}};
+    ASSERT_EQ(memory_run_two_ingests(tasks), 0);
+    ASSERT_TRUE(memory_result_ok(tasks[0].result) || memory_result_ok(tasks[1].result));
+    free(tasks[0].result);
+    free(tasks[1].result);
+
+    cbm_memory_t *inspection = cbm_memory_open(home);
+    ASSERT_NOT_NULL(inspection);
+    ASSERT_EQ(memory_sql_int(inspection, "SELECT count(*) FROM memory_sources;"), 1);
+    ASSERT_TRUE(cbm_file_exists(final_path));
+    ASSERT_FALSE(cbm_file_exists(staging_path));
+    unsigned char *stored = NULL;
+    size_t stored_len = 0;
+    FILE *file = cbm_fopen(final_path, "rb");
+    ASSERT_NOT_NULL(file);
+    stored = malloc(strlen(content) + 1);
+    ASSERT_NOT_NULL(stored);
+    stored_len = fread(stored, 1, strlen(content), file);
+    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(stored_len, strlen(content));
+    ASSERT_EQ(memcmp(stored, content, stored_len), 0);
+    free(stored);
+    cbm_memory_close(inspection);
+    th_rmtree(home);
+    PASS();
+}
+
+TEST(memory_path_ingest_requires_explicit_file_authority) {
+    char home[MEMORY_TEST_PATH];
+    char allowed_dir[MEMORY_TEST_PATH];
+    char allowed_file[MEMORY_TEST_PATH];
+    char outside_file[MEMORY_TEST_PATH];
+    char directory_args[MEMORY_TEST_JSON];
+    char path_args[MEMORY_TEST_JSON];
+    char *temporary = th_mktempdir("cbm_memory_path_ingest");
+    ASSERT_NOT_NULL(temporary);
+    snprintf(home, sizeof(home), "%s/memory", temporary);
+    snprintf(allowed_dir, sizeof(allowed_dir), "%s/allowed", temporary);
+    snprintf(allowed_file, sizeof(allowed_file), "%s/allowed/source.txt", temporary);
+    snprintf(outside_file, sizeof(outside_file), "%s/outside.txt", temporary);
+    cbm_normalize_path_sep(home);
+    cbm_normalize_path_sep(allowed_dir);
+    cbm_normalize_path_sep(allowed_file);
+    cbm_normalize_path_sep(outside_file);
+    ASSERT_EQ(th_write_file(allowed_file, "allowed source bytes"), 0);
+    ASSERT_EQ(th_write_file(outside_file, "outside source bytes"), 0);
+
+    const char *previous_roots = getenv("CBM_MEMORY_INGEST_ROOTS");
+    const char *previous_unsafe = getenv("CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST");
+    char *saved_roots = previous_roots ? strdup(previous_roots) : NULL;
+    char *saved_unsafe = previous_unsafe ? strdup(previous_unsafe) : NULL;
+    cbm_unsetenv("CBM_MEMORY_INGEST_ROOTS");
+    cbm_unsetenv("CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST");
+
+    cbm_memory_t *memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+    int n = snprintf(path_args, sizeof(path_args), "{\"path\":\"%s\"}", allowed_file);
+    ASSERT_GTE(n, 0);
+    ASSERT_LT(n, (int)sizeof(path_args));
+    char *disabled = cbm_memory_ingest_json(memory, path_args);
+    ASSERT_FALSE(memory_result_ok(disabled));
+    ASSERT_TRUE(memory_result_string_is(disabled, "error", "path_ingest_disabled"));
+    free(disabled);
+
+    cbm_setenv("CBM_MEMORY_INGEST_ROOTS", allowed_dir, 1);
+    char *allowed = cbm_memory_ingest_json(memory, path_args);
+    ASSERT_TRUE(memory_result_ok(allowed));
+    free(allowed);
+
+    n = snprintf(path_args, sizeof(path_args), "{\"path\":\"%s\"}", outside_file);
+    ASSERT_GTE(n, 0);
+    ASSERT_LT(n, (int)sizeof(path_args));
+    char *outside = cbm_memory_ingest_json(memory, path_args);
+    ASSERT_FALSE(memory_result_ok(outside));
+    ASSERT_TRUE(memory_result_string_is(outside, "error", "source_path_not_allowed"));
+    free(outside);
+
+    /* A candidate shorter than the configured canonical root must be rejected
+     * before prefix comparison.  This is also an ASan regression for the old
+     * root-length strncmp and boundary-byte read. */
+    char longer_root[MEMORY_TEST_PATH];
+    snprintf(longer_root, sizeof(longer_root), "%s/allowed/a-much-longer-authority-root",
+             temporary);
+    ASSERT_TRUE(cbm_mkdir_p(longer_root, 0700));
+    cbm_setenv("CBM_MEMORY_INGEST_ROOTS", longer_root, 1);
+    unsigned char *short_candidate_bytes = NULL;
+    size_t short_candidate_len = 0;
+    ASSERT_EQ(cbm_memory_raw_read_authorized_path(outside_file, &short_candidate_bytes,
+                                                  &short_candidate_len),
+              CBM_MEMORY_RAW_READ_DENIED);
+    ASSERT_NULL(short_candidate_bytes);
+    cbm_setenv("CBM_MEMORY_INGEST_ROOTS", allowed_dir, 1);
+
+    n = snprintf(directory_args, sizeof(directory_args), "{\"path\":\"%s\"}", allowed_dir);
+    ASSERT_GTE(n, 0);
+    ASSERT_LT(n, (int)sizeof(directory_args));
+    char *directory = cbm_memory_ingest_json(memory, directory_args);
+    ASSERT_FALSE(memory_result_ok(directory));
+    ASSERT_TRUE(memory_result_string_is(directory, "error", "source_path_not_allowed"));
+    free(directory);
+
+#ifndef _WIN32
+    char symlink_path[MEMORY_TEST_PATH];
+    snprintf(symlink_path, sizeof(symlink_path), "%s/allowed/source-link.txt", temporary);
+    ASSERT_EQ(symlink(allowed_file, symlink_path), 0);
+    n = snprintf(path_args, sizeof(path_args), "{\"path\":\"%s\"}", symlink_path);
+    ASSERT_GTE(n, 0);
+    ASSERT_LT(n, (int)sizeof(path_args));
+    char *linked = cbm_memory_ingest_json(memory, path_args);
+    ASSERT_FALSE(memory_result_ok(linked));
+    ASSERT_TRUE(memory_result_string_is(linked, "error", "source_path_not_allowed"));
+    free(linked);
+
+    char outside_dir[MEMORY_TEST_PATH];
+    char outside_secret[MEMORY_TEST_PATH];
+    char linked_dir[MEMORY_TEST_PATH];
+    char linked_secret[MEMORY_TEST_PATH];
+    snprintf(outside_dir, sizeof(outside_dir), "%s/outside-dir", temporary);
+    snprintf(outside_secret, sizeof(outside_secret), "%s/secret.txt", outside_dir);
+    snprintf(linked_dir, sizeof(linked_dir), "%s/allowed/escape-dir", temporary);
+    snprintf(linked_secret, sizeof(linked_secret), "%s/secret.txt", linked_dir);
+    ASSERT_EQ(th_write_file(outside_secret, "must remain outside authority"), 0);
+    ASSERT_EQ(symlink(outside_dir, linked_dir), 0);
+    n = snprintf(path_args, sizeof(path_args), "{\"path\":\"%s\"}", linked_secret);
+    ASSERT_GTE(n, 0);
+    ASSERT_LT(n, (int)sizeof(path_args));
+    char *escaped = cbm_memory_ingest_json(memory, path_args);
+    ASSERT_FALSE(memory_result_ok(escaped));
+    ASSERT_TRUE(memory_result_string_is(escaped, "error", "source_path_not_allowed"));
+    free(escaped);
+
+    char fifo_path[MEMORY_TEST_PATH];
+    snprintf(fifo_path, sizeof(fifo_path), "%s/allowed/source.fifo", temporary);
+    ASSERT_EQ(mkfifo(fifo_path, 0600), 0);
+    memory_fifo_release_task_t source_fifo_task = {
+        .path = fifo_path,
+        .delay_ns = 500000000L,
+    };
+    cbm_thread_t source_fifo_thread;
+    ASSERT_EQ(
+        cbm_thread_create(&source_fifo_thread, 0, memory_fifo_release_thread, &source_fifo_task),
+        0);
+    n = snprintf(path_args, sizeof(path_args), "{\"path\":\"%s\"}", fifo_path);
+    ASSERT_GTE(n, 0);
+    ASSERT_LT(n, (int)sizeof(path_args));
+    struct timespec source_fifo_start;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &source_fifo_start);
+    char *fifo_source = cbm_memory_ingest_json(memory, path_args);
+    int64_t source_fifo_elapsed = memory_test_elapsed_ms(source_fifo_start);
+    ASSERT_EQ(cbm_thread_join(&source_fifo_thread), 0);
+    ASSERT_FALSE(memory_result_ok(fifo_source));
+    ASSERT_TRUE(memory_result_string_is(fifo_source, "error", "source_path_not_allowed"));
+    ASSERT_LT(source_fifo_elapsed, 400);
+    free(fifo_source);
+    ASSERT_EQ(cbm_unlink(fifo_path), 0);
+
+    /* On POSIX, a literal backslash is part of a component, not a separator.
+     * The in-root hard link makes the old normalize-and-stat implementation
+     * pass its inode check while the requested path remains outside authority. */
+    char backslash_dir[MEMORY_TEST_PATH];
+    char backslash_file[MEMORY_TEST_PATH];
+    char in_root_alias_dir[MEMORY_TEST_PATH];
+    char in_root_alias[MEMORY_TEST_PATH];
+    snprintf(backslash_dir, sizeof(backslash_dir), "%s/allowed\\escape", temporary);
+    snprintf(backslash_file, sizeof(backslash_file), "%s/source.txt", backslash_dir);
+    snprintf(in_root_alias_dir, sizeof(in_root_alias_dir), "%s/allowed/escape", temporary);
+    snprintf(in_root_alias, sizeof(in_root_alias), "%s/source.txt", in_root_alias_dir);
+    ASSERT_EQ(th_write_file(backslash_file, "literal backslash is outside the allowed root"), 0);
+    ASSERT_TRUE(cbm_mkdir_p(in_root_alias_dir, 0700));
+    ASSERT_EQ(link(backslash_file, in_root_alias), 0);
+    n = snprintf(path_args, sizeof(path_args), "{\"path\":\"%s/allowed\\\\escape/source.txt\"}",
+                 temporary);
+    ASSERT_GTE(n, 0);
+    ASSERT_LT(n, (int)sizeof(path_args));
+    char *backslash_escape = cbm_memory_ingest_json(memory, path_args);
+    ASSERT_FALSE(memory_result_ok(backslash_escape));
+    ASSERT_TRUE(memory_result_string_is(backslash_escape, "error", "source_path_not_allowed"));
+    free(backslash_escape);
+
+    char raw_helper_home[MEMORY_TEST_PATH];
+    char raw_helper_expected[MEMORY_TEST_PATH];
+    char raw_helper_canonical[MEMORY_TEST_PATH];
+    char raw_helper_concatenated[MEMORY_TEST_PATH];
+    char raw_helper_result[MEMORY_TEST_PATH];
+    snprintf(raw_helper_home, sizeof(raw_helper_home), "%s/raw-helper-home\\", temporary);
+    snprintf(raw_helper_expected, sizeof(raw_helper_expected), "%s/.literal-staging",
+             raw_helper_home);
+    snprintf(raw_helper_concatenated, sizeof(raw_helper_concatenated),
+             "%s/raw-helper-home\\.literal-staging", temporary);
+    ASSERT_TRUE(cbm_mkdir_p(raw_helper_home, 0700));
+    ASSERT_EQ(cbm_memory_raw_ensure_private_subdir(raw_helper_home, ".literal-staging",
+                                                   raw_helper_result, sizeof(raw_helper_result)),
+              0);
+    ASSERT_TRUE(cbm_canonical_path(raw_helper_expected, raw_helper_canonical,
+                                   sizeof(raw_helper_canonical)));
+    ASSERT_STR_EQ(raw_helper_result, raw_helper_canonical);
+    ASSERT_FALSE(cbm_file_exists(raw_helper_concatenated));
+#endif
+
+    cbm_unsetenv("CBM_MEMORY_INGEST_ROOTS");
+    cbm_setenv("CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST", "1", 1);
+    n = snprintf(path_args, sizeof(path_args), "{\"path\":\"%s\"}", outside_file);
+    ASSERT_GTE(n, 0);
+    ASSERT_LT(n, (int)sizeof(path_args));
+    char *explicit_unsafe = cbm_memory_ingest_json(memory, path_args);
+    ASSERT_TRUE(memory_result_ok(explicit_unsafe));
+    free(explicit_unsafe);
+
+    cbm_memory_close(memory);
+    if (saved_roots) {
+        cbm_setenv("CBM_MEMORY_INGEST_ROOTS", saved_roots, 1);
+    } else {
+        cbm_unsetenv("CBM_MEMORY_INGEST_ROOTS");
+    }
+    if (saved_unsafe) {
+        cbm_setenv("CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST", saved_unsafe, 1);
+    } else {
+        cbm_unsetenv("CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST");
+    }
+    free(saved_roots);
+    free(saved_unsafe);
+    th_rmtree(temporary);
     PASS();
 }
 
@@ -361,6 +1033,11 @@ TEST(memory_commit_all_epistemic_entities_and_materializes_wiki) {
     ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_preferences;"), 1);
     ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_code_refs;"), 1);
     ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_relations;"), 3);
+    char *status = cbm_memory_status_json(memory, "{}");
+    ASSERT_TRUE(memory_result_ok(status));
+    ASSERT_EQ(memory_result_nested_int(status, "entities", "total"), 6);
+    ASSERT_EQ(memory_result_nested_int(status, "entities", "relations"), 3);
+    free(status);
     ASSERT_EQ(memory_sql_int(
                   memory, "SELECT count(*) FROM memory_outbox WHERE state='done' AND attempts=1;"),
               1);
@@ -391,6 +1068,90 @@ TEST(memory_commit_all_epistemic_entities_and_materializes_wiki) {
     PASS();
 }
 
+TEST(memory_outbox_retries_with_backoff_and_stops_after_bound) {
+    char home[MEMORY_TEST_PATH];
+    char *temporary = th_mktempdir("cbm_memory_outbox_retry");
+    ASSERT_NOT_NULL(temporary);
+    snprintf(home, sizeof(home), "%s", temporary);
+    cbm_memory_t *memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+    const char *operations = "[{\"type\":\"upsert_page\",\"page_id\":\"page:outbox-retry\","
+                             "\"slug\":\"outbox-retry\",\"page_kind\":\"concept\","
+                             "\"markdown\":\"retryable materialization\"}]";
+    char *seed = memory_propose_commit(memory, "proposal:outbox-retry", "operation:outbox-retry",
+                                       operations, "{}");
+    ASSERT_TRUE(memory_result_ok(seed));
+    free(seed);
+
+    ASSERT_EQ(sqlite3_exec(cbm_memory_db(memory),
+                           "UPDATE memory_pages SET page_kind='invalid/kind' WHERE "
+                           "page_id='page:outbox-retry';"
+                           "UPDATE memory_outbox SET state='pending',attempts=0,lease_owner=NULL,"
+                           "lease_until=NULL,processed_at=NULL,last_error=NULL WHERE "
+                           "aggregate_id='page:outbox-retry';",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(cbm_memory_materialize_pending(memory), 0);
+    ASSERT_EQ(memory_sql_int(memory,
+                             "SELECT count(*) FROM memory_outbox WHERE "
+                             "aggregate_id='page:outbox-retry' AND state='failed' AND attempts=1 "
+                             "AND lease_until IS NOT NULL;"),
+              1);
+    ASSERT_EQ(cbm_memory_materialize_pending(memory), 0);
+    ASSERT_EQ(memory_sql_int(memory, "SELECT attempts FROM memory_outbox WHERE "
+                                     "aggregate_id='page:outbox-retry';"),
+              1);
+
+    ASSERT_EQ(sqlite3_exec(cbm_memory_db(memory),
+                           "UPDATE memory_pages SET page_kind='concept' WHERE "
+                           "page_id='page:outbox-retry';"
+                           "UPDATE memory_outbox SET lease_until='1970-01-01T00:00:00Z' WHERE "
+                           "aggregate_id='page:outbox-retry';",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    cbm_memory_close(memory);
+    memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+    ASSERT_EQ(memory_sql_int(memory,
+                             "SELECT count(*) FROM memory_outbox WHERE "
+                             "aggregate_id='page:outbox-retry' AND state='done' AND attempts=2;"),
+              1);
+
+    ASSERT_EQ(sqlite3_exec(cbm_memory_db(memory),
+                           "UPDATE memory_pages SET page_kind='invalid/kind' WHERE "
+                           "page_id='page:outbox-retry';"
+                           "UPDATE memory_outbox SET state='pending',attempts=0,lease_owner=NULL,"
+                           "lease_until=NULL,processed_at=NULL,last_error=NULL WHERE "
+                           "aggregate_id='page:outbox-retry';",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    for (int attempt = 1; attempt <= 5; attempt++) {
+        ASSERT_EQ(cbm_memory_materialize_pending(memory), 0);
+        ASSERT_EQ(memory_sql_int(memory, "SELECT attempts FROM memory_outbox WHERE "
+                                         "aggregate_id='page:outbox-retry';"),
+                  attempt);
+        ASSERT_EQ(sqlite3_exec(cbm_memory_db(memory),
+                               "UPDATE memory_outbox SET lease_until='1970-01-01T00:00:00Z' "
+                               "WHERE aggregate_id='page:outbox-retry';",
+                               NULL, NULL, NULL),
+                  SQLITE_OK);
+    }
+    ASSERT_EQ(cbm_memory_materialize_pending(memory), 0);
+    ASSERT_EQ(memory_sql_int(memory,
+                             "SELECT count(*) FROM memory_outbox WHERE "
+                             "aggregate_id='page:outbox-retry' AND state='failed' AND attempts=5;"),
+              1);
+    char *status = cbm_memory_status_json(memory, "{}");
+    ASSERT_TRUE(memory_result_ok(status));
+    ASSERT_EQ(memory_result_nested_int(status, "maintenance", "failed_outbox"), 1);
+    ASSERT_EQ(memory_result_nested_int(status, "maintenance", "exhausted_outbox"), 1);
+    free(status);
+
+    cbm_memory_close(memory);
+    th_rmtree(home);
+    PASS();
+}
+
 TEST(memory_operation_idempotency_and_key_ownership) {
     char home[MEMORY_TEST_PATH];
     char *temporary = th_mktempdir("cbm_memory_idempotency");
@@ -404,7 +1165,8 @@ TEST(memory_operation_idempotency_and_key_ownership) {
     ASSERT_NOT_NULL(first);
     ASSERT_TRUE(memory_result_ok(first));
     char *repeat = cbm_memory_commit_json(
-        memory, "{\"proposal_id\":\"proposal:one\",\"operation_id\":\"operation:shared\"}");
+        memory, "{\"proposal_id\":\"proposal:one\",\"operation_id\":\"operation:shared\","
+                "\"user_approved\":true}");
     ASSERT_NOT_NULL(repeat);
     ASSERT_STR_EQ(repeat, first);
     ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_operations;"), 1);
@@ -419,7 +1181,8 @@ TEST(memory_operation_idempotency_and_key_ownership) {
     ASSERT_TRUE(memory_result_ok(proposed));
     free(proposed);
     char *reused = cbm_memory_commit_json(
-        memory, "{\"proposal_id\":\"proposal:two\",\"operation_id\":\"operation:shared\"}");
+        memory, "{\"proposal_id\":\"proposal:two\",\"operation_id\":\"operation:shared\","
+                "\"user_approved\":true}");
     ASSERT_NOT_NULL(reused);
     ASSERT_FALSE(memory_result_ok(reused));
     ASSERT_TRUE(memory_result_string_is(reused, "error", "idempotency_key_reused"));
@@ -427,6 +1190,56 @@ TEST(memory_operation_idempotency_and_key_ownership) {
     free(reused);
     free(repeat);
     free(first);
+    cbm_memory_close(memory);
+    th_rmtree(home);
+    PASS();
+}
+
+TEST(memory_commit_requires_approval_without_consuming_idempotency_key) {
+    char home[MEMORY_TEST_PATH];
+    char *temporary = th_mktempdir("cbm_memory_approval");
+    ASSERT_NOT_NULL(temporary);
+    snprintf(home, sizeof(home), "%s", temporary);
+    cbm_memory_t *memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+    char *proposed = cbm_memory_propose_json(
+        memory, "{\"proposal_id\":\"proposal:approval\",\"operations\":[{"
+                "\"type\":\"add_preference\",\"preference_id\":\"preference:approval\","
+                "\"value\":\"authorized writes only\"}]}");
+    ASSERT_TRUE(memory_result_ok(proposed));
+    free(proposed);
+
+    const char *base = "{\"proposal_id\":\"proposal:approval\","
+                       "\"operation_id\":\"operation:approval\"}";
+    char *missing = cbm_memory_commit_json(memory, base);
+    ASSERT_FALSE(memory_result_ok(missing));
+    ASSERT_TRUE(memory_result_string_is(missing, "error", "approval_required"));
+    free(missing);
+    char *denied = cbm_memory_commit_json(
+        memory, "{\"proposal_id\":\"proposal:approval\","
+                "\"operation_id\":\"operation:approval\",\"user_approved\":false}");
+    ASSERT_FALSE(memory_result_ok(denied));
+    ASSERT_TRUE(memory_result_string_is(denied, "error", "approval_required"));
+    free(denied);
+    ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_operations;"), 0);
+    ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_preferences;"), 0);
+    ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_proposals WHERE proposal_id="
+                                     "'proposal:approval' AND status='pending';"),
+              1);
+
+    const char *approved_args = "{\"proposal_id\":\"proposal:approval\","
+                                "\"operation_id\":\"operation:approval\","
+                                "\"user_approved\":true}";
+    char *approved = cbm_memory_commit_json(memory, approved_args);
+    ASSERT_TRUE(memory_result_ok(approved));
+    char *retry = cbm_memory_commit_json(memory, approved_args);
+    ASSERT_NOT_NULL(retry);
+    ASSERT_STR_EQ(retry, approved);
+    free(retry);
+    free(approved);
+    ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_operations;"), 1);
+    ASSERT_EQ(memory_sql_int(memory, "SELECT count(*) FROM memory_preferences;"), 1);
+
     cbm_memory_close(memory);
     th_rmtree(home);
     PASS();
@@ -469,9 +1282,11 @@ TEST(memory_two_handles_cas_same_page_and_merge_different_pages) {
     free(left_proposal);
     free(right_proposal);
     char *left_commit = cbm_memory_commit_json(
-        left, "{\"proposal_id\":\"proposal:left\",\"operation_id\":\"operation:left\"}");
+        left, "{\"proposal_id\":\"proposal:left\",\"operation_id\":\"operation:left\","
+              "\"user_approved\":true}");
     char *right_commit = cbm_memory_commit_json(
-        right, "{\"proposal_id\":\"proposal:right\",\"operation_id\":\"operation:right\"}");
+        right, "{\"proposal_id\":\"proposal:right\",\"operation_id\":\"operation:right\","
+               "\"user_approved\":true}");
     ASSERT_TRUE(memory_result_ok(left_commit));
     ASSERT_FALSE(memory_result_ok(right_commit));
     ASSERT_TRUE(memory_result_string_is(right_commit, "error", "revision_conflict"));
@@ -496,10 +1311,12 @@ TEST(memory_two_handles_cas_same_page_and_merge_different_pages) {
     free(different_right);
     char *different_left_commit =
         cbm_memory_commit_json(left, "{\"proposal_id\":\"proposal:different-left\",\"operation_"
-                                     "id\":\"operation:different-left\"}");
+                                     "id\":\"operation:different-left\","
+                                     "\"user_approved\":true}");
     char *different_right_commit =
         cbm_memory_commit_json(right, "{\"proposal_id\":\"proposal:different-right\",\"operation_"
-                                      "id\":\"operation:different-right\"}");
+                                      "id\":\"operation:different-right\","
+                                      "\"user_approved\":true}");
     ASSERT_TRUE(memory_result_ok(different_left_commit));
     ASSERT_TRUE(memory_result_ok(different_right_commit));
     ASSERT_EQ(memory_sql_int(left, "SELECT count(*) FROM memory_pages;"), 3);
@@ -528,7 +1345,8 @@ TEST(memory_actual_concurrent_writers_preserve_commuting_updates_and_cas) {
                           "\"type\":\"upsert_page\",\"page_id\":\"page:thread-left\","
                           "\"slug\":\"thread-left\",\"markdown\":\"left thread body\"}]}",
          .commit_json = "{\"proposal_id\":\"proposal:thread-left\","
-                        "\"operation_id\":\"operation:thread-left\"}",
+                        "\"operation_id\":\"operation:thread-left\","
+                        "\"user_approved\":true}",
          .ready = &ready,
          .go = &go},
         {.home = home,
@@ -536,7 +1354,8 @@ TEST(memory_actual_concurrent_writers_preserve_commuting_updates_and_cas) {
                           "\"type\":\"upsert_page\",\"page_id\":\"page:thread-right\","
                           "\"slug\":\"thread-right\",\"markdown\":\"right thread body\"}]}",
          .commit_json = "{\"proposal_id\":\"proposal:thread-right\","
-                        "\"operation_id\":\"operation:thread-right\"}",
+                        "\"operation_id\":\"operation:thread-right\","
+                        "\"user_approved\":true}",
          .ready = &ready,
          .go = &go}};
     ASSERT_EQ(memory_run_two_writers(different), 0);
@@ -571,7 +1390,8 @@ TEST(memory_actual_concurrent_writers_preserve_commuting_updates_and_cas) {
                           "\"slug\":\"thread-shared\",\"markdown\":\"left wins maybe\","
                           "\"expected_revision\":1}]}",
          .commit_json = "{\"proposal_id\":\"proposal:thread-same-left\","
-                        "\"operation_id\":\"operation:thread-same-left\"}",
+                        "\"operation_id\":\"operation:thread-same-left\","
+                        "\"user_approved\":true}",
          .ready = &ready,
          .go = &go},
         {.home = home,
@@ -580,7 +1400,8 @@ TEST(memory_actual_concurrent_writers_preserve_commuting_updates_and_cas) {
                           "\"slug\":\"thread-shared\",\"markdown\":\"right wins maybe\","
                           "\"expected_revision\":1}]}",
          .commit_json = "{\"proposal_id\":\"proposal:thread-same-right\","
-                        "\"operation_id\":\"operation:thread-same-right\"}",
+                        "\"operation_id\":\"operation:thread-same-right\","
+                        "\"user_approved\":true}",
          .ready = &ready,
          .go = &go}};
     ASSERT_EQ(memory_run_two_writers(same), 0);
@@ -707,6 +1528,61 @@ TEST(memory_retrieval_routes_staleness_and_bitemporal_history) {
     ASSERT_NOT_NULL(strstr(current, "\"id\":\"claim:history\""));
     ASSERT_NOT_NULL(strstr(current, "\"status\":\"stale\""));
     free(current);
+    cbm_memory_close(memory);
+    th_rmtree(home);
+    PASS();
+}
+
+TEST(memory_project_boost_is_combined_with_relevance_before_route_selection) {
+    char home[MEMORY_TEST_PATH];
+    char *temporary = th_mktempdir("cbm_memory_project_ranking");
+    ASSERT_NOT_NULL(temporary);
+    snprintf(home, sizeof(home), "%s", temporary);
+    cbm_memory_t *memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+    const char *operations =
+        "[{\"type\":\"upsert_page\",\"page_id\":\"page:ranking-project\","
+        "\"slug\":\"ranking-project\",\"status\":\"stale\","
+        "\"markdown\":\"rankingalpha rankingbeta\"},"
+        "{\"type\":\"upsert_page\",\"page_id\":\"page:ranking-relevant\","
+        "\"slug\":\"ranking-relevant\",\"status\":\"active\","
+        "\"markdown\":\"rankingalpha rankingbeta rankingalpha rankingbeta rankingalpha "
+        "rankingbeta rankingalpha rankingbeta rankingalpha rankingbeta rankingalpha rankingbeta "
+        "rankingalpha rankingbeta rankingalpha rankingbeta rankingalpha rankingbeta rankingalpha "
+        "rankingbeta rankingalpha rankingbeta rankingalpha rankingbeta rankingalpha rankingbeta "
+        "rankingalpha rankingbeta rankingalpha rankingbeta rankingalpha rankingbeta rankingalpha "
+        "rankingbeta rankingalpha rankingbeta rankingalpha rankingbeta rankingalpha rankingbeta\"},"
+        "{\"type\":\"add_code_ref\",\"code_ref_id\":\"coderef:ranking-project\","
+        "\"project\":\"ranking-project\",\"ref_kind\":\"file\","
+        "\"file_path\":\"src/ranking.c\"},"
+        "{\"type\":\"link\",\"source_kind\":\"page\","
+        "\"source_id\":\"page:ranking-project\",\"target_kind\":\"code_ref\","
+        "\"target_id\":\"coderef:ranking-project\",\"relation_type\":\"REFERENCES\"}]";
+    char *seed = memory_propose_commit(memory, "proposal:project-ranking",
+                                       "operation:project-ranking", operations, "{}");
+    ASSERT_TRUE(memory_result_ok(seed));
+    free(seed);
+
+    ASSERT_EQ(sqlite3_exec(
+                  cbm_memory_db(memory),
+                  "WITH RECURSIVE sequence(value) AS (VALUES(1) UNION ALL SELECT value+1 FROM "
+                  "sequence WHERE value<1000) INSERT INTO memory_documents(entity_kind,entity_id,"
+                  "title,summary,body,metadata) SELECT 'source','ranking-filler:'||value,'Filler',"
+                  "'','unrelated filler text','' FROM sequence;",
+                  NULL, NULL, NULL),
+              SQLITE_OK);
+    char *query = cbm_memory_query_json(
+        memory, "{\"query\":\"rankingalpha rankingbeta\",\"entity_kind\":\"page\","
+                "\"current_context\":{\"project\":\"ranking-project\"},\"limit\":10}");
+    ASSERT_TRUE(memory_result_ok(query));
+    const char *relevant = strstr(query, "\"id\":\"page:ranking-relevant\"");
+    const char *project = strstr(query, "\"id\":\"page:ranking-project\"");
+    ASSERT_NOT_NULL(relevant);
+    ASSERT_NOT_NULL(project);
+    ASSERT_TRUE(relevant < project);
+    ASSERT_TRUE(memory_result_string_is(query, "route", "reuse"));
+    free(query);
+
     cbm_memory_close(memory);
     th_rmtree(home);
     PASS();
@@ -844,6 +1720,13 @@ TEST(memory_rebuild_projection_restores_graph_and_search) {
     snprintf(home, sizeof(home), "%s", temporary);
     cbm_memory_t *memory = cbm_memory_open(home);
     ASSERT_NOT_NULL(memory);
+    char *ingested = cbm_memory_ingest_json(
+        memory, "{\"content\":\"projection source evidence\",\"origin\":\"projection-test\"}");
+    ASSERT_TRUE(memory_result_ok(ingested));
+    char object_relpath[MEMORY_TEST_PATH];
+    ASSERT_TRUE(memory_result_copy_string(ingested, "object_path", object_relpath,
+                                          sizeof(object_relpath)));
+    free(ingested);
     const char *operations = "[{\"type\":\"upsert_page\",\"page_id\":\"page:projection\","
                              "\"slug\":\"projection\",\"title\":\"Projection Recovery\","
                              "\"markdown\":\"# Projection Recovery\\nRebuild derived state.\"},"
@@ -872,6 +1755,23 @@ TEST(memory_rebuild_projection_restores_graph_and_search) {
     ASSERT_GT(memory_result_int(query, "count"), 0);
     ASSERT_NOT_NULL(strstr(query, "page:projection"));
     free(query);
+
+#ifndef _WIN32
+    char raw_path[MEMORY_TEST_PATH];
+    char symlink_source[MEMORY_TEST_PATH];
+    snprintf(raw_path, sizeof(raw_path), "%s/%s", home, object_relpath);
+    snprintf(symlink_source, sizeof(symlink_source), "%s/projection-source-link-target", home);
+    ASSERT_EQ(th_write_file(symlink_source, "projection source evidence"), 0);
+    ASSERT_EQ(cbm_unlink(raw_path), 0);
+    ASSERT_EQ(symlink(symlink_source, raw_path), 0);
+    ASSERT_EQ(cbm_memory_rebuild_projection(memory), -1);
+    char *unsafe_raw_lint = cbm_memory_lint_json(memory, "{\"checks\":[\"missing_raw_object\"]}");
+    ASSERT_TRUE(memory_result_ok(unsafe_raw_lint));
+    ASSERT_EQ(memory_result_int(unsafe_raw_lint, "issue_count"), 1);
+    ASSERT_NOT_NULL(strstr(unsafe_raw_lint, "\"code\":\"missing_raw_object\""));
+    free(unsafe_raw_lint);
+#endif
+
     cbm_memory_close(memory);
     th_rmtree(home);
     PASS();
@@ -904,6 +1804,14 @@ TEST(memory_status_reports_entities_maintenance_and_projection) {
     ASSERT_NOT_NULL(strstr(populated, "\"runs_in_process\":1"));
     ASSERT_NOT_NULL(strstr(populated, "\"last_rebuild_documents\":1"));
     free(populated);
+
+    ASSERT_EQ(sqlite3_exec(cbm_memory_db(memory), "DROP TABLE memory_sources;", NULL, NULL, NULL),
+              SQLITE_OK);
+    char *failed = cbm_memory_status_json(memory, "{}");
+    ASSERT_NOT_NULL(failed);
+    ASSERT_FALSE(memory_result_ok(failed));
+    ASSERT_TRUE(memory_result_string_is(failed, "error", "status_failed"));
+    free(failed);
 
     cbm_memory_close(memory);
     th_rmtree(home);
@@ -956,12 +1864,19 @@ SUITE(memory) {
     RUN_TEST(memory_status_reports_entities_maintenance_and_projection);
     RUN_TEST(memory_projection_scaling_benchmark_opt_in);
     RUN_TEST(memory_ingest_deduplicates);
+    RUN_TEST(memory_ingest_commit_failure_leaves_safe_content_addressed_orphan);
+    RUN_TEST(memory_raw_gc_respects_live_ingest_leases_and_stage_owners);
+    RUN_TEST(memory_concurrent_ingest_rollback_never_deletes_winner_object);
+    RUN_TEST(memory_path_ingest_requires_explicit_file_authority);
     RUN_TEST(memory_source_revision_dirties_supported_claim);
     RUN_TEST(memory_commit_all_epistemic_entities_and_materializes_wiki);
+    RUN_TEST(memory_outbox_retries_with_backoff_and_stops_after_bound);
     RUN_TEST(memory_operation_idempotency_and_key_ownership);
+    RUN_TEST(memory_commit_requires_approval_without_consuming_idempotency_key);
     RUN_TEST(memory_two_handles_cas_same_page_and_merge_different_pages);
     RUN_TEST(memory_actual_concurrent_writers_preserve_commuting_updates_and_cas);
     RUN_TEST(memory_retrieval_routes_staleness_and_bitemporal_history);
+    RUN_TEST(memory_project_boost_is_combined_with_relevance_before_route_selection);
     RUN_TEST(memory_lint_reports_epistemic_and_maintenance_issues);
     RUN_TEST(memory_marks_validates_code_refs_and_dirties_linked_memory);
     RUN_TEST(memory_rebuild_projection_restores_graph_and_search);

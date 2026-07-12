@@ -1,9 +1,9 @@
 # Minimal GitHub-only release pipeline for the bogyie fork.
 #
-# This intentionally skips the upstream npm/PyPI/MCP Registry and VirusTotal
-# publishing jobs, which require DeusData-owned credentials. The generated
-# assets and checksums are exactly what install.sh and the self-update command
-# consume from this fork's GitHub Releases page.
+# This intentionally skips the upstream npm/PyPI/MCP Registry, attestations,
+# signing, SBOM, and VirusTotal publishing jobs that require additional
+# credentials/services. It still gates publication on lint, security, the
+# cross-platform test matrix, and smoke tests of the exact built artifacts.
 name: Fork Release
 
 on:
@@ -22,8 +22,49 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate release version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "fork releases must be dispatched from main (got $GITHUB_REF)" >&2
+            exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid release version: $VERSION" >&2
+            exit 1
+          fi
+
+  lint:
+    needs: validate
+    uses: ./.github/workflows/_lint.yml
+
+  security:
+    needs: validate
+    permissions:
+      actions: read
+      contents: read
+      security-events: read
+    uses: ./.github/workflows/_security.yml
+
+  test:
+    needs: lint
+    uses: ./.github/workflows/_test.yml
+    with:
+      skip_perf: true
+      broad_platforms: false
+
   build:
+    needs: [test, security]
     # Reusable workflows cannot elevate permissions beyond their caller.
     # _build.yml declares these scopes because it can optionally attest
     # artifacts, so the caller must grant them even when attest=false.
@@ -36,8 +77,14 @@ jobs:
       version: ${{ inputs.version }}
       attest: false
 
-  publish:
+  smoke:
     needs: build
+    uses: ./.github/workflows/_smoke.yml
+    with:
+      broad_platforms: false
+
+  publish:
+    needs: [build, smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write

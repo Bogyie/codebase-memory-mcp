@@ -6,6 +6,7 @@
 #include "foundation/platform.h" // safe_realloc (frees old on failure)
 #include "foundation/log.h"      // cbm_log_warn
 #include "extract_node_stack.h"
+#include "extract_unified.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
@@ -5077,7 +5078,8 @@ static void extract_vars_config(CBMExtractCtx *ctx, TSNode node, CBMArena *a, co
         TSNode key = ts_node_child_by_field_name(node, TS_FIELD("key"));
         if (!ts_node_is_null(key)) {
             const char *name = cbm_node_text(a, key, ctx->source);
-            push_var_def_with_config_path(ctx, name, node, name);
+            const char *config_path = cbm_yaml_config_path_escape_segment(a, name);
+            push_var_def_with_config_path(ctx, name, node, config_path);
         }
         break;
     }

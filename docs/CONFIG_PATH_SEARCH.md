@@ -1,12 +1,31 @@
 # YAML configuration path search
 
-Nested YAML keys are indexed as dotted paths without storing their values. This makes repeated leaf names distinct while keeping secrets and other scalar values out of the graph.
+YAML keys are indexed as reversible escaped dotted paths without storing their values. This makes
+repeated leaf names and literal dots inside mapping keys distinct while keeping secrets and other
+scalar values out of the graph.
 
 ```bash
 codebase-memory-mcp cli search_graph '{"project":"my-project","config_path":"^services\\.api\\.timeout$","fields":["config_path"]}'
 ```
 
 The same filter is available to MCP clients as `search_graph.config_path`. It is a case-insensitive regular expression and composes with `label`, `file_pattern`, degree filters, and pagination. Each matching `Variable` keeps its leaf `name` for ConfigLinker compatibility, while its qualified name and `config_path` property contain the full dotted path.
+
+## Path identity and escaping
+
+Simple keys remain backward-compatible: `services.api.timeout` is unchanged. Within each YAML key
+segment, a literal `.` is stored as `\.` and a literal `\` is doubled. The unescaped `.` between
+segments remains the nesting separator, so the encoding is reversible:
+
+| YAML shape | Stored `config_path` |
+|---|---|
+| `services: { api: { timeout: 30 } }` | `services.api.timeout` |
+| `a.b: 1` | `a\.b` |
+| `a: { b: 2 }` | `a.b` |
+| key segment `a\b` | `a\\b` |
+
+Because `config_path` filters are regular expressions, clients searching for an escaped identity
+must also apply the normal regex and JSON/string escaping required by their client language. Reading
+the returned `config_path` field first is the least error-prone way to construct an exact filter.
 
 ## Safety and size contract
 

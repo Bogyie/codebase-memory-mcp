@@ -49,6 +49,10 @@ export const messages = {
       connected: "Connected context",
       noRelations: "No connected usages or aliases.",
       noTokens: "No tokens match this filter.",
+      loadMore: "Load more",
+      loadingMore: "Loading more...",
+      definitions: "Definitions",
+      ambiguousDefinitions: "source definitions (review ambiguity)",
     },
     memory: {
       title: "Global Memory",
@@ -109,6 +113,9 @@ export const messages = {
       memoryEntities: "Entities",
       memoryReview: "Open review",
       memoryRefs: "Unresolved refs",
+      memoryOutbox: "Outbox pending",
+      memoryOutboxFailures: (failed: number, exhausted: number) =>
+        `${failed.toLocaleString()} failed outbox item(s); ${exhausted.toLocaleString()} exhausted the retry limit.`,
       memoryProjection: "Projection",
       memoryProjectionDetail: (strategy: string, ms: number, documents: number) =>
         `${strategy} · last rebuild ${ms} ms · ${documents.toLocaleString()} documents`,
@@ -194,6 +201,10 @@ export const messages = {
       connected: "关联上下文",
       noRelations: "没有关联的使用位置或别名。",
       noTokens: "没有符合筛选条件的令牌。",
+      loadMore: "加载更多",
+      loadingMore: "正在加载...",
+      definitions: "定义来源",
+      ambiguousDefinitions: "个来源定义（请检查歧义）",
     },
     memory: {
       title: "全局记忆",
@@ -254,6 +265,9 @@ export const messages = {
       memoryEntities: "实体",
       memoryReview: "待审查",
       memoryRefs: "未解析引用",
+      memoryOutbox: "发件箱待处理",
+      memoryOutboxFailures: (failed: number, exhausted: number) =>
+        `${failed.toLocaleString()} 个发件箱项目失败；${exhausted.toLocaleString()} 个已达到重试上限。`,
       memoryProjection: "投影视图",
       memoryProjectionDetail: (strategy: string, ms: number, documents: number) =>
         `${strategy} · 最近重建 ${ms} 毫秒 · ${documents.toLocaleString()} 个文档`,

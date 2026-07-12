@@ -10,18 +10,40 @@ export default defineConfig({
     alias: {
       "@": path.resolve(__dirname, "./src"),
     },
+    dedupe: ["react", "react-dom", "three"],
   },
   test: {
     environment: "jsdom",
     globals: true,
+    // Node 25 exposes an incomplete process-global Web Storage shim unless a
+    // persistence file is configured. jsdom supplies the storage used by the
+    // tests, so disable only that Node shim in workers when the runtime knows
+    // the flag; this also keeps older supported Node versions compatible.
+    execArgv: process.allowedNodeEnvironmentFlags.has("--no-experimental-webstorage")
+      ? ["--no-experimental-webstorage"]
+      : [],
   },
   build: {
     outDir: "dist",
     assetsDir: "assets",
     sourcemap: false,
+    // Three.js is a single, tree-shaken engine module. It is loaded only when
+    // the graph tab opens and compresses to well below this threshold.
+    chunkSizeWarningLimit: 750,
     rollupOptions: {
       output: {
-        manualChunks: undefined,
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("/postprocessing/") || id.includes("/@react-three/postprocessing/")) {
+            return "graph-effects";
+          }
+          if (id.includes("/three-stdlib/") || id.includes("/@react-three/drei/")) {
+            return "graph-controls";
+          }
+          if (id.includes("/@react-three/fiber/")) return "graph-react";
+          if (id.includes("/three/")) return "graph-three";
+          return undefined;
+        },
       },
     },
   },

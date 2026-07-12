@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatGraphLimitNotice } from "./GraphTab";
+import { formatGraphLimitNotice } from "../lib/graphLimits";
 import type { GraphData } from "../lib/types";
 
 describe("formatGraphLimitNotice", () => {

@@ -19,40 +19,58 @@
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#include "foundation/rooted_file.h"
 #include "foundation/str_util.h"
+#include "foundation/sha256.h"
 #include "foundation/win_utf8.h"
 #include "foundation/yaml.h"
 
 #include <yyjson/yyjson.h>
 
 #include <stdbool.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
 /* Read an entire file into a malloc'd buffer. Returns NULL on failure. */
-static char *pkgmap_read_file(const char *path, int *out_len) {
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
+static char *pkgmap_read_file(const char *repo_root, const char *path, const char *rel_path,
+                              cbm_userconfig_snapshot_t *input_snapshot, int *out_len) {
+    char *buf = NULL;
+    size_t source_len = 0;
+    char source_sha256[CBM_SHA256_HEX_LEN + 1];
+    cbm_rooted_file_t rooted = {0};
+    int read_rc = CBM_NOT_FOUND;
+    if (repo_root && rel_path) {
+        cbm_rooted_file_status_t status =
+            cbm_rooted_file_read(repo_root, rel_path, (size_t)CBM_SZ_1K * CBM_SZ_1K, &rooted);
+        if (status == CBM_ROOTED_FILE_OK) {
+            buf = rooted.data;
+            rooted.data = NULL;
+            source_len = rooted.len;
+            memcpy(source_sha256, rooted.sha256, sizeof(source_sha256));
+            read_rc = 0;
+        }
+        cbm_rooted_file_free(&rooted);
+    } else {
+        read_rc = cbm_sha256_file_read_hex(path, (size_t)CBM_SZ_1K * CBM_SZ_1K, &buf, &source_len,
+                                           source_sha256);
+    }
+    if (read_rc != 0) {
+        cbm_userconfig_snapshot_note_auxiliary_read_failure(input_snapshot, rel_path);
         return NULL;
     }
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > (long)CBM_SZ_1K * CBM_SZ_1K) { /* 1MB cap for manifests */
-        (void)fclose(f);
+    if (input_snapshot && cbm_userconfig_snapshot_verify_auxiliary_source(input_snapshot, rel_path,
+                                                                          source_sha256) != 0) {
+        free(buf);
         return NULL;
     }
-    char *buf = (char *)malloc((size_t)size + SKIP_ONE);
-    if (!buf) {
-        (void)fclose(f);
+    if (source_len == 0 || source_len > INT_MAX) {
+        free(buf);
         return NULL;
     }
-    size_t nread = fread(buf, SKIP_ONE, (size_t)size, f);
-    (void)fclose(f);
-    buf[nread] = '\0';
-    *out_len = (int)nread;
+    *out_len = (int)source_len;
     return buf;
 }
 
@@ -60,7 +78,7 @@ static char *pkgmap_read_file(const char *path, int *out_len) {
 
 enum {
     PKGMAP_INIT_CAP = 16,
-    PKGMAP_PATH_BUF = 1024,
+    PKGMAP_PATH_BUF = 4096,
     PKGMAP_LINE_BUF = 512,
     PKGMAP_HT_INIT = 64,
     PKGMAP_ITOA_BUF = 16,
@@ -71,6 +89,7 @@ enum {
      * descent stops at this depth so the walk can never hang. 64 is far
      * deeper than any real source tree. */
     PKGMAP_WALK_MAX_DEPTH = 64,
+    PKGMAP_WALK_MAX_FILES = 4096,
     /* String lengths for manifest parsing (avoid magic numbers in memcmp) */
     TOML_NAME_LEN = 4,      /* strlen("name") */
     TOML_NAME_SP = 5,       /* strlen("name ") */
@@ -99,15 +118,37 @@ void cbm_pkg_entries_init(cbm_pkg_entries_t *e) {
     e->items = NULL;
     e->count = 0;
     e->cap = 0;
+    e->failed = false;
 }
 
 static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_rel) {
+    if (!e || !pkg_name || !entry_rel || e->failed) {
+        free(pkg_name);
+        free(entry_rel);
+        if (e) {
+            e->failed = true;
+        }
+        return;
+    }
     if (e->count >= e->cap) {
-        int new_cap = e->cap == 0 ? PKGMAP_INIT_CAP : e->cap * SKIP_ONE * PAIR_LEN;
-        cbm_pkg_entry_t *tmp = realloc(e->items, new_cap * sizeof(cbm_pkg_entry_t));
+        if (e->cap > INT_MAX / PAIR_LEN) {
+            free(pkg_name);
+            free(entry_rel);
+            e->failed = true;
+            return;
+        }
+        int new_cap = e->cap == 0 ? PKGMAP_INIT_CAP : e->cap * PAIR_LEN;
+        if ((size_t)new_cap > SIZE_MAX / sizeof(cbm_pkg_entry_t)) {
+            free(pkg_name);
+            free(entry_rel);
+            e->failed = true;
+            return;
+        }
+        cbm_pkg_entry_t *tmp = realloc(e->items, (size_t)new_cap * sizeof(cbm_pkg_entry_t));
         if (!tmp) {
             free(pkg_name);
             free(entry_rel);
+            e->failed = true;
             return;
         }
         e->items = tmp;
@@ -127,6 +168,7 @@ void cbm_pkg_entries_free(cbm_pkg_entries_t *e) {
     e->items = NULL;
     e->count = 0;
     e->cap = 0;
+    e->failed = false;
 }
 
 /* ── Helpers ───────────────────────────────────────────────────── */
@@ -714,44 +756,106 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
 
 /* ── Merge: per-worker entries → hash table ────────────────────── */
 
+static void pkgmap_free_entry(const char *key, void *value, void *userdata);
+
+static int pkg_entry_ptr_cmp(const void *left_ptr, const void *right_ptr) {
+    const cbm_pkg_entry_t *left = *(const cbm_pkg_entry_t *const *)left_ptr;
+    const cbm_pkg_entry_t *right = *(const cbm_pkg_entry_t *const *)right_ptr;
+    int name_cmp = strcmp(left->pkg_name, right->pkg_name);
+    return name_cmp != 0 ? name_cmp : strcmp(left->entry_rel, right->entry_rel);
+}
+
+static void pkgmap_free_table(CBMHashTable *map) {
+    if (map) {
+        cbm_ht_foreach(map, pkgmap_free_entry, NULL);
+        cbm_ht_free(map);
+    }
+}
+
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
                                const char *project_name) {
+    if (!worker_entries || worker_count <= 0 || !project_name) {
+        return NULL;
+    }
     /* Count total entries */
     int total = 0;
     for (int w = 0; w < worker_count; w++) {
+        if (worker_entries[w].failed || worker_entries[w].count < 0 ||
+            total > INT_MAX - worker_entries[w].count) {
+            worker_entries[0].failed = true;
+            return NULL;
+        }
         total += worker_entries[w].count;
     }
     if (total == 0) {
         return NULL;
     }
 
-    CBMHashTable *map = cbm_ht_create(PKGMAP_HT_INIT);
-    int merged = 0;
-
+    if ((size_t)total > SIZE_MAX / sizeof(cbm_pkg_entry_t *)) {
+        worker_entries[0].failed = true;
+        return NULL;
+    }
+    cbm_pkg_entry_t **ordered = malloc((size_t)total * sizeof(*ordered));
+    if (!ordered) {
+        worker_entries[0].failed = true;
+        return NULL;
+    }
+    int ordered_count = 0;
     for (int w = 0; w < worker_count; w++) {
-        cbm_pkg_entries_t *we = &worker_entries[w];
-        for (int i = 0; i < we->count; i++) {
-            /* Convert entry_rel to QN: project.dir.parts */
-            char *qn = cbm_pipeline_fqn_module(project_name, we->items[i].entry_rel);
-            if (!qn) {
-                continue;
-            }
-
-            /* Check for duplicate — first wins */
-            if (cbm_ht_has(map, we->items[i].pkg_name)) {
-                free(qn);
-                continue;
-            }
-
-            /* Transfer ownership: key = strdup'd pkg_name, value = qn */
-            char *key = strdup(we->items[i].pkg_name);
-            cbm_ht_set(map, key, qn);
-            merged++;
+        for (int i = 0; i < worker_entries[w].count; i++) {
+            ordered[ordered_count++] = &worker_entries[w].items[i];
         }
     }
+    qsort(ordered, (size_t)ordered_count, sizeof(*ordered), pkg_entry_ptr_cmp);
+
+    CBMHashTable *map = cbm_ht_create(PKGMAP_HT_INIT);
+    if (!map) {
+        free(ordered);
+        worker_entries[0].failed = true;
+        return NULL;
+    }
+    int merged = 0;
+
+    for (int i = 0; i < ordered_count; i++) {
+        cbm_pkg_entry_t *entry = ordered[i];
+        /* Convert entry_rel to QN: project.dir.parts */
+        char *qn = cbm_pipeline_fqn_module(project_name, entry->entry_rel);
+        if (!qn) {
+            worker_entries[0].failed = true;
+            pkgmap_free_table(map);
+            free(ordered);
+            return NULL;
+        }
+
+        /* Canonically sorted first entry wins for duplicate package names. */
+        if (cbm_ht_has(map, entry->pkg_name)) {
+            free(qn);
+            continue;
+        }
+
+        char *key = strdup(entry->pkg_name);
+        if (!key) {
+            free(qn);
+            worker_entries[0].failed = true;
+            pkgmap_free_table(map);
+            free(ordered);
+            return NULL;
+        }
+        cbm_ht_set(map, key, qn);
+        if (cbm_ht_get(map, key) != qn) {
+            free(key);
+            free(qn);
+            worker_entries[0].failed = true;
+            pkgmap_free_table(map);
+            free(ordered);
+            return NULL;
+        }
+        merged++;
+    }
+    free(ordered);
 
     if (merged == 0) {
-        cbm_ht_free(map);
+        pkgmap_free_table(map);
         return NULL;
     }
     cbm_log_info("pkgmap.build", "entries", pkgmap_itoa(merged));
@@ -844,15 +948,17 @@ static bool pkgmap_is_reparse_point(const char *abs_path) {
  * recursion bound — even directory junctions / symlink cycles cannot make
  * it hang. On Windows we additionally skip reparse points before
  * descending as a best-effort early-out. */
-static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
-                           int depth, char **excluded_dirs, int excluded_count) {
+static int pkgmap_walk_dir(const char *repo_root, const char *abs_dir, const char *rel_dir,
+                           cbm_pkg_entries_t *entries, int depth, char **excluded_dirs,
+                           int excluded_count, cbm_userconfig_snapshot_t *input_snapshot,
+                           int *manifest_count) {
     if (depth >= PKGMAP_WALK_MAX_DEPTH) {
         cbm_log_info("pkgmap.walk", "depth_cap", rel_dir && rel_dir[0] ? rel_dir : ".");
-        return 0;
+        return CBM_NOT_FOUND;
     }
     cbm_dir_t *dir = cbm_opendir(abs_dir);
     if (!dir) {
-        return 0;
+        return CBM_NOT_FOUND;
     }
     int parsed = 0;
     cbm_dirent_t *entry;
@@ -863,11 +969,20 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         }
         char abs_path[PKGMAP_PATH_BUF];
         char rel_path[PKGMAP_PATH_BUF];
-        snprintf(abs_path, sizeof(abs_path), "%s/%s", abs_dir, name);
+        int abs_n = snprintf(abs_path, sizeof(abs_path), "%s/%s", abs_dir, name);
+        int rel_n;
         if (rel_dir && rel_dir[0]) {
-            snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_dir, name);
+            rel_n = snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_dir, name);
         } else {
-            snprintf(rel_path, sizeof(rel_path), "%s", name);
+            rel_n = snprintf(rel_path, sizeof(rel_path), "%s", name);
+        }
+        if (abs_n < 0 || abs_n >= (int)sizeof(abs_path) || rel_n < 0 ||
+            rel_n >= (int)sizeof(rel_path)) {
+            cbm_closedir(dir);
+            return CBM_NOT_FOUND;
+        }
+        if (entry->is_reparse) {
+            continue;
         }
         struct stat st;
         if (pkgmap_safe_stat(abs_path, &st) != 0) {
@@ -887,8 +1002,14 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
                 continue;
             }
 #endif
-            parsed += pkgmap_walk_dir(abs_path, rel_path, entries, depth + 1, excluded_dirs,
-                                      excluded_count);
+            int child_parsed =
+                pkgmap_walk_dir(repo_root, abs_path, rel_path, entries, depth + 1, excluded_dirs,
+                                excluded_count, input_snapshot, manifest_count);
+            if (child_parsed < 0) {
+                cbm_closedir(dir);
+                return child_parsed;
+            }
+            parsed += child_parsed;
             continue;
         }
         if (!S_ISREG(st.st_mode)) {
@@ -897,8 +1018,14 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         if (!is_pkgmap_manifest_basename(name)) {
             continue;
         }
+        if (*manifest_count >= PKGMAP_WALK_MAX_FILES) {
+            cbm_log_warn("pkgmap.walk", "manifest_cap", "4096", "repo", abs_dir);
+            cbm_closedir(dir);
+            return CBM_NOT_FOUND;
+        }
+        (*manifest_count)++;
         int source_len = 0;
-        char *source = pkgmap_read_file(abs_path, &source_len);
+        char *source = pkgmap_read_file(repo_root, abs_path, rel_path, input_snapshot, &source_len);
         if (!source) {
             continue;
         }
@@ -906,6 +1033,14 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
             parsed++;
         }
         free(source);
+        if (entries->failed) {
+            cbm_closedir(dir);
+            return CBM_NOT_FOUND;
+        }
+    }
+    if (cbm_dir_had_error(dir)) {
+        cbm_closedir(dir);
+        return CBM_NOT_FOUND;
     }
     cbm_closedir(dir);
     return parsed;
@@ -922,14 +1057,30 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
  * Windows reparse points, so it cannot hang on directory junctions.
  * This is what lets bare workspace imports (e.g. "@org/pkg" declared in
  * an ignored package.json) resolve on Windows as well as POSIX. */
-int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
-                         int excluded_count) {
+int cbm_pkgmap_scan_repo_snapshot(const char *repo_path, cbm_pkg_entries_t *entries,
+                                  char **excluded_dirs, int excluded_count,
+                                  cbm_userconfig_snapshot_t *input_snapshot) {
     if (!repo_path || !entries) {
+        cbm_userconfig_snapshot_finish_auxiliary_consumer(input_snapshot,
+                                                          CBM_USERCONFIG_AUX_PKGMAP);
         return 0;
     }
-    int parsed = pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count);
+    int manifest_count = 0;
+    int parsed = pkgmap_walk_dir(repo_path, repo_path, "", entries, 0, excluded_dirs,
+                                 excluded_count, input_snapshot, &manifest_count);
+    if (parsed < 0) {
+        entries->failed = true;
+        cbm_userconfig_snapshot_note_auxiliary_consumer_failure(input_snapshot,
+                                                                CBM_USERCONFIG_AUX_PKGMAP);
+    }
+    cbm_userconfig_snapshot_finish_auxiliary_consumer(input_snapshot, CBM_USERCONFIG_AUX_PKGMAP);
     cbm_log_info("pkgmap.scan_repo", "manifests", pkgmap_itoa(parsed));
     return parsed;
+}
+
+int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
+                         int excluded_count) {
+    return cbm_pkgmap_scan_repo_snapshot(repo_path, entries, excluded_dirs, excluded_count, NULL);
 }
 
 /* Build pkgmap for sequential path (reads manifest files directly) */
@@ -946,7 +1097,7 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
 
         /* Read file */
         int source_len = 0;
-        char *source = pkgmap_read_file(files[i].path, &source_len);
+        char *source = pkgmap_read_file(NULL, files[i].path, files[i].rel_path, NULL, &source_len);
         if (!source) {
             continue;
         }
@@ -963,9 +1114,11 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
  * filesystem to pick up manifests filtered out by the main discoverer
  * (the canonical case: package.json, which is in IGNORED_JSON_FILES).
  * Falls back to the files[]-only behaviour if repo_path is NULL. */
-CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
-                                         int file_count, const char *project_name,
-                                         char **excluded_dirs, int excluded_count) {
+CBMHashTable *cbm_pkgmap_build_from_repo_snapshot(const char *repo_path,
+                                                  const cbm_file_info_t *files, int file_count,
+                                                  const char *project_name, char **excluded_dirs,
+                                                  int excluded_count,
+                                                  cbm_userconfig_snapshot_t *input_snapshot) {
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
 
@@ -981,7 +1134,8 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
         }
         from_files++;
         int source_len = 0;
-        char *source = pkgmap_read_file(files[i].path, &source_len);
+        char *source = pkgmap_read_file(repo_path, files[i].path, files[i].rel_path, input_snapshot,
+                                        &source_len);
         if (!source) {
             continue;
         }
@@ -989,13 +1143,27 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
         free(source);
     }
 
-    int from_walk = cbm_pkgmap_scan_repo(repo_path, &entries, excluded_dirs, excluded_count);
+    int from_walk = cbm_pkgmap_scan_repo_snapshot(repo_path, &entries, excluded_dirs,
+                                                  excluded_count, input_snapshot);
     cbm_log_info("pkgmap.scan", "manifests_from_files", pkgmap_itoa(from_files),
                  "manifests_from_walk", pkgmap_itoa(from_walk), "entries",
                  pkgmap_itoa(entries.count));
     CBMHashTable *map = cbm_pkgmap_build(&entries, SKIP_ONE, project_name);
+    if (from_walk < 0 || entries.failed) {
+        cbm_userconfig_snapshot_note_auxiliary_consumer_failure(input_snapshot,
+                                                                CBM_USERCONFIG_AUX_PKGMAP);
+        cbm_pkgmap_free(map);
+        map = NULL;
+    }
     cbm_pkg_entries_free(&entries);
     return map;
+}
+
+CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
+                                         int file_count, const char *project_name,
+                                         char **excluded_dirs, int excluded_count) {
+    return cbm_pkgmap_build_from_repo_snapshot(repo_path, files, file_count, project_name,
+                                               excluded_dirs, excluded_count, NULL);
 }
 
 static void pkgmap_free_entry(const char *key, void *value, void *userdata) {

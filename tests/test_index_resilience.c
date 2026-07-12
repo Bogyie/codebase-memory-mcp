@@ -492,6 +492,15 @@ TEST(index_parse_partial_clears_on_fix) {
     ASSERT_NOT_NULL(strstr(cov1, "flaky.c"));
     free(cov1);
 
+    /* A no-change incremental run must report the installed snapshot's full
+     * coverage, not only this run's empty file-error delta. */
+    char iargs[700];
+    snprintf(iargs, sizeof(iargs), "{\"repo_path\":\"%s\"}", lp.tmpdir);
+    char *same_resp = cbm_mcp_handle_tool(lp.srv, "index_repository", iargs);
+    ASSERT_NOT_NULL(same_resp);
+    ASSERT_NOT_NULL(strstr(same_resp, "flaky.c"));
+    free(same_resp);
+
     /* Fix the file; ensure a newer mtime so change detection can't miss it. */
     struct timespec ts = {0, INCR_FIX_SLEEP_NS};
     nanosleep(&ts, NULL);
@@ -502,8 +511,6 @@ TEST(index_parse_partial_clears_on_fix) {
                   "}\n");
 
     /* Re-index WITHOUT deleting the DB → routes through the incremental path. */
-    char iargs[700];
-    snprintf(iargs, sizeof(iargs), "{\"repo_path\":\"%s\"}", lp.tmpdir);
     char *resp2 = cbm_mcp_handle_tool(lp.srv, "index_repository", iargs);
     ASSERT_NOT_NULL(resp2);
     free(resp2);

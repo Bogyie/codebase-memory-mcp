@@ -91,6 +91,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "semantic/ast_profile.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -205,62 +206,6 @@ static uint64_t extract_now_ns(void) {
     struct timespec ts;
     cbm_clock_gettime(CLOCK_MONOTONIC, &ts);
     return ((uint64_t)ts.tv_sec * PP_NSEC_PER_SEC) + (uint64_t)ts.tv_nsec;
-}
-
-/* ── Helpers (duplicated from pass files — kept static for isolation) ── */
-
-/* Read file into a malloc'd buffer (= mimalloc in production).
- * *out_size receives the on-disk size and *out_status the failure reason so the
- * caller can attribute a skip to the right phase (read vs oversized) instead of
- * a silent drop. Both out params may be NULL. */
-static char *read_file(const char *path, int *out_len, long *out_size,
-                       cbm_read_status_t *out_status) {
-    if (out_size) {
-        *out_size = 0;
-    }
-    if (out_status) {
-        *out_status = CBM_READ_OK;
-    }
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
-        if (out_status) {
-            *out_status = CBM_READ_OPEN_FAIL;
-        }
-        return NULL;
-    }
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-    if (out_size) {
-        *out_size = size;
-    }
-    if (size <= 0) {
-        (void)fclose(f);
-        if (out_status) {
-            *out_status = CBM_READ_EMPTY;
-        }
-        return NULL;
-    }
-    if (size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
-        (void)fclose(f);
-        if (out_status) {
-            *out_status = CBM_READ_OVERSIZED;
-        }
-        return NULL;
-    }
-    char *buf = (char *)malloc((size_t)size + SKIP_ONE);
-    if (!buf) {
-        (void)fclose(f);
-        if (out_status) {
-            *out_status = CBM_READ_OOM;
-        }
-        return NULL;
-    }
-    size_t nread = fread(buf, SKIP_ONE, (size_t)size, f);
-    (void)fclose(f);
-    buf[nread] = '\0';
-    *out_len = (int)nread;
-    return buf;
 }
 
 /* ── Per-worker skip list (Stage 2 / Track B) ───────────────────────
@@ -675,6 +620,7 @@ typedef struct __attribute__((aligned(CBM_CACHE_LINE))) {
 } extract_worker_state_t;
 
 typedef struct {
+    cbm_pipeline_ctx_t *pipeline_ctx;
     const cbm_file_info_t *files;
     file_sort_entry_t *sorted;
     int file_count;
@@ -844,33 +790,38 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         }
 
         /* Read + extract */
-        int source_len = 0;
-        long file_size = 0;
-        cbm_read_status_t rst = CBM_READ_OK;
-        char *source = read_file(fi->path, &source_len, &file_size, &rst);
-        if (!source) {
-            ws->errors++;
-            if (rst == CBM_READ_OVERSIZED) {
+        size_t source_size = 0;
+        char source_sha256[CBM_SHA256_HEX_LEN + 1];
+        char *source = NULL;
+        int source_rc =
+            cbm_pipeline_read_selected_source(ec->pipeline_ctx, fi, (size_t)cbm_max_file_bytes(),
+                                              &source, &source_size, source_sha256);
+        if (source_rc != CBM_SHA256_FILE_HASHED || source_size == 0 || source_size > INT_MAX) {
+            if (source_rc == CBM_SHA256_FILE_SKIPPED) {
+                ws->errors++;
                 /* Never a silent drop: record the oversized skip + a throttled
                  * WARN so the file surfaces in the response/logfile. */
                 long cap = cbm_max_file_bytes();
                 char reason[96];
                 snprintf(reason, sizeof(reason), "oversized (%lld MB > %lld MB)",
-                         (long long)(file_size / (CBM_SZ_1K * CBM_SZ_1K)),
+                         (long long)(fi->size / (CBM_SZ_1K * CBM_SZ_1K)),
                          (long long)(cap / (CBM_SZ_1K * CBM_SZ_1K)));
                 pp_err_add(errs, fi->rel_path, reason, "oversized");
                 if (atomic_fetch_add_explicit(&ec->oversized_warned, SKIP_ONE,
                                               memory_order_relaxed) < PP_OVERSIZED_WARN_MAX) {
                     cbm_log_warn("index.file_oversized", "path", fi->rel_path, "size_mb",
-                                 itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
+                                 itoa_log((int)(fi->size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
                                  itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
                 }
-            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
+            } else if (source_rc != CBM_SHA256_FILE_HASHED || source_size > INT_MAX) {
+                ws->errors++;
                 pp_err_add(errs, fi->rel_path, "read failed", "read");
             }
             /* CBM_READ_EMPTY: benign 0-byte file — not reported. */
+            free(source);
             continue;
         }
+        int source_len = (int)source_size;
 
         /* Per-file start log: shows which file each worker is processing.
          * Critical for diagnosing stuck workers on large vendored files. */
@@ -953,10 +904,11 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                 int64_t prior = atomic_fetch_add_explicit(&ec->retained_bytes, (int64_t)source_len,
                                                           memory_order_relaxed);
                 if ((size_t)(prior + (int64_t)source_len) <= ec->retain_total_budget_bytes) {
-                    char *copy = (char *)cbm_arena_alloc(&result->arena, (size_t)source_len + 1);
+                    char *copy = (char *)cbm_arena_alloc(
+                        &result->arena, (size_t)source_len + CBM_SOURCE_LOOKAHEAD_PAD);
                     if (copy) {
                         memcpy(copy, source, (size_t)source_len);
-                        copy[source_len] = '\0';
+                        memset(copy + source_len, 0, CBM_SOURCE_LOOKAHEAD_PAD);
                         result->source = copy;
                         result->source_len = source_len;
                     } else {
@@ -1022,8 +974,21 @@ static void merge_pkg_entries(cbm_pipeline_ctx_t *ctx, cbm_pkg_entries_t *pkg_en
      * by the main discoverer (package.json, composer.json — in
      * IGNORED_JSON_FILES) still feed pkgmap. Append into worker 0's
      * array so the existing merge below sees them. */
-    cbm_pkgmap_scan_repo(ctx->repo_path, &pkg_entries[0], ctx->excluded_dirs, ctx->excluded_count);
-    cbm_pipeline_set_pkgmap(cbm_pkgmap_build(pkg_entries, worker_count, ctx->project_name));
+    cbm_userconfig_snapshot_t *inputs =
+        ctx->pipeline ? cbm_pipeline_userconfig_snapshot(ctx->pipeline) : NULL;
+    int scan_rc = cbm_pkgmap_scan_repo_snapshot(ctx->repo_path, &pkg_entries[0], ctx->excluded_dirs,
+                                                ctx->excluded_count, inputs);
+    CBMHashTable *pkgmap = cbm_pkgmap_build(pkg_entries, worker_count, ctx->project_name);
+    bool failed = scan_rc < 0;
+    for (int i = 0; i < worker_count; i++) {
+        failed = failed || pkg_entries[i].failed;
+    }
+    if (failed) {
+        cbm_userconfig_snapshot_note_auxiliary_consumer_failure(inputs, CBM_USERCONFIG_AUX_PKGMAP);
+        cbm_pkgmap_free(pkgmap);
+        pkgmap = NULL;
+    }
+    cbm_pipeline_set_pkgmap(pkgmap);
     for (int i = 0; i < worker_count; i++) {
         cbm_pkg_entries_free(&pkg_entries[i]);
     }
@@ -1117,6 +1082,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     pp_err_list_t *err_lists = calloc((size_t)worker_count, sizeof(pp_err_list_t));
 
     extract_ctx_t ec = {
+        .pipeline_ctx = ctx,
         .files = files,
         .sorted = sorted,
         .file_count = file_count,
@@ -1379,6 +1345,7 @@ typedef struct __attribute__((aligned(CBM_CACHE_LINE))) {
 } resolve_worker_state_t;
 
 typedef struct {
+    cbm_pipeline_ctx_t *pipeline_ctx;
     const cbm_file_info_t *files;
     int file_count;
     const char *project_name;
@@ -2766,9 +2733,18 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
             const char *lsp_source = result->source;
             int lsp_source_len = result->source_len;
             if ((!lsp_source || lsp_source_len <= 0) && rc->files[file_idx].path) {
-                /* Retention cap skipped this file — re-read on demand (bounded
-                 * by read_file's cbm_max_file_bytes cap), freed below. */
-                lsp_source_owned = read_file(rc->files[file_idx].path, &lsp_source_len, NULL, NULL);
+                size_t selected_len = 0;
+                char source_sha256[CBM_SHA256_HEX_LEN + 1];
+                if (cbm_pipeline_read_selected_source(rc->pipeline_ctx, &rc->files[file_idx], 0,
+                                                      &lsp_source_owned, &selected_len,
+                                                      source_sha256) == 0 &&
+                    selected_len <= INT_MAX) {
+                    lsp_source_len = (int)selected_len;
+                } else {
+                    free_source(lsp_source_owned);
+                    lsp_source_owned = NULL;
+                    lsp_source_len = 0;
+                }
                 lsp_source = lsp_source_owned;
             }
             if (lsp_source && lsp_source_len > 0) {
@@ -2895,6 +2871,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     memset(workers, 0, (size_t)worker_count * sizeof(resolve_worker_state_t));
 
     resolve_ctx_t rc = {
+        .pipeline_ctx = ctx,
         .files = files,
         .file_count = file_count,
         .project_name = ctx->project_name,

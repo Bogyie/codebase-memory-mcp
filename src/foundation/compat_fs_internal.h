@@ -9,6 +9,12 @@
 #ifndef CBM_FOUNDATION_COMPAT_FS_INTERNAL_H
 #define CBM_FOUNDATION_COMPAT_FS_INTERNAL_H
 
+/* One-shot directory iteration failure seam. A non-negative value allows that
+ * many successful cbm_readdir calls globally, then the next call returns NULL,
+ * marks the directory erroneous, and resets the hook to disabled (-1).
+ * Single-threaded tests only. */
+void cbm_dir_set_test_fail_after(int successful_entries);
+
 #ifdef _WIN32
 
 #include <wchar.h>

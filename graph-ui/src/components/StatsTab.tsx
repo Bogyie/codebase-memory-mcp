@@ -12,7 +12,13 @@ interface StatsTabProps {
 interface MemoryStatus {
   snapshot_epoch: number;
   entities: { total: number };
-  maintenance: { open_dirty: number; unresolved_code_refs: number };
+  maintenance: {
+    open_dirty: number;
+    unresolved_code_refs: number;
+    pending_outbox: number;
+    failed_outbox: number;
+    exhausted_outbox: number;
+  };
   projection: {
     strategy: string;
     documents: number;
@@ -566,12 +572,13 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
           </div>
           {memoryStatus && (
             <>
-              <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+              <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
               {[
                 [t.projects.memoryEpoch, memoryStatus.snapshot_epoch],
                 [t.projects.memoryEntities, memoryStatus.entities.total],
                 [t.projects.memoryReview, memoryStatus.maintenance.open_dirty],
                 [t.projects.memoryRefs, memoryStatus.maintenance.unresolved_code_refs],
+                [t.projects.memoryOutbox, memoryStatus.maintenance.pending_outbox],
                 [t.projects.memoryProjection, memoryStatus.projection.documents],
               ].map(([label, value]) => (
                 <div key={String(label)} className="rounded-lg border border-white/[0.04] bg-black/10 px-2.5 py-2">
@@ -580,6 +587,14 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
                 </div>
               ))}
               </div>
+              {memoryStatus.maintenance.failed_outbox > 0 && (
+                <p role="status" className="mt-2 rounded-md border border-amber-300/15 bg-amber-300/[0.04] px-2.5 py-1.5 text-[10px] text-amber-200/65">
+                  {t.projects.memoryOutboxFailures(
+                    memoryStatus.maintenance.failed_outbox,
+                    memoryStatus.maintenance.exhausted_outbox,
+                  )}
+                </p>
+              )}
               <p className="mt-2 text-[10px] text-foreground/25">
                 {t.projects.memoryProjectionDetail(
                   memoryStatus.projection.strategy,

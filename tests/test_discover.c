@@ -6,6 +6,8 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "discover/discover.h"
+#include "foundation/compat_fs.h"
+#include "foundation/compat_fs_internal.h"
 
 typedef struct {
     char *home;
@@ -1090,8 +1092,10 @@ TEST(discover_git_info_exclude_stacks_with_gitignore) {
     bool found_log = false;
     bool found_scratch = false;
     for (int i = 0; i < count; i++) {
-        if (strstr(files[i].rel_path, ".log"))    found_log     = true;
-        if (strstr(files[i].rel_path, "scratch")) found_scratch = true;
+        if (strstr(files[i].rel_path, ".log"))
+            found_log = true;
+        if (strstr(files[i].rel_path, "scratch"))
+            found_scratch = true;
     }
     ASSERT_FALSE(found_log);
     ASSERT_FALSE(found_scratch);
@@ -1241,6 +1245,334 @@ TEST(discover_nested_gitignore_stacks_with_root) {
     PASS();
 }
 
+TEST(discover_nested_gitignore_all_depths_last_scope_wins) {
+    char *base = th_mktempdir("cbm_disc_ngi_deep");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.js\n");
+    th_write_file(TH_PATH(base, "a/.gitignore"), "!*.js\nblocked.js\n");
+    th_write_file(TH_PATH(base, "a/b/.gitignore"), "!blocked.js\n");
+    th_write_file(TH_PATH(base, "root.js"), "export const root = true\n");
+    th_write_file(TH_PATH(base, "a/keep.js"), "export const keep = true\n");
+    th_write_file(TH_PATH(base, "a/blocked.js"), "export const blocked = true\n");
+    th_write_file(TH_PATH(base, "a/b/blocked.js"), "export const deepKeep = true\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), 0);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "root.js"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "a/keep.js"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "a/blocked.js"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "a/b/blocked.js"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_git_precedence_root_then_info_then_global) {
+    git_env_snapshot_t env = save_git_env();
+    char *tmp = th_mktempdir("cbm_disc_gi_precedence");
+    ASSERT(tmp != NULL);
+    char repo[512], home[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    snprintf(home, sizeof(home), "%s/home", tmp);
+    cbm_setenv("HOME", home, 1);
+    cbm_unsetenv("XDG_CONFIG_HOME");
+
+    th_write_file(TH_PATH(repo, ".git/config"), "[core]\n");
+    th_write_file(TH_PATH(home, ".gitconfig"), "[core]\n    excludesFile = ~/global-ignore\n");
+    th_write_file(TH_PATH(home, "global-ignore"), "*.go\n");
+    th_write_file(TH_PATH(repo, ".git/info/exclude"), "!info.go\nfrom-info.js\n");
+    th_write_file(TH_PATH(repo, ".gitignore"), "info.go\n!from-info.js\n!root.go\n");
+    th_write_file(TH_PATH(repo, "info.go"), "package info\n");
+    th_write_file(TH_PATH(repo, "from-info.js"), "export const included = true\n");
+    th_write_file(TH_PATH(repo, "root.go"), "package root\n");
+    th_write_file(TH_PATH(repo, "other.go"), "package other\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(repo, &opts, &files, &count), 0);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "info.go"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "from-info.js"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "root.go"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "other.go"));
+
+    cbm_discover_free(files, count);
+    restore_git_env(&env);
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(discover_walk_stack_grows_past_512_siblings) {
+    enum { SIBLINGS = 520 };
+    char *base = th_mktempdir("cbm_disc_wide");
+    ASSERT(base != NULL);
+    for (int i = 0; i < SIBLINGS; i++) {
+        char rel[64];
+        snprintf(rel, sizeof(rel), "pkg-%03d/main.go", i);
+        th_write_file(TH_PATH(base, rel), "package main\n");
+    }
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), 0);
+    ASSERT_EQ(count, SIBLINGS);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "pkg-000/main.go"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "pkg-519/main.go"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+extern void *(*cbm_discover_realloc_hook_for_test)(void *, size_t);
+extern char *(*cbm_discover_strdup_hook_for_test)(const char *);
+extern void (*cbm_discover_after_ignore_load_hook_for_test)(void);
+extern void (*cbm_discover_before_ignore_verify_hook_for_test)(void);
+
+static void *discover_fail_realloc(void *ptr, size_t size) {
+    (void)ptr;
+    (void)size;
+    return NULL;
+}
+
+static int discover_dup_calls;
+static char *discover_fail_late_dup(const char *value) {
+    discover_dup_calls++;
+    return discover_dup_calls > 4 ? NULL : strdup(value);
+}
+
+TEST(discover_stack_oom_returns_no_partial_results) {
+    char *base = th_mktempdir("cbm_disc_stack_oom");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = (cbm_file_info_t *)(uintptr_t)1;
+    int count = 99;
+
+    cbm_discover_realloc_hook_for_test = discover_fail_realloc;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    cbm_discover_realloc_hook_for_test = NULL;
+    ASSERT_EQ(rc, -1);
+    ASSERT_NULL(files);
+    ASSERT_EQ(count, 0);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_file_copy_oom_discards_earlier_results) {
+    char *base = th_mktempdir("cbm_disc_copy_oom");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "a.go"), "package a\n");
+    th_write_file(TH_PATH(base, "b.go"), "package b\n");
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = (cbm_file_info_t *)(uintptr_t)1;
+    int count = 99;
+
+    discover_dup_calls = 0;
+    cbm_discover_strdup_hook_for_test = discover_fail_late_dup;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    cbm_discover_strdup_hook_for_test = NULL;
+    ASSERT_EQ(rc, -1);
+    ASSERT_NULL(files);
+    ASSERT_EQ(count, 0);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_readdir_error_discards_partial_results) {
+    char *base = th_mktempdir("cbm_disc_readdir_error");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "a.go"), "package a\n");
+    th_write_file(TH_PATH(base, "b.go"), "package b\n");
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = (cbm_file_info_t *)(uintptr_t)1;
+    int count = 99;
+
+    cbm_dir_set_test_fail_after(1);
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, -1);
+    ASSERT_NULL(files);
+    ASSERT_EQ(count, 0);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_dirent_capacity_covers_max_windows_utf8_name) {
+    ASSERT(CBM_DIRENT_NAME_MAX >= 1021);
+    PASS();
+}
+
+static const char *discover_generation_ignore_path;
+
+static void discover_swap_ignore_to_b(void) {
+    th_write_file(discover_generation_ignore_path, "*.go\n");
+}
+
+static void discover_restore_ignore_a(void) {
+    th_write_file(discover_generation_ignore_path, "# generation A\n");
+}
+
+TEST(discover_ignore_generation_a_b_a_uses_one_selected_buffer) {
+    char *base = th_mktempdir("cbm_disc_ignore_aba");
+    ASSERT(base != NULL);
+    char *ignore_path = cbm_strdup(TH_PATH(base, ".gitignore"));
+    ASSERT(ignore_path != NULL);
+    discover_generation_ignore_path = ignore_path;
+    th_write_file(discover_generation_ignore_path, "# generation A\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+
+    cbm_discover_after_ignore_load_hook_for_test = discover_swap_ignore_to_b;
+    cbm_discover_before_ignore_verify_hook_for_test = discover_restore_ignore_a;
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    cbm_discover_after_ignore_load_hook_for_test = NULL;
+    cbm_discover_before_ignore_verify_hook_for_test = NULL;
+    discover_generation_ignore_path = NULL;
+    free(ignore_path);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_ignore_generation_change_rejects_partial_results) {
+    char *base = th_mktempdir("cbm_disc_ignore_changed");
+    ASSERT(base != NULL);
+    char *ignore_path = cbm_strdup(TH_PATH(base, ".gitignore"));
+    ASSERT(ignore_path != NULL);
+    discover_generation_ignore_path = ignore_path;
+    th_write_file(discover_generation_ignore_path, "# generation A\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+
+    cbm_discover_after_ignore_load_hook_for_test = discover_swap_ignore_to_b;
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = (cbm_file_info_t *)(uintptr_t)1;
+    int count = 99;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    cbm_discover_after_ignore_load_hook_for_test = NULL;
+    discover_generation_ignore_path = NULL;
+    free(ignore_path);
+
+    ASSERT_EQ(rc, -1);
+    ASSERT_NULL(files);
+    ASSERT_EQ(count, 0);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_snapshot_is_full_mode_independent) {
+    char *base = th_mktempdir("cbm_disc_snapshot_mode");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "docs/doc.go"), "package docs\n");
+
+    cbm_discover_opts_t fast = {.mode = CBM_MODE_FAST};
+    cbm_discover_opts_t full = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *fast_files = NULL;
+    cbm_file_info_t *full_files = NULL;
+    int fast_count = 0;
+    int full_count = 0;
+    cbm_discovery_snapshot_t *fast_snapshot = NULL;
+    cbm_discovery_snapshot_t *full_snapshot = NULL;
+    ASSERT_EQ(cbm_discover_ex3(base, &fast, &fast_files, &fast_count, NULL, NULL, NULL, NULL, NULL,
+                               &fast_snapshot),
+              0);
+    ASSERT_EQ(cbm_discover_ex3(base, &full, &full_files, &full_count, NULL, NULL, NULL, NULL, NULL,
+                               &full_snapshot),
+              0);
+    ASSERT_EQ(fast_count, 1);
+    ASSERT_EQ(full_count, 2);
+    ASSERT_STR_EQ(cbm_discovery_snapshot_fingerprint(fast_snapshot),
+                  cbm_discovery_snapshot_fingerprint(full_snapshot));
+
+    cbm_discovery_snapshot_free(fast_snapshot);
+    cbm_discovery_snapshot_free(full_snapshot);
+    cbm_discover_free(fast_files, fast_count);
+    cbm_discover_free(full_files, full_count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_snapshot_detects_coverage_only_ignore_change) {
+    char *base = th_mktempdir("cbm_disc_snapshot_ignore");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, ".gitignore"), "# coverage version one\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    cbm_discovery_snapshot_t *snapshot = NULL;
+    ASSERT_EQ(
+        cbm_discover_ex3(base, &opts, &files, &count, NULL, NULL, NULL, NULL, NULL, &snapshot), 0);
+    ASSERT_TRUE(cbm_discovery_snapshot_verify(snapshot));
+    th_write_file(TH_PATH(base, ".gitignore"), "# coverage version two\n");
+    ASSERT_FALSE(cbm_discovery_snapshot_verify(snapshot));
+
+    cbm_discovery_snapshot_free(snapshot);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_snapshot_excludes_only_configured_output_family) {
+    char *base = th_mktempdir("cbm_disc_snapshot_output");
+    ASSERT(base != NULL);
+    char *output = cbm_strdup(TH_PATH(base, "index.db"));
+    ASSERT(output != NULL);
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(output, "sqlite generation one");
+    th_write_file(TH_PATH(base, "index.db-wal"), "wal one");
+    th_write_file(TH_PATH(base, "index.db.building.abcdef"), "staging one");
+    th_write_file(TH_PATH(base, ".codebase-memory.json"),
+                  "{\"extra_extensions\":{\".x\":\"go\"}}\n");
+
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .exclude_output_path = output,
+    };
+    cbm_file_info_t *files = NULL;
+    cbm_ignored_file_t *ignored = NULL;
+    int count = 0;
+    int ignored_count = 0;
+    int ignored_total = 0;
+    cbm_discovery_snapshot_t *snapshot = NULL;
+    ASSERT_EQ(cbm_discover_ex3(base, &opts, &files, &count, NULL, NULL, &ignored, &ignored_count,
+                               &ignored_total, &snapshot),
+              0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
+    ASSERT_EQ(ignored_count, 0);
+    ASSERT_EQ(ignored_total, 0);
+    ASSERT_TRUE(cbm_discovery_snapshot_verify(snapshot));
+
+    /* Output publication and sidecar churn are not repository inputs. */
+    th_write_file(output, "sqlite generation two");
+    th_write_file(TH_PATH(base, "index.db-wal"), "wal two");
+    ASSERT_TRUE(cbm_discovery_snapshot_verify(snapshot));
+
+    /* The exclusion is exact: an unrelated ignored DB still changes coverage. */
+    th_write_file(TH_PATH(base, "other.db"), "not the configured output");
+    ASSERT_FALSE(cbm_discovery_snapshot_verify(snapshot));
+
+    cbm_discovery_snapshot_free(snapshot);
+    cbm_discover_free(files, count);
+    cbm_discover_free_ignored(ignored, ignored_count);
+    free(output);
+    th_cleanup(base);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
@@ -1356,4 +1688,16 @@ SUITE(discover) {
     /* Nested .gitignore tests (issue #178) */
     RUN_TEST(discover_nested_gitignore);
     RUN_TEST(discover_nested_gitignore_stacks_with_root);
+    RUN_TEST(discover_nested_gitignore_all_depths_last_scope_wins);
+    RUN_TEST(discover_git_precedence_root_then_info_then_global);
+    RUN_TEST(discover_walk_stack_grows_past_512_siblings);
+    RUN_TEST(discover_stack_oom_returns_no_partial_results);
+    RUN_TEST(discover_file_copy_oom_discards_earlier_results);
+    RUN_TEST(discover_readdir_error_discards_partial_results);
+    RUN_TEST(discover_dirent_capacity_covers_max_windows_utf8_name);
+    RUN_TEST(discover_ignore_generation_a_b_a_uses_one_selected_buffer);
+    RUN_TEST(discover_ignore_generation_change_rejects_partial_results);
+    RUN_TEST(discover_snapshot_is_full_mode_independent);
+    RUN_TEST(discover_snapshot_detects_coverage_only_ignore_change);
+    RUN_TEST(discover_snapshot_excludes_only_configured_output_family);
 }

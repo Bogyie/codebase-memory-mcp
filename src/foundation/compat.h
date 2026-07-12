@@ -10,7 +10,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
-/* stdlib.h declares getenv (cbm_tmpdir) and, on Windows, _putenv_s (cbm_setenv/
+/* stdlib.h declares, on Windows, _putenv_s (cbm_setenv/
  * cbm_unsetenv). The x86-64 mingw toolchain pulled it in transitively, but the
  * aarch64 (CLANGARM64) include chain does not, so include it directly — without
  * it those calls become implicit declarations that conflict with the real
@@ -143,16 +143,15 @@ static inline int cbm_unsetenv(const char *name) {
 #endif
 
 /* ── Temp directory helper ───────────────────────────────────── */
-static inline const char *cbm_tmpdir(void) {
 #ifdef _WIN32
-    const char *t = getenv("TEMP");
-    if (!t)
-        t = getenv("TMP");
-    return t ? t : ".";
+/* UTF-8 GetTempPathW result in a thread-local buffer. Returns NULL when the
+ * OS result is empty, invalid, or does not fit; never falls back to CWD. */
+const char *cbm_tmpdir(void);
 #else
+static inline const char *cbm_tmpdir(void) {
     return "/tmp";
-#endif
 }
+#endif
 
 /* ── Signal handling ──────────────────────────────────────────── */
 /* Windows doesn't have sigaction; provide macro to select signal API. */

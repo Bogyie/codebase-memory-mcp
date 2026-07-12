@@ -6,7 +6,7 @@
  *   GET /             → embedded index.html
  *   GET /assets/...   → embedded JS/CSS
  *   POST /rpc         → JSON-RPC dispatch via own cbm_mcp_server_t
- *   OPTIONS /rpc      → CORS preflight (for vite dev on :5173)
+ *   OPTIONS /rpc      → same-origin CORS preflight
  *   GET/POST /api/... → UI support endpoints (layout, index, browse, …)
  *   *                 → 404
  *
@@ -34,16 +34,16 @@
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
 #include "foundation/compat_thread.h"
-#include "foundation/subprocess.h" /* cbm_build_win_cmdline — shared MS-CRT arg quoting */
-#include "foundation/win_utf8.h"   /* cbm_utf8_to_wide — CreateProcessW wide cmdline (#423/#20) */
+#include "foundation/subprocess.h"
+#include "foundation/win_utf8.h"
 
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
 
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,10 +51,11 @@
 #include <windows.h>
 #include <process.h>
 #include <psapi.h> /* GetProcessMemoryInfo */
+#define ui_close_fd _close
 #else
 #include <sys/stat.h>
 #include <unistd.h>
-#include <sys/wait.h>
+#define ui_close_fd close
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -65,7 +66,7 @@
 /* Max JSON-RPC request body size (1 MB) — transport enforces the same cap. */
 #define MAX_BODY_SIZE CBM_HTTP_MAX_BODY
 
-/* ── CORS: only allow localhost origins (blocks remote website attacks) ────── */
+/* ── Browser-origin and Host guards ───────────────────────────────────────── */
 
 /* Per-request CORS header buffers. Updated at the start of each dispatch.
  * The server handles requests sequentially on one thread (see httpd.h),
@@ -73,12 +74,211 @@
 static char g_cors[256];      /* CORS headers only */
 static char g_cors_json[512]; /* CORS + Content-Type: application/json */
 
-/* Inspect the Origin header and only reflect it if it's a localhost URL.
- * This prevents remote websites from making cross-origin requests to the
- * local graph-ui server (the key defense against CORS-based data exfil). */
-static void update_cors(const cbm_http_req_t *req) {
-    if (req->origin[0] != '\0' && (cbm_http_path_match(req->origin, "http://localhost:*") ||
-                                   cbm_http_path_match(req->origin, "http://127.0.0.1:*"))) {
+static bool ascii_equal_nocase_n(const char *a, const char *b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ac = (unsigned char)a[i];
+        unsigned char bc = (unsigned char)b[i];
+        if (ac >= 'A' && ac <= 'Z')
+            ac = (unsigned char)(ac - 'A' + 'a');
+        if (bc >= 'A' && bc <= 'Z')
+            bc = (unsigned char)(bc - 'A' + 'a');
+        if (ac != bc)
+            return false;
+    }
+    return true;
+}
+
+static bool valid_port_suffix(const char *s) {
+    if (!s || *s != ':')
+        return false;
+    s++;
+    if (*s == '\0')
+        return false;
+
+    unsigned port = 0;
+    size_t digits = 0;
+    while (*s) {
+        if (*s < '0' || *s > '9' || digits == 5)
+            return false;
+        port = port * 10u + (unsigned)(*s - '0');
+        digits++;
+        s++;
+    }
+    return port > 0 && port <= 65535u;
+}
+
+/* Accept only a syntactically complete loopback authority, not a prefix such
+ * as "localhost:9749.evil". The latter used to pass the wildcard matcher. */
+static bool authority_is_loopback(const char *authority) {
+    static const char localhost[] = "localhost";
+    size_t n = strlen(authority);
+    size_t host_len = sizeof(localhost) - 1;
+    if (n >= host_len && ascii_equal_nocase_n(authority, localhost, host_len) &&
+        (n == host_len || valid_port_suffix(authority + host_len))) {
+        return true;
+    }
+
+    static const char ipv4[] = "127.0.0.1";
+    host_len = sizeof(ipv4) - 1;
+    if (n >= host_len && memcmp(authority, ipv4, host_len) == 0 &&
+        (n == host_len || valid_port_suffix(authority + host_len))) {
+        return true;
+    }
+
+    static const char ipv6[] = "[::1]";
+    host_len = sizeof(ipv6) - 1;
+    return n >= host_len && memcmp(authority, ipv6, host_len) == 0 &&
+           (n == host_len || valid_port_suffix(authority + host_len));
+}
+
+typedef struct {
+    char host[16];
+    unsigned port;
+    bool has_port;
+} loopback_authority_t;
+
+static bool parse_port_value(const char *suffix, unsigned *port) {
+    if (!valid_port_suffix(suffix))
+        return false;
+    unsigned value = 0;
+    for (const char *p = suffix + 1; *p; p++)
+        value = value * 10U + (unsigned)(*p - '0');
+    *port = value;
+    return true;
+}
+
+static bool parse_loopback_authority(const char *authority, loopback_authority_t *out) {
+    if (!authority || !out || !authority_is_loopback(authority))
+        return false;
+    memset(out, 0, sizeof(*out));
+    const char *suffix = NULL;
+    if (ascii_equal_nocase_n(authority, "localhost", sizeof("localhost") - 1U)) {
+        memcpy(out->host, "localhost", sizeof("localhost"));
+        suffix = authority + sizeof("localhost") - 1U;
+    } else if (strncmp(authority, "127.0.0.1", sizeof("127.0.0.1") - 1U) == 0) {
+        memcpy(out->host, "127.0.0.1", sizeof("127.0.0.1"));
+        suffix = authority + sizeof("127.0.0.1") - 1U;
+    } else {
+        memcpy(out->host, "[::1]", sizeof("[::1]"));
+        suffix = authority + sizeof("[::1]") - 1U;
+    }
+    if (*suffix == '\0')
+        return true;
+    out->has_port = true;
+    return parse_port_value(suffix, &out->port);
+}
+
+static bool host_matches_listener(const char *host, int server_port) {
+    loopback_authority_t parsed;
+    return parse_loopback_authority(host, &parsed) &&
+           (!parsed.has_port || parsed.port == (unsigned)server_port);
+}
+
+static bool origin_is_same_server(const char *origin, const char *host, int server_port) {
+    static const char scheme[] = "http://";
+    size_t scheme_len = sizeof(scheme) - 1U;
+    if (!origin || !host || strlen(origin) <= scheme_len ||
+        !ascii_equal_nocase_n(origin, scheme, scheme_len)) {
+        return false;
+    }
+    loopback_authority_t origin_auth;
+    loopback_authority_t host_auth;
+    if (!parse_loopback_authority(origin + scheme_len, &origin_auth) ||
+        !parse_loopback_authority(host, &host_auth) ||
+        !ascii_equal_nocase_n(origin_auth.host, host_auth.host, strlen(host_auth.host)) ||
+        strlen(origin_auth.host) != strlen(host_auth.host)) {
+        return false;
+    }
+    unsigned origin_port = origin_auth.has_port ? origin_auth.port : 80U;
+    unsigned host_port = host_auth.has_port ? host_auth.port : (unsigned)server_port;
+    return origin_port == (unsigned)server_port && host_port == (unsigned)server_port;
+}
+
+static bool http_token_char(unsigned char ch) {
+    return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+           ch == '!' || ch == '#' || ch == '$' || ch == '%' || ch == '&' || ch == '\'' ||
+           ch == '*' || ch == '+' || ch == '-' || ch == '.' || ch == '^' || ch == '_' ||
+           ch == '`' || ch == '|' || ch == '~';
+}
+
+static const char *skip_http_ows(const char *p) {
+    while (*p == ' ' || *p == '\t')
+        p++;
+    return p;
+}
+
+/* Validate media-type parameters rather than accepting arbitrary bytes after
+ * the first semicolon. This keeps the CSRF media-type gate syntactically strict
+ * while allowing conventional values such as `charset=utf-8`. */
+static bool json_content_type_parameters_valid(const char *p) {
+    while (*p) {
+        if (*p++ != ';')
+            return false;
+        p = skip_http_ows(p);
+
+        const char *name = p;
+        while (http_token_char((unsigned char)*p))
+            p++;
+        if (p == name)
+            return false;
+        p = skip_http_ows(p);
+        if (*p++ != '=')
+            return false;
+        p = skip_http_ows(p);
+
+        if (*p == '"') {
+            p++;
+            bool closed = false;
+            while (*p) {
+                unsigned char ch = (unsigned char)*p++;
+                if (ch == '"') {
+                    closed = true;
+                    break;
+                }
+                if (ch == '\\') {
+                    if (*p == '\0')
+                        return false;
+                    p++;
+                } else if ((ch < 0x20 && ch != '\t') || ch == 0x7f) {
+                    return false;
+                }
+            }
+            if (!closed)
+                return false;
+        } else {
+            const char *value = p;
+            while (http_token_char((unsigned char)*p))
+                p++;
+            if (p == value)
+                return false;
+        }
+        p = skip_http_ows(p);
+        if (*p && *p != ';')
+            return false;
+    }
+    return true;
+}
+
+static bool content_type_is_json(const char *content_type) {
+    static const char json_type[] = "application/json";
+    if (!content_type)
+        return false;
+    const char *semi = strchr(content_type, ';');
+    size_t n = semi ? (size_t)(semi - content_type) : strlen(content_type);
+    while (n > 0 && (content_type[n - 1] == ' ' || content_type[n - 1] == '\t'))
+        n--;
+    if (n != sizeof(json_type) - 1 ||
+        !ascii_equal_nocase_n(content_type, json_type, sizeof(json_type) - 1)) {
+        return false;
+    }
+    return !semi || json_content_type_parameters_valid(semi);
+}
+
+/* Reflect only the exact HTTP origin serving this listener. Merely being on a
+ * loopback address is insufficient: unrelated local web apps are cross-origin
+ * and must not gain write authority over this service. */
+static void update_cors(const cbm_http_req_t *req, int server_port) {
+    if (req->origin[0] != '\0' && origin_is_same_server(req->origin, req->host, server_port)) {
         snprintf(g_cors, sizeof(g_cors),
                  "Access-Control-Allow-Origin: %s\r\n"
                  "Access-Control-Allow-Methods: POST, GET, DELETE, OPTIONS\r\n"
@@ -103,8 +303,12 @@ static const char *detect_ui_lang(const char *accept_language) {
 static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     const char *lang = NULL;
     char cache_dir[1024];
-    snprintf(cache_dir, sizeof(cache_dir), "%s", cbm_resolve_cache_dir());
-    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    cbm_config_t *cfg = NULL;
+    const char *resolved_cache = cbm_resolve_cache_dir();
+    int cache_len =
+        resolved_cache ? snprintf(cache_dir, sizeof(cache_dir), "%s", resolved_cache) : -1;
+    if (cache_len > 0 && (size_t)cache_len < sizeof(cache_dir))
+        cfg = cbm_config_open(cache_dir);
     if (cfg) {
         const char *pinned = cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto");
         if (strcmp(pinned, "zh") == 0 || strcmp(pinned, "en") == 0) {
@@ -146,12 +350,19 @@ typedef struct {
     char project_name[256];
     atomic_int status; /* 0=idle, 1=running, 2=done, 3=error */
     char error_msg[256];
-#ifndef _WIN32
-    pid_t child_pid; /* tracked for process-kill validation */
-#endif
+    _Atomic uint64_t job_id;          /* monotonically assigned per slot reuse */
+    cbm_proc_control_t child_control; /* stable supervisor-owned kill channel */
 } index_job_t;
 
 static index_job_t g_index_jobs[MAX_INDEX_JOBS];
+static _Atomic uint64_t g_next_index_job_id = 1;
+
+static uint64_t next_index_job_id(void) {
+    uint64_t id = atomic_fetch_add_explicit(&g_next_index_job_id, 1, memory_order_relaxed);
+    if (id == 0)
+        id = atomic_fetch_add_explicit(&g_next_index_job_id, 1, memory_order_relaxed);
+    return id;
+}
 
 /* ── Serve embedded asset ─────────────────────────────────────── */
 
@@ -185,16 +396,21 @@ static bool serve_embedded(cbm_http_conn_t *c, const char *path) {
 }
 
 /* Build DB path for a project: <cache_dir>/<project>.db */
-static void db_path_for_project(const char *project, char *buf, size_t bufsz) {
-    if (!cbm_validate_project_name(project)) {
-        buf[0] = '\0';
-        return;
-    }
+bool cbm_http_server_project_db_path(const char *project, char *buf, size_t bufsz) {
+    if (!buf || bufsz == 0)
+        return false;
+    buf[0] = '\0';
+    if (!cbm_validate_project_name(project))
+        return false;
     const char *dir = cbm_resolve_cache_dir();
-    if (!dir) {
-        dir = cbm_tmpdir();
+    if (!dir)
+        return false;
+    int n = snprintf(buf, bufsz, "%s/%s.db", dir, project);
+    if (n <= 0 || (size_t)n >= bufsz) {
+        buf[0] = '\0';
+        return false;
     }
-    snprintf(buf, bufsz, "%s/%s.db", dir, project);
+    return true;
 }
 
 /* ── Git remote → GitHub deep-link base (/api/repo-info) ───────── */
@@ -305,7 +521,7 @@ static void handle_repo_info(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
 
     char db_path[1024];
-    db_path_for_project(project, db_path, sizeof(db_path));
+    cbm_http_server_project_db_path(project, db_path, sizeof(db_path));
     if (db_path[0] == '\0' || !cbm_file_exists(db_path)) {
         cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
         return;
@@ -344,18 +560,26 @@ static void handle_repo_info(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         snprintf(blob_base, sizeof(blob_base), "%s/blob/%s", web_base, branch);
     }
 
-    /* JSON-escape the free-form fields. */
-    char esc_root[2048], esc_branch[512], esc_remote[2048], esc_web[2048], esc_blob[2304];
-    cbm_json_escape(esc_root, (int)sizeof(esc_root), root_path);
-    cbm_json_escape(esc_branch, (int)sizeof(esc_branch), branch);
-    cbm_json_escape(esc_remote, (int)sizeof(esc_remote), remote_safe ? remote_safe : "");
-    cbm_json_escape(esc_web, (int)sizeof(esc_web), web_base ? web_base : "");
-    cbm_json_escape(esc_blob, (int)sizeof(esc_blob), blob_base);
-
-    cbm_http_replyf(c, 200, g_cors_json,
-                    "{\"root_path\":\"%s\",\"branch\":\"%s\",\"remote_url\":\"%s\","
-                    "\"web_base\":\"%s\",\"blob_base\":\"%s\"}",
-                    esc_root, esc_branch, esc_remote, esc_web, esc_blob);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    char *json = NULL;
+    if (doc && root) {
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_strcpy(doc, root, "root_path", root_path);
+        yyjson_mut_obj_add_strcpy(doc, root, "branch", branch);
+        yyjson_mut_obj_add_strcpy(doc, root, "remote_url", remote_safe ? remote_safe : "");
+        yyjson_mut_obj_add_strcpy(doc, root, "web_base", web_base ? web_base : "");
+        yyjson_mut_obj_add_strcpy(doc, root, "blob_base", blob_base);
+        json = yyjson_mut_write(doc, 0, NULL);
+    }
+    if (json) {
+        cbm_http_replyf(c, 200, g_cors_json, "%s", json);
+        free(json);
+    } else {
+        cbm_http_replyf(c, 500, g_cors_json, "%s", "{\"error\":\"serialization failed\"}");
+    }
+    if (doc)
+        yyjson_mut_doc_free(doc);
 
     free(remote);
     free(remote_safe);
@@ -415,32 +639,9 @@ void cbm_ui_log_append(const char *line) {
  * so `pos += snprintf(...)` runs pos past the end on truncation and the next
  * call computes a wrapped (huge) remaining size and writes out of bounds. This
  * clamps: on truncation *pos is pinned at bufsz and further appends are no-ops. */
-static void http_appendf(char *buf, size_t bufsz, int *pos, const char *fmt, ...)
-    __attribute__((format(printf, 4, 5)));
-static void http_appendf(char *buf, size_t bufsz, int *pos, const char *fmt, ...) {
-    if (*pos < 0) {
-        return;
-    }
-    if ((size_t)*pos >= bufsz) {
-        *pos = (int)bufsz;
-        return;
-    }
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf + *pos, bufsz - (size_t)*pos, fmt, ap);
-    va_end(ap);
-    if (n < 0) {
-        return;
-    }
-    if ((size_t)n >= bufsz - (size_t)*pos) {
-        *pos = (int)bufsz;
-    } else {
-        *pos += n;
-    }
-}
-
 /* GET /api/logs?lines=N — returns last N log lines */
 static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    cbm_ui_log_init();
     char lines_str[16] = {0};
     int max_lines = 100;
     if (cbm_http_query_param(req->query, "lines", lines_str, (int)sizeof(lines_str))) {
@@ -454,64 +655,150 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     int start = (g_log_head - count + LOG_RING_SIZE) % LOG_RING_SIZE;
     int total = g_log_count;
 
-    /* Copy lines under lock */
-    size_t buf_size = (size_t)count * (LOG_LINE_MAX + 10) + 64;
-    char *buf = malloc(buf_size);
-    if (!buf) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    yyjson_mut_val *lines = doc ? yyjson_mut_arr(doc) : NULL;
+    if (!doc || !root || !lines) {
         cbm_mutex_unlock(&g_log_mutex);
+        if (doc)
+            yyjson_mut_doc_free(doc);
         cbm_http_replyf(c, 500, g_cors, "oom");
         return;
     }
-
-    int pos = 0;
-    http_appendf(buf, buf_size, &pos, "{\"lines\":[");
+    yyjson_mut_doc_set_root(doc, root);
     for (int i = 0; i < count; i++) {
         int idx = (start + i) % LOG_RING_SIZE;
-        if (i > 0)
-            buf[pos++] = ',';
-        /* Escape quotes in log lines */
-        buf[pos++] = '"';
-        for (int j = 0; g_log_ring[idx][j] && (size_t)pos < buf_size - 10; j++) {
-            char ch = g_log_ring[idx][j];
-            if (ch == '"') {
-                buf[pos++] = '\\';
-                buf[pos++] = '"';
-            } else if (ch == '\\') {
-                buf[pos++] = '\\';
-                buf[pos++] = '\\';
-            } else if (ch == '\n') {
-                buf[pos++] = '\\';
-                buf[pos++] = 'n';
-            } else {
-                buf[pos++] = ch;
-            }
-        }
-        buf[pos++] = '"';
+        if (!yyjson_mut_arr_add_strcpy(doc, lines, g_log_ring[idx]))
+            break;
     }
     cbm_mutex_unlock(&g_log_mutex);
-    http_appendf(buf, buf_size, &pos, "],\"total\":%d}", total);
+    yyjson_mut_obj_add_val(doc, root, "lines", lines);
+    yyjson_mut_obj_add_int(doc, root, "total", total);
 
-    cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
-    free(buf);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    if (json) {
+        cbm_http_replyf(c, 200, g_cors_json, "%s", json);
+        free(json);
+    } else {
+        cbm_http_replyf(c, 500, g_cors_json, "%s", "{\"error\":\"serialization failed\"}");
+    }
+    yyjson_mut_doc_free(doc);
 }
 
 /* ── Process monitoring ───────────────────────────────────────── */
 
 #ifndef _WIN32
 #include <sys/resource.h>
-#endif
-#include <signal.h>
 
-/* GET /api/processes — list codebase-memory-mcp processes via ps */
+typedef struct {
+    int pid;
+    double cpu;
+    long rss_kb;
+    char elapsed[64];
+    char command[256];
+} ui_process_info_t;
+
+/* Use only fixed, absolute system binaries. Running `ps | grep` through a
+ * shell let an inherited PATH select attacker-controlled executables. */
+static const char *ui_system_binary(const char *first, const char *second) {
+    if (first && access(first, X_OK) == 0)
+        return first;
+    if (second && access(second, X_OK) == 0)
+        return second;
+    return NULL;
+}
+
+static size_t collect_ui_processes(ui_process_info_t *out, size_t cap) {
+    const char *env_bin = ui_system_binary("/usr/bin/env", "/bin/env");
+    const char *ps_bin = ui_system_binary("/bin/ps", "/usr/bin/ps");
+    if (!env_bin || !ps_bin || !out || cap == 0)
+        return 0;
+
+    const char *argv[] = {env_bin, "LC_ALL=C", ps_bin, "-eo", "pid=,pcpu=,rss=,etime=,comm=", NULL};
+    cbm_proc_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.bin = env_bin;
+    opts.argv = argv;
+    opts.discard_stderr = true;
+
+    char *data = NULL;
+    size_t data_len = 0;
+    char output_hash[65];
+    cbm_proc_result_t result;
+    if (cbm_subprocess_capture(&opts, 1024U * 1024U, &data, &data_len, output_hash, &result) != 0 ||
+        !data) {
+        free(data);
+        return 0;
+    }
+
+    size_t count = 0;
+    char *line = data;
+    char *end = data + data_len;
+    while (line < end && count < cap) {
+        char *newline = memchr(line, '\n', (size_t)(end - line));
+        char *line_end = newline ? newline : end;
+        size_t line_len = (size_t)(line_end - line);
+        char line_buf[1024];
+        if (line_len >= sizeof(line_buf)) {
+            line = newline ? newline + 1 : end;
+            continue;
+        }
+        memcpy(line_buf, line, line_len);
+        line_buf[line_len] = '\0';
+
+        ui_process_info_t item;
+        memset(&item, 0, sizeof(item));
+        if (sscanf(line_buf, "%d %lf %ld %63s %255s", &item.pid, &item.cpu, &item.rss_kb,
+                   item.elapsed, item.command) == 5 &&
+            /* Linux TASK_COMM_LEN truncates the product name to
+             * "codebase-memory"; match that stable prefix. */
+            strstr(item.command, "codebase-memory") != NULL) {
+            out[count++] = item;
+        }
+
+        line = newline ? newline + 1 : end;
+    }
+    free(data);
+    return count;
+}
+#endif
+
+static bool owned_index_job_for_pid(uint64_t pid, uint64_t *job_id) {
+    if (job_id)
+        *job_id = 0;
+    if (pid == 0)
+        return false;
+    for (int i = 0; i < MAX_INDEX_JOBS; i++) {
+        if (atomic_load_explicit(&g_index_jobs[i].status, memory_order_acquire) != 1)
+            continue;
+        if (cbm_proc_control_pid(&g_index_jobs[i].child_control) != pid)
+            continue;
+        uint64_t id = atomic_load_explicit(&g_index_jobs[i].job_id, memory_order_acquire);
+        if (id == 0)
+            return false;
+        if (job_id)
+            *job_id = id;
+        return true;
+    }
+    return false;
+}
+
+/* GET /api/processes — list codebase-memory-mcp processes without a shell. */
 static void handle_processes(cbm_http_conn_t *c) {
-    char buf[8192];
-    int pos = 0;
+    double self_rss_mb = 0.0;
+    double user_s = 0.0;
+    double sys_s = 0.0;
+
+#ifndef _WIN32
+    ui_process_info_t processes[64];
+    size_t process_count =
+        collect_ui_processes(processes, sizeof(processes) / sizeof(processes[0]));
+#endif
 
 #ifdef _WIN32
     /* Windows: GetProcessMemoryInfo + GetProcessTimes */
     PROCESS_MEMORY_COUNTERS pmc;
     FILETIME ft_create, ft_exit, ft_kernel, ft_user;
-    double user_s = 0, sys_s = 0;
     size_t rss_bytes = 0;
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
         rss_bytes = pmc.WorkingSetSize;
@@ -524,60 +811,163 @@ static void handle_processes(cbm_http_conn_t *c) {
         user_s = (double)u.QuadPart / 1e7;
         sys_s = (double)k.QuadPart / 1e7;
     }
-    http_appendf(buf, sizeof(buf), &pos,
-                 "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
-                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[]}",
-                 (int)_getpid(), (double)rss_bytes / (1024.0 * 1024.0), user_s, sys_s);
+    self_rss_mb = (double)rss_bytes / (1024.0 * 1024.0);
 #else
     struct rusage ru;
-    getrusage(RUSAGE_SELF, &ru);
+    memset(&ru, 0, sizeof(ru));
+    (void)getrusage(RUSAGE_SELF, &ru);
     long rss_kb = ru.ru_maxrss;
 #ifdef __APPLE__
     rss_kb /= 1024;
 #endif
-    http_appendf(buf, sizeof(buf), &pos,
-                 "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
-                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[",
-                 (int)getpid(), (double)rss_kb / 1024.0,
-                 (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6,
-                 (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6);
-
-    FILE *fp = popen("LC_ALL=C ps -eo pid,pcpu,rss,etime,comm 2>/dev/null"
-                     " | grep '[c]odebase-memory-mcp'",
-                     "r");
-    int proc_count = 0;
-    if (fp) {
-        char line[1024];
-        while (fgets(line, sizeof(line), fp)) {
-            int pid = 0;
-            float cpu = 0;
-            long rss = 0;
-            char elapsed[64] = {0};
-            char comm[256] = {0};
-
-            if (sscanf(line, "%d %f %ld %63s %255s", &pid, &cpu, &rss, elapsed, comm) >= 4) {
-                if (proc_count > 0)
-                    buf[pos++] = ',';
-                http_appendf(buf, sizeof(buf), &pos,
-                             "{\"pid\":%d,\"cpu\":%.1f,\"rss_mb\":%.1f,"
-                             "\"elapsed\":\"%s\",\"command\":\"%s\",\"is_self\":%s}",
-                             pid, (double)cpu, (double)rss / 1024.0, elapsed, comm,
-                             pid == (int)getpid() ? "true" : "false");
-                if (pos >= (int)sizeof(buf)) {
-                    pos = (int)sizeof(buf) - 1;
-                }
-                proc_count++;
-            }
+    self_rss_mb = (double)rss_kb / 1024.0; /* fallback: peak RSS */
+    user_s = (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6;
+    sys_s = (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
+    for (size_t i = 0; i < process_count; i++) {
+        if (processes[i].pid == (int)getpid()) {
+            self_rss_mb = (double)processes[i].rss_kb / 1024.0; /* current RSS */
+            break;
         }
-        pclose(fp);
     }
-    http_appendf(buf, sizeof(buf), &pos, "]}");
 #endif
 
-    cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    yyjson_mut_val *arr = doc ? yyjson_mut_arr(doc) : NULL;
+    if (!doc || !root || !arr) {
+        if (doc)
+            yyjson_mut_doc_free(doc);
+        cbm_http_replyf(c, 500, g_cors_json, "%s", "{\"error\":\"oom\"}");
+        return;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+#ifdef _WIN32
+    yyjson_mut_obj_add_int(doc, root, "self_pid", (int)_getpid());
+#else
+    yyjson_mut_obj_add_int(doc, root, "self_pid", (int)getpid());
+#endif
+    yyjson_mut_obj_add_real(doc, root, "self_rss_mb", self_rss_mb);
+    yyjson_mut_obj_add_real(doc, root, "self_user_cpu_s", user_s);
+    yyjson_mut_obj_add_real(doc, root, "self_sys_cpu_s", sys_s);
+    yyjson_mut_obj_add_val(doc, root, "processes", arr);
+
+#ifndef _WIN32
+    for (size_t i = 0; i < process_count; i++) {
+        yyjson_mut_val *entry = yyjson_mut_obj(doc);
+        if (!entry)
+            break;
+        yyjson_mut_obj_add_int(doc, entry, "pid", processes[i].pid);
+        yyjson_mut_obj_add_real(doc, entry, "cpu", processes[i].cpu);
+        yyjson_mut_obj_add_real(doc, entry, "rss_mb", (double)processes[i].rss_kb / 1024.0);
+        yyjson_mut_obj_add_strcpy(doc, entry, "elapsed", processes[i].elapsed);
+        yyjson_mut_obj_add_strcpy(doc, entry, "command", processes[i].command);
+        yyjson_mut_obj_add_bool(doc, entry, "is_self", processes[i].pid == (int)getpid());
+        uint64_t job_id = 0;
+        bool killable =
+            processes[i].pid > 0 && owned_index_job_for_pid((uint64_t)processes[i].pid, &job_id);
+        yyjson_mut_obj_add_bool(doc, entry, "killable", killable);
+        char job_id_text[32];
+        snprintf(job_id_text, sizeof(job_id_text), "%llu", (unsigned long long)job_id);
+        yyjson_mut_obj_add_strcpy(doc, entry, "job_id", job_id_text);
+        yyjson_mut_arr_add_val(arr, entry);
+    }
+#else
+    /* Windows has no `ps` parser above. Expose only subprocesses whose live
+     * control objects this server owns; these are exactly the PIDs the kill
+     * endpoint can safely target without a stale-PID race. */
+    for (int i = 0; i < MAX_INDEX_JOBS; i++) {
+        if (atomic_load_explicit(&g_index_jobs[i].status, memory_order_acquire) != 1)
+            continue;
+        uint64_t pid = cbm_proc_control_pid(&g_index_jobs[i].child_control);
+        uint64_t job_id = atomic_load_explicit(&g_index_jobs[i].job_id, memory_order_acquire);
+        if (pid == 0 || pid > UINT32_MAX || job_id == 0)
+            continue;
+        HANDLE process =
+            OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, (DWORD)pid);
+        if (!process)
+            continue;
+        PROCESS_MEMORY_COUNTERS child_mem;
+        FILETIME child_create, child_exit, child_kernel, child_user;
+        double cpu = 0.0;
+        double rss_mb = 0.0;
+        if (GetProcessMemoryInfo(process, &child_mem, sizeof(child_mem)))
+            rss_mb = (double)child_mem.WorkingSetSize / (1024.0 * 1024.0);
+        if (GetProcessTimes(process, &child_create, &child_exit, &child_kernel, &child_user)) {
+            ULARGE_INTEGER kernel_ticks, user_ticks;
+            kernel_ticks.LowPart = child_kernel.dwLowDateTime;
+            kernel_ticks.HighPart = child_kernel.dwHighDateTime;
+            user_ticks.LowPart = child_user.dwLowDateTime;
+            user_ticks.HighPart = child_user.dwHighDateTime;
+            cpu = (double)(kernel_ticks.QuadPart + user_ticks.QuadPart) / 1e7;
+        }
+        CloseHandle(process);
+
+        yyjson_mut_val *entry = yyjson_mut_obj(doc);
+        if (!entry)
+            break;
+        yyjson_mut_obj_add_uint(doc, entry, "pid", pid);
+        yyjson_mut_obj_add_real(doc, entry, "cpu", cpu);
+        yyjson_mut_obj_add_real(doc, entry, "rss_mb", rss_mb);
+        yyjson_mut_obj_add_str(doc, entry, "elapsed", "");
+        yyjson_mut_obj_add_str(doc, entry, "command", "codebase-memory-mcp index worker");
+        yyjson_mut_obj_add_bool(doc, entry, "is_self", false);
+        yyjson_mut_obj_add_bool(doc, entry, "killable", true);
+        char job_id_text[32];
+        snprintf(job_id_text, sizeof(job_id_text), "%llu", (unsigned long long)job_id);
+        yyjson_mut_obj_add_strcpy(doc, entry, "job_id", job_id_text);
+        yyjson_mut_arr_add_val(arr, entry);
+    }
+#endif
+
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    if (json) {
+        cbm_http_replyf(c, 200, g_cors_json, "%s", json);
+        free(json);
+    } else {
+        cbm_http_replyf(c, 500, g_cors_json, "%s", "{\"error\":\"serialization failed\"}");
+    }
+    yyjson_mut_doc_free(doc);
 }
 
-/* POST /api/process-kill — kill a process by PID */
+static bool json_positive_u64(yyjson_val *value, uint64_t *out) {
+    if (!value || !out)
+        return false;
+    if (yyjson_is_str(value)) {
+        const char *text = yyjson_get_str(value);
+        size_t len = yyjson_get_len(value);
+        if (!text || len == 0 || len != strlen(text))
+            return false;
+        uint64_t number = 0;
+        for (size_t i = 0; i < len; i++) {
+            if (text[i] < '0' || text[i] > '9')
+                return false;
+            unsigned digit = (unsigned)(text[i] - '0');
+            if (number > (UINT64_MAX - digit) / 10U)
+                return false;
+            number = number * 10U + digit;
+        }
+        if (number == 0)
+            return false;
+        *out = number;
+        return true;
+    }
+    if (!yyjson_is_int(value))
+        return false;
+    if (yyjson_is_uint(value)) {
+        uint64_t number = yyjson_get_uint(value);
+        if (number == 0)
+            return false;
+        *out = number;
+        return true;
+    }
+    int64_t number = yyjson_get_sint(value);
+    if (number <= 0)
+        return false;
+    *out = (uint64_t)number;
+    return true;
+}
+
+/* POST /api/process-kill — request termination by PID + per-run job identity. */
 static void handle_process_kill(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     if (req->body_len == 0 || req->body_len > 256) {
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid body\"}");
@@ -590,86 +980,67 @@ static void handle_process_kill(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *v_pid = yyjson_obj_get(root, "pid");
-    if (!v_pid || !yyjson_is_int(v_pid)) {
+    yyjson_val *v_pid = yyjson_is_obj(root) ? yyjson_obj_get(root, "pid") : NULL;
+    yyjson_val *v_job_id = yyjson_is_obj(root) ? yyjson_obj_get(root, "job_id") : NULL;
+    uint64_t target_pid = 0;
+    uint64_t target_job_id = 0;
+    if (!json_positive_u64(v_pid, &target_pid) || !json_positive_u64(v_job_id, &target_job_id)) {
         yyjson_doc_free(doc);
-        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing pid\"}");
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"valid pid and job_id required\"}");
         return;
     }
-    int target_pid = (int)yyjson_get_int(v_pid);
     yyjson_doc_free(doc);
 
 #ifdef _WIN32
-    if (target_pid == (int)_getpid()) {
+    const uint64_t max_pid = UINT32_MAX;
 #else
-    if (target_pid == (int)getpid()) {
+    const uint64_t max_pid = INT_MAX;
 #endif
+    if (target_pid == 0 || target_pid > max_pid) {
+        cbm_http_replyf(c, 400, g_cors_json, "%s", "{\"error\":\"invalid pid\"}");
+        return;
+    }
+
+    /* Keep the conditional compilation outside the `if` expression. Raw C
+     * parsers see every preprocessor branch at once; splitting one control
+     * statement across branches makes the file syntactically unbalanced and
+     * can hide this security-sensitive handler from the code graph. */
+#ifdef _WIN32
+    uint64_t self_pid = (uint64_t)_getpid();
+#else
+    uint64_t self_pid = (uint64_t)getpid();
+#endif
+    if (target_pid == self_pid) {
         cbm_http_replyf(c, 400, g_cors_json,
                         "{\"error\":\"cannot kill self (use the UI server's own shutdown)\"}");
         return;
     }
 
-#ifndef _WIN32
-    /* Only allow killing PIDs that were spawned by this server (indexing jobs) */
-    {
-        bool pid_is_ours = false;
-        for (int i = 0; i < MAX_INDEX_JOBS; i++) {
-            if (atomic_load(&g_index_jobs[i].status) == 1 &&
-                g_index_jobs[i].child_pid == target_pid) {
-                pid_is_ours = true;
-                break;
-            }
-        }
-        if (!pid_is_ours) {
-            cbm_http_replyf(c, 403, g_cors_json,
-                            "{\"error\":\"can only kill server-spawned processes\"}");
-            return;
+    /* Never signal a numeric PID here. The supervisor still owns the native
+     * child relationship/HANDLE and consumes this atomic request, so an exited
+     * child's reused PID can never target an unrelated process. */
+    bool requested = false;
+    for (int i = 0; i < MAX_INDEX_JOBS; i++) {
+        if (atomic_load_explicit(&g_index_jobs[i].status, memory_order_acquire) == 1 &&
+            atomic_load_explicit(&g_index_jobs[i].job_id, memory_order_acquire) == target_job_id &&
+            cbm_proc_control_request_kill(&g_index_jobs[i].child_control, target_pid)) {
+            requested = true;
+            break;
         }
     }
-#endif
-
-#ifdef _WIN32
-    HANDLE hproc = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)target_pid);
-    if (!hproc || !TerminateProcess(hproc, 1)) {
-        if (hproc)
-            CloseHandle(hproc);
-        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"kill failed\"}");
+    if (!requested) {
+        cbm_http_replyf(c, 403, g_cors_json,
+                        "{\"error\":\"can only kill a live server-spawned process\"}");
         return;
     }
-    CloseHandle(hproc);
-#else
-    if (kill(target_pid, SIGTERM) != 0) {
-        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"kill failed\"}");
-        return;
-    }
-#endif
 
-    cbm_http_replyf(c, 200, g_cors_json, "{\"killed\":%d}", target_pid);
+    cbm_http_replyf(c, 202, g_cors_json, "{\"kill_requested\":%llu,\"job_id\":\"%llu\"}",
+                    (unsigned long long)target_pid, (unsigned long long)target_job_id);
 }
 
 /* ── Directory browser ────────────────────────────────────────── */
 
 #include <dirent.h>
-
-static void append_roots_json(char *buf, size_t bufsz, int *pos) {
-    http_appendf(buf, bufsz, pos, ",\"roots\":[");
-#ifdef _WIN32
-    DWORD drives = GetLogicalDrives();
-    int count = 0;
-    for (int i = 0; i < 26; i++) {
-        if (!(drives & (1u << i))) {
-            continue;
-        }
-        if (count++ > 0) {
-            buf[(*pos)++] = ',';
-        }
-        http_appendf(buf, bufsz, pos, "\"%c:/\"", 'A' + i);
-    }
-#else
-    http_appendf(buf, bufsz, pos, "\"/\"");
-#endif
-    http_appendf(buf, bufsz, pos, "]");
-}
 
 /* GET /api/browse?path=/some/dir — list subdirectories for file picker */
 static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
@@ -700,10 +1071,23 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
-    /* Build JSON response */
-    char buf[32768];
-    int pos = 0;
-    http_appendf(buf, sizeof(buf), &pos, "{\"path\":\"%s\",\"dirs\":[", path);
+    /* Build with yyjson rather than a fixed buffer. Besides making quotes and
+     * control bytes safe, this avoids the old overflow path where a direct
+     * comma write replaced vsnprintf's final NUL after a wide directory. */
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    yyjson_mut_val *dirs = doc ? yyjson_mut_arr(doc) : NULL;
+    yyjson_mut_val *roots = doc ? yyjson_mut_arr(doc) : NULL;
+    if (!doc || !root || !dirs || !roots) {
+        if (doc)
+            yyjson_mut_doc_free(doc);
+        closedir(dir);
+        cbm_http_replyf(c, 500, g_cors_json, "%s", "{\"error\":\"oom\"}");
+        return;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "path", path);
+    yyjson_mut_obj_add_val(doc, root, "dirs", dirs);
 
     struct dirent *ent;
     int count = 0;
@@ -714,21 +1098,14 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
         /* Check if it's actually a directory */
         char full[2048];
-        snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
+        int full_len = snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
+        if (full_len <= 0 || (size_t)full_len >= sizeof(full))
+            continue;
         if (!cbm_is_dir(full))
             continue;
 
-        if (count > 0)
-            buf[pos++] = ',';
-        /* Escape directory name to prevent XSS (e.g., names with quotes/angle brackets) */
-        {
-            char esc[512];
-            cbm_json_escape(esc, (int)sizeof(esc), ent->d_name);
-            http_appendf(buf, sizeof(buf), &pos, "\"%s\"", esc);
-        }
-        if (pos >= (int)sizeof(buf)) {
-            pos = (int)sizeof(buf) - 1;
-        }
+        if (!yyjson_mut_arr_add_strcpy(doc, dirs, ent->d_name))
+            break;
         count++;
 
         if (count >= 200)
@@ -753,14 +1130,29 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         snprintf(parent, sizeof(parent), "/");
     }
 
-    {
-        char esc_parent[2048];
-        cbm_json_escape(esc_parent, (int)sizeof(esc_parent), parent);
-        http_appendf(buf, sizeof(buf), &pos, "],\"parent\":\"%s\"", esc_parent);
-        append_roots_json(buf, sizeof(buf), &pos);
-        http_appendf(buf, sizeof(buf), &pos, "}");
+    yyjson_mut_obj_add_strcpy(doc, root, "parent", parent);
+#ifdef _WIN32
+    DWORD drives = GetLogicalDrives();
+    for (int i = 0; i < 26; i++) {
+        if (drives & (1u << i)) {
+            char drive[4] = {(char)('A' + i), ':', '/', '\0'};
+            if (!yyjson_mut_arr_add_strcpy(doc, roots, drive))
+                break;
+        }
     }
-    cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
+#else
+    yyjson_mut_arr_add_strcpy(doc, roots, "/");
+#endif
+    yyjson_mut_obj_add_val(doc, root, "roots", roots);
+
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    if (json) {
+        cbm_http_replyf(c, 200, g_cors_json, "%s", json);
+        free(json);
+    } else {
+        cbm_http_replyf(c, 500, g_cors_json, "%s", "{\"error\":\"serialization failed\"}");
+    }
+    yyjson_mut_doc_free(doc);
 }
 
 /* ── ADR endpoints ────────────────────────────────────────────── */
@@ -774,7 +1166,7 @@ static void handle_adr_get(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
 
     char db_path[1024];
-    db_path_for_project(name, db_path, sizeof(db_path));
+    cbm_http_server_project_db_path(name, db_path, sizeof(db_path));
 
     cbm_store_t *store = cbm_store_open_path(db_path);
     if (!store) {
@@ -785,36 +1177,25 @@ static void handle_adr_get(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     cbm_adr_t adr;
     memset(&adr, 0, sizeof(adr));
     if (cbm_store_adr_get(store, name, &adr) == CBM_STORE_OK && adr.content) {
-        /* Escape content for JSON — simple: replace quotes and newlines */
-        size_t clen = strlen(adr.content);
-        size_t buf_size = clen * 2 + 256;
-        char *buf = malloc(buf_size);
-        if (buf) {
-            int pos = snprintf(buf, buf_size, "{\"has_adr\":true,\"content\":\"");
-            for (size_t i = 0; i < clen && (size_t)pos < buf_size - 10; i++) {
-                char ch = adr.content[i];
-                if (ch == '"') {
-                    buf[pos++] = '\\';
-                    buf[pos++] = '"';
-                } else if (ch == '\\') {
-                    buf[pos++] = '\\';
-                    buf[pos++] = '\\';
-                } else if (ch == '\n') {
-                    buf[pos++] = '\\';
-                    buf[pos++] = 'n';
-                } else if (ch == '\r') { /* skip */
-                } else if (ch == '\t') {
-                    buf[pos++] = '\\';
-                    buf[pos++] = 't';
-                } else {
-                    buf[pos++] = ch;
-                }
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+        if (doc && root) {
+            yyjson_mut_doc_set_root(doc, root);
+            yyjson_mut_obj_add_bool(doc, root, "has_adr", true);
+            yyjson_mut_obj_add_strcpy(doc, root, "content", adr.content);
+            yyjson_mut_obj_add_strcpy(doc, root, "updated_at",
+                                      adr.updated_at ? adr.updated_at : "");
+            char *json = yyjson_mut_write(doc, 0, NULL);
+            if (json) {
+                cbm_http_replyf(c, 200, g_cors_json, "%s", json);
+                free(json);
+            } else {
+                cbm_http_replyf(c, 500, g_cors_json, "%s", "{\"error\":\"serialization failed\"}");
             }
-            http_appendf(buf, buf_size, &pos, "\",\"updated_at\":\"%s\"}",
-                         adr.updated_at ? adr.updated_at : "");
-            cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
-            free(buf);
+            yyjson_mut_doc_free(doc);
         } else {
+            if (doc)
+                yyjson_mut_doc_free(doc);
             cbm_http_replyf(c, 500, g_cors, "oom");
         }
         cbm_store_adr_free(&adr);
@@ -848,19 +1229,31 @@ static void handle_adr_save(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
     const char *proj = yyjson_get_str(v_proj);
     const char *content = yyjson_get_str(v_content);
+    if (proj[0] == '\0' || yyjson_get_len(v_proj) != strlen(proj) ||
+        yyjson_get_len(v_content) != strlen(content)) {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 400, g_cors_json, "%s", "{\"error\":\"invalid project or content\"}");
+        return;
+    }
 
     char db_path[1024];
-    db_path_for_project(proj, db_path, sizeof(db_path));
+    cbm_http_server_project_db_path(proj, db_path, sizeof(db_path));
+    if (db_path[0] == '\0') {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 404, g_cors_json, "%s", "{\"error\":\"project not found\"}");
+        return;
+    }
 
     cbm_store_t *store = cbm_store_open_path(db_path);
-    yyjson_doc_free(doc);
     if (!store) {
+        yyjson_doc_free(doc);
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
         return;
     }
 
     int rc = cbm_store_adr_store(store, proj, content);
     cbm_store_close(store);
+    yyjson_doc_free(doc);
 
     if (rc == CBM_STORE_OK) {
         cbm_http_replyf(c, 200, g_cors_json, "{\"saved\":true}");
@@ -881,63 +1274,70 @@ static bool copy_path(char *out, size_t outsz, const char *path) {
     return n > 0 && (size_t)n < outsz;
 }
 
-#ifndef _WIN32
-static bool is_executable_file(const char *path) {
-    struct stat st;
-    return path && stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
-}
-
-static bool resolve_from_path(const char *name, char *out, size_t outsz) {
-    const char *path = getenv("PATH");
-    if (!name || !name[0] || strchr(name, '/') || !path || !path[0]) {
+static bool canonical_executable(const char *path, char *out, size_t outsz) {
+    if (!path || !path[0] || !out || outsz == 0)
         return false;
-    }
-
-    const char *cur = path;
-    while (*cur) {
-        const char *colon = strchr(cur, ':');
-        size_t dir_len = colon ? (size_t)(colon - cur) : strlen(cur);
-        if (dir_len > 0 && dir_len < 900) {
-            char candidate[1024];
-            int n = snprintf(candidate, sizeof(candidate), "%.*s/%s", (int)dir_len, cur, name);
-            if (n > 0 && (size_t)n < sizeof(candidate) && is_executable_file(candidate)) {
-                return copy_path(out, outsz, candidate);
-            }
-        }
-        if (!colon) {
-            break;
-        }
-        cur = colon + 1;
-    }
-    return false;
+    char canonical[4096];
+    if (!cbm_canonical_path(path, canonical, sizeof(canonical)))
+        return false;
+#ifndef _WIN32
+    struct stat st;
+    if (stat(canonical, &st) != 0 || !S_ISREG(st.st_mode) || access(canonical, X_OK) != 0)
+        return false;
+#else
+    if (cbm_file_size(canonical) < 0)
+        return false;
+#endif
+    return copy_path(out, outsz, canonical);
 }
 
+static bool ui_path_is_absolute(const char *path) {
+    if (!path || !path[0])
+        return false;
+#ifdef _WIN32
+    return ((path[0] == '\\' && path[1] == '\\') ||
+            (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+             path[1] == ':' && (path[2] == '\\' || path[2] == '/')));
+#else
+    return path[0] == '/';
+#endif
+}
+
+#ifndef _WIN32
 static bool resolve_self_executable(char *out, size_t outsz) {
 #if defined(__APPLE__)
-    char buf[1024];
-    uint32_t sz = sizeof(buf);
-    if (_NSGetExecutablePath(buf, &sz) == 0 && buf[0]) {
-        return copy_path(out, outsz, buf);
-    }
-    return false;
+    char probe[1];
+    uint32_t size = sizeof(probe);
+    if (_NSGetExecutablePath(probe, &size) == 0)
+        return canonical_executable(probe, out, outsz);
+    if (size == 0 || size > 1024U * 1024U)
+        return false;
+    char *buf = malloc(size);
+    if (!buf)
+        return false;
+    bool ok = _NSGetExecutablePath(buf, &size) == 0 && canonical_executable(buf, out, outsz);
+    free(buf);
+    return ok;
 #else
-    char buf[1024];
+    char buf[4096];
     ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (len > 0) {
+    if (len > 0 && (size_t)len < sizeof(buf) - 1U) {
         buf[len] = '\0';
-        return copy_path(out, outsz, buf);
+        return canonical_executable(buf, out, outsz);
     }
     return false;
 #endif
 }
 #else
 static bool resolve_self_executable(char *out, size_t outsz) {
-    char buf[1024];
-    DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)sizeof(buf));
-    if (n > 0 && n < sizeof(buf)) {
-        return copy_path(out, outsz, buf);
-    }
-    return false;
+    wchar_t wide[32768];
+    DWORD n = GetModuleFileNameW(NULL, wide, (DWORD)(sizeof(wide) / sizeof(wide[0])));
+    if (n == 0 || n >= (DWORD)(sizeof(wide) / sizeof(wide[0])))
+        return false;
+    char *utf8 = cbm_wide_to_utf8(wide);
+    bool ok = utf8 && canonical_executable(utf8, out, outsz);
+    free(utf8);
+    return ok;
 }
 #endif
 
@@ -947,26 +1347,12 @@ bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t ou
     }
     out[0] = '\0';
 
-#ifndef _WIN32
-    if (argv0 && strchr(argv0, '/') && is_executable_file(argv0)) {
-        return copy_path(out, outsz, argv0);
-    }
-    if (resolve_from_path(argv0, out, outsz)) {
+    /* Honor only an explicit path. A bare argv[0] must never re-resolve through
+     * a mutable PATH/current directory after process startup. */
+    if (ui_path_is_absolute(argv0) && canonical_executable(argv0, out, outsz)) {
         return true;
     }
-#else
-    if (argv0 && argv0[0]) {
-        DWORD attrs = GetFileAttributesA(argv0);
-        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-            return copy_path(out, outsz, argv0);
-        }
-    }
-#endif
-
-    if (resolve_self_executable(out, outsz)) {
-        return true;
-    }
-    return copy_path(out, outsz, argv0);
+    return resolve_self_executable(out, outsz);
 }
 
 void cbm_http_server_set_binary_path(const char *path) {
@@ -977,177 +1363,102 @@ void cbm_http_server_set_binary_path(const char *path) {
     }
 }
 
-/* Index via subprocess — isolates crashes from the main process. */
+static void index_log_line(const char *line, void *ud) {
+    (void)ud;
+    cbm_ui_log_append(line);
+}
+
+/* Index via the shared cross-platform supervisor. The old local fork/wait loop
+ * reaped the child once, discarded that status, then interpreted ECHILD plus a
+ * zero-initialized status as success. One private descriptor now carries both
+ * output and progress; no predictable pathname is reopened by the child. */
 static void *index_thread_fn(void *arg) {
     index_job_t *job = arg;
     cbm_log_info("ui.index.start", "path", job->root_path);
 
-    /* Use stored binary path, or try to find it */
-    const char *bin = g_binary_path;
-    char self_path[1024] = {0};
-    if (!bin[0]) {
-        cbm_http_server_resolve_binary_path(NULL, self_path, sizeof(self_path));
-        bin = self_path[0] ? self_path : "codebase-memory-mcp";
-    }
-
-    char log_file[256];
-
-    /* JSON-escape root_path and optional project name. */
-    char escaped_path[2048];
-    cbm_json_escape(escaped_path, (int)sizeof(escaped_path), job->root_path);
-    char escaped_name[512];
-    cbm_json_escape(escaped_name, (int)sizeof(escaped_name), job->project_name);
-    char json_arg[4096];
-    if (job->project_name[0]) {
-        snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\",\"name\":\"%s\"}", escaped_path,
-                 escaped_name);
-    } else {
-        snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\"}", escaped_path);
-    }
-
-#ifdef _WIN32
-    snprintf(log_file, sizeof(log_file), "%s\\cbm_index_%d.log",
-             getenv("TEMP") ? getenv("TEMP") : ".", (int)_getpid());
-
-    /* Build command line for CreateProcess through the shared MS-CRT quoter so the
-     * JSON arg's embedded quotes survive the child's argv re-parse — a naive
-     * `"%s"` wrap dropped them, corrupting {"repo_path":"…"} into {repo_path:…}.
-     * --index-worker: this http_server spawn is already the crash-isolation layer,
-     * so the child runs indexing in-process rather than spawning its own supervisor
-     * (avoids redundant process nesting). */
-    char cmdline[2048];
-    const char *const idx_argv[] = {bin,      "cli", "--index-worker", "index_repository",
-                                    json_arg, NULL};
-    if (!cbm_build_win_cmdline(cmdline, sizeof(cmdline), idx_argv)) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "index command line too long");
-        atomic_store(&job->status, 3);
-        return NULL;
-    }
-    /* Wide command line: CreateProcessA would re-mangle the UTF-8 repo path through the
-     * ANSI code page at the spawn boundary, so a non-ASCII repo path never reaches the
-     * worker intact (#423/#20). Convert and spawn via CreateProcessW. */
-    wchar_t *wcmd = cbm_utf8_to_wide(cmdline);
-    if (!wcmd) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "index command line conversion failed");
-        atomic_store(&job->status, 3);
-        return NULL;
-    }
-
-    cbm_log_info("ui.index.spawn", "bin", bin, "log", log_file);
-
-    HANDLE hlog = CreateFileA(log_file, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, NULL);
-    STARTUPINFOW si_proc = {.cb = sizeof(si_proc)};
-    if (hlog != INVALID_HANDLE_VALUE) {
-        si_proc.dwFlags = STARTF_USESTDHANDLES;
-        si_proc.hStdError = hlog;
-        si_proc.hStdOutput = hlog;
-    }
-    PROCESS_INFORMATION pi = {0};
-    BOOL spawned = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, 0, NULL, NULL, &si_proc, &pi);
-    free(wcmd);
-    if (!spawned) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "CreateProcess failed");
-        atomic_store(&job->status, 3);
-        if (hlog != INVALID_HANDLE_VALUE)
-            CloseHandle(hlog);
-        return NULL;
-    }
-    if (hlog != INVALID_HANDLE_VALUE)
-        CloseHandle(hlog);
-
-    /* Poll log file while child runs */
-    long tail_pos = 0;
-    for (;;) {
-        DWORD wait = WaitForSingleObject(pi.hProcess, 500);
-        FILE *lf = fopen(log_file, "r");
-        if (lf) {
-            fseek(lf, tail_pos, SEEK_SET);
-            char line[512];
-            while (fgets(line, sizeof(line), lf)) {
-                size_t l = strlen(line);
-                if (l > 0 && line[l - 1] == '\n')
-                    line[l - 1] = '\0';
-                if (line[0])
-                    cbm_ui_log_append(line);
-            }
-            tail_pos = ftell(lf);
-            fclose(lf);
+    char bin[1024];
+    if (g_binary_path[0]) {
+        if (!copy_path(bin, sizeof(bin), g_binary_path)) {
+            snprintf(job->error_msg, sizeof(job->error_msg), "index binary path is too long");
+            atomic_store(&job->status, 3);
+            return NULL;
         }
-        if (wait == WAIT_OBJECT_0)
-            break;
-    }
-
-    DWORD win_exit = 1;
-    GetExitCodeProcess(pi.hProcess, &win_exit);
-    int exit_code = (int)win_exit;
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    (void)DeleteFileA(log_file);
-#else
-    snprintf(log_file, sizeof(log_file), "/tmp/cbm_index_%d.log", (int)getpid());
-
-    cbm_log_info("ui.index.fork", "bin", bin, "log", log_file);
-
-    pid_t child_pid = fork();
-    if (child_pid < 0) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "fork failed");
+    } else if (!cbm_http_server_resolve_binary_path(NULL, bin, sizeof(bin))) {
+        snprintf(job->error_msg, sizeof(job->error_msg), "cannot resolve index binary");
         atomic_store(&job->status, 3);
         return NULL;
     }
-    job->child_pid = child_pid;
 
-    if (child_pid == 0) {
-        FILE *lf = freopen(log_file, "w", stderr);
-        (void)lf;
-        freopen("/dev/null", "w", stdout);
-        execl(bin, bin, "cli", "--index-worker", "index_repository", json_arg, (char *)NULL);
-        _exit(127);
+    yyjson_mut_doc *arg_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *arg_root = arg_doc ? yyjson_mut_obj(arg_doc) : NULL;
+    char *json_arg = NULL;
+    if (arg_doc && arg_root) {
+        yyjson_mut_doc_set_root(arg_doc, arg_root);
+        yyjson_mut_obj_add_strcpy(arg_doc, arg_root, "repo_path", job->root_path);
+        if (job->project_name[0])
+            yyjson_mut_obj_add_strcpy(arg_doc, arg_root, "name", job->project_name);
+        json_arg = yyjson_mut_write(arg_doc, 0, NULL);
+    }
+    if (arg_doc)
+        yyjson_mut_doc_free(arg_doc);
+    if (!json_arg) {
+        snprintf(job->error_msg, sizeof(job->error_msg), "cannot serialize index request");
+        atomic_store(&job->status, 3);
+        return NULL;
     }
 
-    long tail_pos = 0;
-    for (;;) {
-        int wstatus = 0;
-        pid_t wr = waitpid(child_pid, &wstatus, WNOHANG);
-        bool child_done = (wr == child_pid);
-
-        FILE *lf = fopen(log_file, "r");
-        if (lf) {
-            fseek(lf, tail_pos, SEEK_SET);
-            char line[512];
-            while (fgets(line, sizeof(line), lf)) {
-                size_t l = strlen(line);
-                if (l > 0 && line[l - 1] == '\n')
-                    line[l - 1] = '\0';
-                if (line[0])
-                    cbm_ui_log_append(line);
-            }
-            tail_pos = ftell(lf);
-            fclose(lf);
-        }
-
-        if (child_done)
-            break;
-
-        struct timespec ts = {0, 500000000};
-        cbm_nanosleep(&ts, NULL);
+    char temp_path[1024];
+    const char *tmp_dir = cbm_tmpdir();
+    int temp_len = tmp_dir && tmp_dir[0]
+                       ? snprintf(temp_path, sizeof(temp_path), "%s/cbm-index-log-XXXXXX", tmp_dir)
+                       : -1;
+    int output_fd =
+        temp_len > 0 && (size_t)temp_len < sizeof(temp_path) ? cbm_mkstemp(temp_path) : -1;
+    if (output_fd < 0) {
+        free(json_arg);
+        snprintf(job->error_msg, sizeof(job->error_msg), "cannot create private index log");
+        atomic_store(&job->status, 3);
+        return NULL;
     }
-
-    int wstatus = 0;
-    waitpid(child_pid, &wstatus, 0);
-    int exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
-
-    (void)unlink(log_file);
+#ifndef _WIN32
+    /* The supervisor and worker retain this exact descriptor. */
+    if (cbm_unlink(temp_path) != 0) {
+        (void)ui_close_fd(output_fd);
+        free(json_arg);
+        snprintf(job->error_msg, sizeof(job->error_msg), "cannot privatize index log");
+        atomic_store(&job->status, 3);
+        return NULL;
+    }
 #endif
 
-    if (exit_code != 0) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "indexing failed (exit code %d)",
-                 exit_code);
-        atomic_store(&job->status, 3);
-    } else {
-        atomic_store(&job->status, 2);
+    const char *argv[] = {bin, "cli", "--index-worker", "index_repository", json_arg, NULL};
+    cbm_proc_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.bin = bin;
+    opts.argv = argv;
+    opts.use_output_fd = true;
+    opts.output_fd = output_fd;
+    opts.max_output_bytes = 64U * 1024U * 1024U;
+    opts.on_log_line = index_log_line;
+    opts.control = &job->child_control;
+
+    cbm_proc_result_t result;
+    int run_rc = cbm_subprocess_run(&opts, &result);
+    (void)ui_close_fd(output_fd);
+#ifdef _WIN32
+    (void)cbm_unlink(temp_path);
+#endif
+    free(json_arg);
+
+    bool clean = run_rc == 0 && result.outcome == CBM_PROC_CLEAN;
+    if (!clean) {
+        snprintf(job->error_msg, sizeof(job->error_msg), "indexing failed (%s, exit=%d, signal=%d)",
+                 cbm_proc_outcome_str(result.outcome), result.exit_code, result.term_signal);
     }
-    cbm_log_info("ui.index.done", "path", job->root_path, "rc", exit_code == 0 ? "ok" : "err");
+    cbm_log_info("ui.index.done", "path", job->root_path, "rc", clean ? "ok" : "err");
+    /* Publish terminal state only after the final access to mutable job fields;
+     * the single-threaded dispatcher may immediately reuse a terminal slot. */
+    atomic_store(&job->status, clean ? 2 : 3);
     return NULL;
 }
 
@@ -1174,6 +1485,15 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     yyjson_val *v_project_name = yyjson_obj_get(root, "project_name");
     const char *project_name = yyjson_is_str(v_project_name) ? yyjson_get_str(v_project_name) : "";
 
+    if (yyjson_get_len(v_path) != strlen(rpath) ||
+        (yyjson_is_str(v_project_name) && yyjson_get_len(v_project_name) != strlen(project_name)) ||
+        strlen(rpath) >= sizeof(g_index_jobs[0].root_path) ||
+        strlen(project_name) >= sizeof(g_index_jobs[0].project_name)) {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 400, g_cors_json, "%s", "{\"error\":\"path or name too long\"}");
+        return;
+    }
+
     /* Check path exists */
     if (!cbm_is_dir(rpath)) {
         yyjson_doc_free(doc);
@@ -1197,44 +1517,91 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
 
     index_job_t *job = &g_index_jobs[slot];
-    snprintf(job->root_path, sizeof(job->root_path), "%s", rpath);
-    snprintf(job->project_name, sizeof(job->project_name), "%s", project_name);
+    memcpy(job->root_path, rpath, strlen(rpath) + 1U);
+    memcpy(job->project_name, project_name, strlen(project_name) + 1U);
     job->error_msg[0] = '\0';
-    atomic_store(&job->status, 1);
+    cbm_proc_control_init(&job->child_control);
+    uint64_t job_id = next_index_job_id();
+    char job_id_text[32];
+    snprintf(job_id_text, sizeof(job_id_text), "%llu", (unsigned long long)job_id);
+    atomic_store_explicit(&job->job_id, job_id, memory_order_relaxed);
+    atomic_store_explicit(&job->status, 1, memory_order_release);
     yyjson_doc_free(doc);
 
     /* Spawn background thread */
     cbm_thread_t tid;
     if (cbm_thread_create(&tid, 0, index_thread_fn, job) != 0) {
-        atomic_store(&job->status, 3);
         snprintf(job->error_msg, sizeof(job->error_msg), "thread creation failed");
+        atomic_store(&job->status, 3);
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"thread creation failed\"}");
         return;
     }
     cbm_thread_detach(&tid); /* Don't leak thread handle */
 
-    cbm_http_replyf(c, 202, g_cors_json, "{\"status\":\"indexing\",\"slot\":%d,\"path\":\"%s\"}",
-                    slot, job->root_path);
+    yyjson_mut_doc *reply_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *reply = reply_doc ? yyjson_mut_obj(reply_doc) : NULL;
+    if (!reply_doc || !reply) {
+        if (reply_doc)
+            yyjson_mut_doc_free(reply_doc);
+        cbm_http_replyf(c, 202, g_cors_json, "{\"status\":\"indexing\",\"job_id\":\"%s\"}",
+                        job_id_text);
+        return;
+    }
+    yyjson_mut_doc_set_root(reply_doc, reply);
+    yyjson_mut_obj_add_str(reply_doc, reply, "status", "indexing");
+    yyjson_mut_obj_add_int(reply_doc, reply, "slot", slot);
+    yyjson_mut_obj_add_strcpy(reply_doc, reply, "job_id", job_id_text);
+    yyjson_mut_obj_add_strcpy(reply_doc, reply, "path", job->root_path);
+    char *reply_json = yyjson_mut_write(reply_doc, 0, NULL);
+    if (reply_json) {
+        cbm_http_replyf(c, 202, g_cors_json, "%s", reply_json);
+        free(reply_json);
+    } else {
+        cbm_http_replyf(c, 202, g_cors_json, "{\"status\":\"indexing\",\"job_id\":\"%s\"}",
+                        job_id_text);
+    }
+    yyjson_mut_doc_free(reply_doc);
 }
 
 /* GET /api/index-status — returns status of all index jobs */
 static void handle_index_status(cbm_http_conn_t *c) {
-    char buf[2048] = "[";
-    int pos = 1;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *jobs = doc ? yyjson_mut_arr(doc) : NULL;
+    if (!doc || !jobs) {
+        if (doc)
+            yyjson_mut_doc_free(doc);
+        cbm_http_replyf(c, 500, g_cors_json, "%s", "{\"error\":\"oom\"}");
+        return;
+    }
+    yyjson_mut_doc_set_root(doc, jobs);
     for (int i = 0; i < MAX_INDEX_JOBS; i++) {
         int st = atomic_load(&g_index_jobs[i].status);
         if (st == 0)
             continue;
-        if (pos > 1)
-            buf[pos++] = ',';
         const char *ss = st == 1 ? "indexing" : st == 2 ? "done" : "error";
-        http_appendf(buf, sizeof(buf), &pos,
-                     "{\"slot\":%d,\"status\":\"%s\",\"path\":\"%s\",\"error\":\"%s\"}", i, ss,
-                     g_index_jobs[i].root_path, st == 3 ? g_index_jobs[i].error_msg : "");
+        yyjson_mut_val *job = yyjson_mut_obj(doc);
+        if (!job)
+            break;
+        yyjson_mut_obj_add_int(doc, job, "slot", i);
+        uint64_t job_id = atomic_load_explicit(&g_index_jobs[i].job_id, memory_order_acquire);
+        char job_id_text[32];
+        snprintf(job_id_text, sizeof(job_id_text), "%llu", (unsigned long long)job_id);
+        yyjson_mut_obj_add_strcpy(doc, job, "job_id", job_id_text);
+        yyjson_mut_obj_add_strcpy(doc, job, "status", ss);
+        yyjson_mut_obj_add_uint(doc, job, "pid",
+                                cbm_proc_control_pid(&g_index_jobs[i].child_control));
+        yyjson_mut_obj_add_strcpy(doc, job, "path", g_index_jobs[i].root_path);
+        yyjson_mut_obj_add_strcpy(doc, job, "error", st == 3 ? g_index_jobs[i].error_msg : "");
+        yyjson_mut_arr_add_val(jobs, job);
     }
-    buf[pos++] = ']';
-    buf[pos] = '\0';
-    cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    if (json) {
+        cbm_http_replyf(c, 200, g_cors_json, "%s", json);
+        free(json);
+    } else {
+        cbm_http_replyf(c, 500, g_cors_json, "%s", "{\"error\":\"serialization failed\"}");
+    }
+    yyjson_mut_doc_free(doc);
 }
 
 static void unwatch_project(cbm_http_server_t *srv, const char *name) {
@@ -1253,7 +1620,7 @@ static void handle_delete_project(cbm_http_server_t *srv, cbm_http_conn_t *c,
     }
 
     char db_path[1024];
-    db_path_for_project(name, db_path, sizeof(db_path));
+    cbm_http_server_project_db_path(name, db_path, sizeof(db_path));
     if (db_path[0] == '\0') {
         cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
         return;
@@ -1290,7 +1657,7 @@ static void handle_project_health(cbm_http_conn_t *c, const cbm_http_req_t *req)
     }
 
     char db_path[1024];
-    db_path_for_project(name, db_path, sizeof(db_path));
+    cbm_http_server_project_db_path(name, db_path, sizeof(db_path));
 
     if (!cbm_file_exists(db_path)) {
         cbm_http_replyf(c, 200, g_cors_json, "{\"status\":\"missing\"}");
@@ -1339,8 +1706,11 @@ static int find_cross_repo_targets(cbm_store_t *store, const char *project, char
         const char *tp = (const char *)sqlite3_column_text(s, 0);
         if (tp && tp[0]) {
             size_t len = strlen(tp);
-            out[count] = malloc(len + 1);
-            memcpy(out[count], tp, len + 1);
+            char *copy = malloc(len + 1);
+            if (!copy)
+                break;
+            memcpy(copy, tp, len + 1);
+            out[count] = copy;
             count++;
         }
     }
@@ -1351,6 +1721,13 @@ static int find_cross_repo_targets(cbm_store_t *store, const char *project, char
 enum { LAYOUT_MAX_LINKED = 16 };
 #define LAYOUT_GALAXY_SPACING 600.0
 #define LAYOUT_GALAXY_PAD 400.0
+
+static void free_linked_targets(char **linked, int count) {
+    for (int i = 0; i < count; i++) {
+        free(linked[i]);
+        linked[i] = NULL;
+    }
+}
 
 /* Bounding-radius of a layout result: max distance from origin across all
  * nodes. Used to size galaxy spacing so satellites don't overlap the primary
@@ -1406,28 +1783,27 @@ static bool attach_missed_graph(yyjson_mut_doc *mdoc, yyjson_mut_val *mroot, cbm
     }
     yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
     yyjson_val *mlroot = yyjson_doc_get_root(mldoc);
-    yyjson_val *mn = yyjson_obj_get(mlroot, "nodes");
-    yyjson_val *me = yyjson_obj_get(mlroot, "edges");
-    if (mn) {
-        yyjson_mut_obj_add_val(mdoc, entry, "nodes", yyjson_val_mut_copy(mdoc, mn));
-    }
-    if (me) {
-        yyjson_mut_obj_add_val(mdoc, entry, "edges", yyjson_val_mut_copy(mdoc, me));
-    }
+    yyjson_val *mn = yyjson_is_obj(mlroot) ? yyjson_obj_get(mlroot, "nodes") : NULL;
+    yyjson_val *me = yyjson_is_obj(mlroot) ? yyjson_obj_get(mlroot, "edges") : NULL;
+    yyjson_mut_val *mn_copy = mn ? yyjson_val_mut_copy(mdoc, mn) : NULL;
+    yyjson_mut_val *me_copy = me ? yyjson_val_mut_copy(mdoc, me) : NULL;
+    bool copied = entry && mn_copy && me_copy &&
+                  yyjson_mut_obj_add_val(mdoc, entry, "nodes", mn_copy) &&
+                  yyjson_mut_obj_add_val(mdoc, entry, "edges", me_copy);
     yyjson_doc_free(mldoc);
+    if (!copied)
+        return false;
 
     double dist = primary_radius + miss_radius + LAYOUT_GALAXY_PAD;
     if (dist < LAYOUT_GALAXY_SPACING) {
         dist = LAYOUT_GALAXY_SPACING;
     }
     yyjson_mut_val *offset = yyjson_mut_obj(mdoc);
-    yyjson_mut_obj_add_real(mdoc, offset, "x", 0.0);
-    yyjson_mut_obj_add_real(mdoc, offset, "y", -dist);
-    yyjson_mut_obj_add_real(mdoc, offset, "z", 0.0);
-    yyjson_mut_obj_add_val(mdoc, entry, "offset", offset);
-
-    yyjson_mut_obj_add_val(mdoc, mroot, "missed_graph", entry);
-    return true;
+    return offset && yyjson_mut_obj_add_real(mdoc, offset, "x", 0.0) &&
+           yyjson_mut_obj_add_real(mdoc, offset, "y", -dist) &&
+           yyjson_mut_obj_add_real(mdoc, offset, "z", 0.0) &&
+           yyjson_mut_obj_add_val(mdoc, entry, "offset", offset) &&
+           yyjson_mut_obj_add_val(mdoc, mroot, "missed_graph", entry);
 }
 
 static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
@@ -1464,7 +1840,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
 
     char db_path[1024];
-    db_path_for_project(project, db_path, sizeof(db_path));
+    cbm_http_server_project_db_path(project, db_path, sizeof(db_path));
 
     if (!cbm_file_exists(db_path)) {
         cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
@@ -1480,17 +1856,17 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     cbm_layout_result_t *layout =
         cbm_layout_compute(store, scoped_project, CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes);
 
-    /* Find linked projects from CROSS_* edges. Keep `store` open through the
-     * linked-projects loop below so we can resolve target Route QNs against
-     * the linked stores when populating cross_edges. */
-    char *linked[LAYOUT_MAX_LINKED];
-    int linked_count = find_cross_repo_targets(store, project, linked, LAYOUT_MAX_LINKED);
-
     if (!layout) {
         cbm_store_close(store);
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"layout computation failed\"}");
         return;
     }
+
+    /* Find linked projects from CROSS_* edges. Keep `store` open through the
+     * linked-projects loop below so we can resolve target Route QNs against
+     * the linked stores when populating cross_edges. */
+    char *linked[LAYOUT_MAX_LINKED] = {0};
+    int linked_count = find_cross_repo_targets(store, project, linked, LAYOUT_MAX_LINKED);
 
     /* Capture primary cluster radius before freeing the layout. */
     double primary_radius = layout_radius(layout);
@@ -1499,6 +1875,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     char *primary_json = cbm_layout_to_json(layout);
     cbm_layout_free(layout);
     if (!primary_json) {
+        free_linked_targets(linked, linked_count);
         cbm_store_close(store);
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON serialization failed\"}");
         return;
@@ -1517,6 +1894,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     yyjson_doc *pdoc = yyjson_read(primary_json, strlen(primary_json), 0);
     free(primary_json);
     if (!pdoc) {
+        free_linked_targets(linked, linked_count);
         cbm_store_close(store);
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON parse failed\"}");
         return;
@@ -1524,25 +1902,42 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
     yyjson_mut_doc *mdoc = yyjson_doc_mut_copy(pdoc, NULL);
     yyjson_doc_free(pdoc);
-    yyjson_mut_val *mroot = yyjson_mut_doc_get_root(mdoc);
+    yyjson_mut_val *mroot = mdoc ? yyjson_mut_doc_get_root(mdoc) : NULL;
+    if (!mdoc || !mroot || !yyjson_mut_is_obj(mroot)) {
+        if (mdoc)
+            yyjson_mut_doc_free(mdoc);
+        free_linked_targets(linked, linked_count);
+        cbm_store_close(store);
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON copy failed\"}");
+        return;
+    }
 
     if (!missed_graph) {
         (void)attach_missed_graph(mdoc, mroot, store, project, primary_radius);
     }
 
     yyjson_mut_val *lp_arr = yyjson_mut_arr(mdoc);
+    if (!lp_arr) {
+        yyjson_mut_doc_free(mdoc);
+        free_linked_targets(linked, linked_count);
+        cbm_store_close(store);
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON allocation failed\"}");
+        return;
+    }
 
     for (int li = 0; li < linked_count; li++) {
         char lp_path[1024];
-        db_path_for_project(linked[li], lp_path, sizeof(lp_path));
+        cbm_http_server_project_db_path(linked[li], lp_path, sizeof(lp_path));
         if (!cbm_file_exists(lp_path)) {
             free(linked[li]);
+            linked[li] = NULL;
             continue;
         }
 
         cbm_store_t *lp_store = cbm_store_open_path(lp_path);
         if (!lp_store) {
             free(linked[li]);
+            linked[li] = NULL;
             continue;
         }
 
@@ -1553,6 +1948,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         if (!lp_layout) {
             cbm_store_close(lp_store);
             free(linked[li]);
+            linked[li] = NULL;
             continue;
         }
 
@@ -1562,6 +1958,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         if (!lp_json) {
             cbm_store_close(lp_store);
             free(linked[li]);
+            linked[li] = NULL;
             continue;
         }
 
@@ -1571,26 +1968,41 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         if (!lpdoc) {
             cbm_store_close(lp_store);
             free(linked[li]);
+            linked[li] = NULL;
             continue;
         }
 
         yyjson_mut_doc *lm = yyjson_doc_mut_copy(lpdoc, NULL);
         yyjson_doc_free(lpdoc);
-        yyjson_mut_val *lmroot = yyjson_mut_doc_get_root(lm);
+        yyjson_mut_val *lmroot = lm ? yyjson_mut_doc_get_root(lm) : NULL;
+        if (!lm || !lmroot || !yyjson_mut_is_obj(lmroot)) {
+            if (lm)
+                yyjson_mut_doc_free(lm);
+            cbm_store_close(lp_store);
+            free(linked[li]);
+            linked[li] = NULL;
+            continue;
+        }
 
         /* Build linked project entry */
         yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
-        yyjson_mut_obj_add_strcpy(mdoc, entry, "project", linked[li]);
+        if (!entry) {
+            yyjson_mut_doc_free(lm);
+            cbm_store_close(lp_store);
+            free(linked[li]);
+            linked[li] = NULL;
+            continue;
+        }
+        bool entry_ok = yyjson_mut_obj_add_strcpy(mdoc, entry, "project", linked[li]);
 
         /* Copy nodes and edges from linked layout */
         yyjson_mut_val *ln = yyjson_mut_obj_get(lmroot, "nodes");
         yyjson_mut_val *le = yyjson_mut_obj_get(lmroot, "edges");
-        if (ln) {
-            yyjson_mut_obj_add_val(mdoc, entry, "nodes", yyjson_mut_val_mut_copy(mdoc, ln));
-        }
-        if (le) {
-            yyjson_mut_obj_add_val(mdoc, entry, "edges", yyjson_mut_val_mut_copy(mdoc, le));
-        }
+        yyjson_mut_val *ln_copy = ln ? yyjson_mut_val_mut_copy(mdoc, ln) : NULL;
+        yyjson_mut_val *le_copy = le ? yyjson_mut_val_mut_copy(mdoc, le) : NULL;
+        entry_ok = entry_ok && ln_copy && le_copy &&
+                   yyjson_mut_obj_add_val(mdoc, entry, "nodes", ln_copy) &&
+                   yyjson_mut_obj_add_val(mdoc, entry, "edges", le_copy);
 
         /* Compute galaxy offset: evenly spaced around primary, far enough out
          * that the primary cluster (radius primary_radius) and the satellite
@@ -1602,10 +2014,11 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
             dist = LAYOUT_GALAXY_SPACING;
         }
         yyjson_mut_val *offset = yyjson_mut_obj(mdoc);
-        yyjson_mut_obj_add_real(mdoc, offset, "x", cos(angle) * dist);
-        yyjson_mut_obj_add_real(mdoc, offset, "y", sin(angle) * dist);
-        yyjson_mut_obj_add_real(mdoc, offset, "z", 0.0);
-        yyjson_mut_obj_add_val(mdoc, entry, "offset", offset);
+        entry_ok = entry_ok && offset &&
+                   yyjson_mut_obj_add_real(mdoc, offset, "x", cos(angle) * dist) &&
+                   yyjson_mut_obj_add_real(mdoc, offset, "y", sin(angle) * dist) &&
+                   yyjson_mut_obj_add_real(mdoc, offset, "z", 0.0) &&
+                   yyjson_mut_obj_add_val(mdoc, entry, "offset", offset);
 
         /* Populate cross_edges connecting primary→this linked galaxy. Each
          * entry: {source: <primary node id>, target: <linked node id>, type}.
@@ -1616,9 +2029,10 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
          * the cross-repo matching contract. Join edges → nodes in source to
          * pull the QN, then look it up in the linked store. */
         yyjson_mut_val *cross_arr = yyjson_mut_arr(mdoc);
+        entry_ok = entry_ok && cross_arr;
         struct sqlite3 *src_db = cbm_store_get_db(store);
         struct sqlite3 *lp_db = cbm_store_get_db(lp_store);
-        if (src_db && lp_db) {
+        if (entry_ok && src_db && lp_db) {
             sqlite3_stmt *eq = NULL;
             if (sqlite3_prepare_v2(src_db,
                                    "SELECT e.source_id, e.type, n.qualified_name "
@@ -1650,26 +2064,36 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
                     }
                     int64_t tgt_id = sqlite3_column_int64(lookup, 0);
                     yyjson_mut_val *ce = yyjson_mut_obj(mdoc);
-                    yyjson_mut_obj_add_int(mdoc, ce, "source", src_id);
-                    yyjson_mut_obj_add_int(mdoc, ce, "target", tgt_id);
-                    yyjson_mut_obj_add_strcpy(mdoc, ce, "type", etype);
-                    yyjson_mut_arr_append(cross_arr, ce);
+                    if (!ce || !yyjson_mut_obj_add_int(mdoc, ce, "source", src_id) ||
+                        !yyjson_mut_obj_add_int(mdoc, ce, "target", tgt_id) ||
+                        !yyjson_mut_obj_add_strcpy(mdoc, ce, "type", etype) ||
+                        !yyjson_mut_arr_append(cross_arr, ce)) {
+                        entry_ok = false;
+                        break;
+                    }
                 }
                 if (lookup)
                     sqlite3_finalize(lookup);
                 sqlite3_finalize(eq);
             }
         }
-        yyjson_mut_obj_add_val(mdoc, entry, "cross_edges", cross_arr);
+        entry_ok = entry_ok && yyjson_mut_obj_add_val(mdoc, entry, "cross_edges", cross_arr);
 
         cbm_store_close(lp_store);
-        yyjson_mut_arr_append(lp_arr, entry);
+        if (entry_ok)
+            (void)yyjson_mut_arr_append(lp_arr, entry);
         yyjson_mut_doc_free(lm);
         free(linked[li]);
+        linked[li] = NULL;
     }
 
+    free_linked_targets(linked, linked_count);
     cbm_store_close(store);
-    yyjson_mut_obj_add_val(mdoc, mroot, "linked_projects", lp_arr);
+    if (!yyjson_mut_obj_add_val(mdoc, mroot, "linked_projects", lp_arr)) {
+        yyjson_mut_doc_free(mdoc);
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON allocation failed\"}");
+        return;
+    }
 
     size_t len = 0;
     char *final_json = yyjson_mut_write(mdoc, 0, &len);
@@ -1711,24 +2135,27 @@ static void handle_rpc(cbm_http_conn_t *c, const cbm_http_req_t *req, cbm_mcp_se
  * name that is not loopback — a rebinding DNS host or a proxy pointed at the
  * local port — which is the DNS-rebinding / cross-site vector against a
  * localhost-only service. */
-static bool host_is_loopback(const char *host) {
-    return cbm_http_path_match(host, "localhost") || cbm_http_path_match(host, "localhost:*") ||
-           cbm_http_path_match(host, "127.0.0.1") || cbm_http_path_match(host, "127.0.0.1:*") ||
-           cbm_http_path_match(host, "[::1]") || cbm_http_path_match(host, "[::1]:*");
-}
-
 static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
                              const cbm_http_req_t *req) {
-    /* Build per-request CORS headers (only reflects localhost origins) */
-    update_cors(req);
+    /* Reflect only the exact origin serving this request. Another service on a
+     * different loopback port is cross-origin and receives no authority. */
+    update_cors(req, srv->port);
 
     /* DNS-rebinding / cross-site guard: the server binds to loopback only, so a
      * request carrying any non-loopback Host was routed here under a foreign
      * name (a rebinding DNS record, a proxy) and must be refused before it can
      * reach a state-changing endpoint. A bare request with no Host header
      * (HTTP/1.0 local tooling) is still allowed. */
-    if (req->host[0] != '\0' && !host_is_loopback(req->host)) {
-        cbm_http_replyf(c, 403, g_cors, "%s", "{\"error\":\"forbidden host\"}");
+    if (req->host[0] != '\0' && !host_matches_listener(req->host, srv->port)) {
+        cbm_http_replyf(c, 403, g_cors_json, "%s", "{\"error\":\"forbidden host\"}");
+        return;
+    }
+
+    /* CORS governs whether browser JavaScript may read a response; it does not
+     * stop a cross-site form/fetch from sending the request. Refuse every
+     * explicit foreign Origin before routing, including OPTIONS probes. */
+    if (req->origin[0] != '\0' && !origin_is_same_server(req->origin, req->host, srv->port)) {
+        cbm_http_replyf(c, 403, g_cors_json, "%s", "{\"error\":\"forbidden origin\"}");
         return;
     }
 
@@ -1739,6 +2166,14 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     /* OPTIONS preflight for CORS */
     if (strcmp(req->method, "OPTIONS") == 0) {
         cbm_http_replyf(c, 204, g_cors, "%s", "");
+        return;
+    }
+
+    /* All POST routes in this server consume JSON. Requiring the non-simple
+     * media type prevents a cross-site HTML form or sendBeacon from mutating
+     * localhost when an older client omits Origin. */
+    if (is_post && !content_type_is_json(req->content_type)) {
+        cbm_http_replyf(c, 415, g_cors_json, "%s", "{\"error\":\"application/json required\"}");
         return;
     }
 
@@ -1944,6 +2379,12 @@ int cbm_http_server_port(const cbm_http_server_t *srv) {
 void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms) {
     if (srv && srv->listener_ok) {
         cbm_httpd_set_recv_deadline_ms(srv->listener, ms);
+    }
+}
+
+void cbm_http_server_set_send_deadline_ms(cbm_http_server_t *srv, int ms) {
+    if (srv && srv->listener_ok) {
+        cbm_httpd_set_send_deadline_ms(srv->listener, ms);
     }
 }
 

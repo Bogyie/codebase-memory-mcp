@@ -1,6 +1,8 @@
 #ifndef CBM_PATH_ALIAS_H
 #define CBM_PATH_ALIAS_H
 
+#include "discover/userconfig.h"
+
 /*
  * path_alias.h — Generic build-tool path alias resolution.
  *
@@ -75,6 +77,9 @@ cbm_path_alias_collection_t *cbm_load_path_aliases(const char *repo_path);
 cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_path,
                                                             char **excluded_dirs,
                                                             int excluded_count);
+cbm_path_alias_collection_t *cbm_load_path_aliases_excluded_snapshot(
+    const char *repo_path, char **excluded_dirs, int excluded_count,
+    cbm_userconfig_snapshot_t *input_snapshot);
 
 /* Free a collection produced by cbm_load_path_aliases. NULL-safe. */
 void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll);

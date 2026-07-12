@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Canvas, useThree, useFrame } from "@react-three/fiber";
-import { OrbitControls } from "@react-three/drei";
+import { OrbitControls } from "@react-three/drei/core/OrbitControls.js";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { EffectComposer, Bloom } from "@react-three/postprocessing";
 import * as THREE from "three";
@@ -15,6 +15,10 @@ import {
   nodeBoostScale,
   type DisplaySettings,
 } from "../lib/density";
+import {
+  GRAPH_CANVAS_DPR,
+  GRAPH_COMPOSER_MULTISAMPLING,
+} from "../lib/graphLimits";
 
 const BASE_BLOOM_INTENSITY = 1.45;
 
@@ -69,8 +73,6 @@ function CameraAnimator({
 /* ── Idle auto-rotation ──────────────────────────────────── */
 
 const IDLE_TIMEOUT_MS = 60_000;
-export const GRAPH_CANVAS_DPR: [number, number] = [1, 1.5];
-export const GRAPH_COMPOSER_MULTISAMPLING = 0;
 
 function IdleAutoRotate({
   controlsRef,

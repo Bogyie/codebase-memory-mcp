@@ -91,6 +91,11 @@ void cbm_munmap(void *addr, size_t size);
 /* Monotonic nanosecond timestamp (for elapsed time measurement). */
 uint64_t cbm_now_ns(void);
 
+/* Scale QueryPerformanceCounter ticks to nanoseconds without overflowing the
+ * intermediate multiplication. Kept platform-independent for deterministic
+ * regression tests; frequency==0 returns 0. */
+uint64_t cbm_qpc_ticks_to_ns(uint64_t ticks, uint64_t frequency);
+
 /* Monotonic millisecond timestamp. */
 uint64_t cbm_now_ms(void);
 
@@ -116,23 +121,29 @@ int cbm_default_worker_count(bool initial);
 
 /* ── Environment variables ──────────────────────────────────────── */
 
-/* Thread-safe getenv: copies the value into a caller-provided buffer.
- * Returns buf on success, or fallback if the variable is unset.
- * Returns NULL when the variable is unset and fallback is NULL. */
+/* Copy an environment value into a caller-provided buffer, or copy fallback
+ * when the variable is unset. Returns buf on success. An unset variable with
+ * no fallback, invalid arguments, or a selected value that does not fit returns
+ * NULL and empties buf when buf_sz > 0. The process environment must not be
+ * mutated concurrently with this call. */
 const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback);
 
 /* ── Home directory ─────────────────────────────────────────────── */
 
-/* Cross-platform home directory: tries HOME first, then USERPROFILE (Windows).
+/* Path-returning functions below use independent thread-local buffers. A result
+ * remains valid until the next call to the same function in the current thread;
+ * concurrent calls from other threads do not overwrite it. They return NULL
+ * when no base directory is available or the resolved path does not fit. */
+
+/* Cross-platform home directory: tries HOME first, then USERPROFILE.
  * Returns NULL when neither is set. */
 const char *cbm_get_home_dir(void);
 
 /* ── App config directories ────────────────────────────────────── */
 
-/* Cross-platform app config directory (static buffer, not thread-safe).
+/* Cross-platform app config directory.
  * Windows: %APPDATA% (e.g. C:/Users/.../AppData/Roaming)
- * macOS:   $HOME (callers append Library/Application Support/...)
- * Linux:   $XDG_CONFIG_HOME or ~/.config */
+ * macOS/Linux: $XDG_CONFIG_HOME or ~/.config */
 const char *cbm_app_config_dir(void);
 
 /* Windows: %LOCALAPPDATA% (e.g. C:/Users/.../AppData/Local)
@@ -143,7 +154,7 @@ const char *cbm_app_local_dir(void);
 
 /* Resolve the database cache directory. All project indexes are stored here.
  * Priority: CBM_CACHE_DIR env var > ~/.cache/codebase-memory-mcp (default).
- * Returns static buffer or NULL if home is unavailable. */
+ * Returns NULL if home is unavailable or the resolved path does not fit. */
 const char *cbm_resolve_cache_dir(void);
 
 /* ── File system ───────────────────────────────────────────────── */
@@ -157,9 +168,10 @@ bool cbm_is_dir(const char *path);
 /* Get file size. Returns -1 on error. */
 int64_t cbm_file_size(const char *path);
 
-/* Normalize path separators to forward slashes (in-place).
- * On Windows, converts backslashes to forward slashes.
- * On POSIX, this is a no-op. Returns the input pointer. */
+/* Normalize a portable or serialized path to forward slashes (in-place) and
+ * canonicalize an ASCII drive letter. This also recognizes Windows path text
+ * on POSIX; local POSIX environment paths must not call it because backslash
+ * is a valid filename byte there. Returns the input pointer. */
 char *cbm_normalize_path_sep(char *path);
 
 #endif /* CBM_PLATFORM_H */

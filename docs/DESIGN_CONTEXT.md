@@ -142,6 +142,18 @@ the same normalized path exists. `var(--name)` references produce `USES_TOKEN` e
 file. CSS parsing is intentionally lightweight and read-only; it does not replace a browser parser or
 a token compiler.
 
+When several files define the same normalized token path, the `DesignToken` remains the stable
+canonical identity and retains every source definition in its `definitions` property. Each entry
+records source path, line, value, format, provenance, and whether it was selected as canonical. A
+`File` → `DesignToken` `DEFINES_TOKEN` edge carries the same per-definition metadata for graph
+queries. `ambiguous: true` and `definition_count` make overlaps visible instead of silently applying
+last-write-wins.
+
+Canonical selection is deterministic: higher provenance is indexed first, then DTCG, `DESIGN.md`,
+and CSS source formats; ties use repository-relative source path and the first definition in that
+file. Generated output therefore cannot replace an authoritative or observed source, but its value
+and `GENERATED_AS` relationship remain inspectable.
+
 ## Project configuration
 
 Defaults discover `DESIGN.md`, `*.tokens.json`, `*.resolver.json`, and CSS/SCSS. Override discovery or
@@ -159,9 +171,18 @@ provenance in the repository-root `.codebase-memory.json`:
 }
 ```
 
-Patterns are repository-relative and support `*`, `**`, and `?`. Each design input is capped at 8 MiB
-and normal repository ignore rules still apply. Treat `authoritative` and `generated` as provenance,
-not as build instructions: the index never writes either category.
+Patterns are repository-relative and support `*`, recursive wildcards, and `?`; matching uses a
+bounded dynamic-programming implementation and patterns are capped at 4,096 characters. Each design
+input is capped at 8 MiB and normal repository ignore rules still apply. A `DESIGN.md` that cannot be
+read completely, changes size while being read, or exceeds the cap is logged and skipped; it never
+creates an empty `DesignSystem` that appears ready. Treat `authoritative` and `generated` as
+provenance, not as build instructions: the index never writes either category.
+
+The same read contract applies to DTCG tokens, resolver metadata, CSS, and SCSS. Skips emit a
+structured `design.source_skip` warning with `source_kind`, repository-relative `path`, and a stable
+`reason` such as `open_failed`, `oversized`, or `incomplete_or_changed_read`. Allocation failure is
+not treated as an ordinary skip: it fails the staging pass so the previous good derived graph is
+preserved.
 
 Recommended source-of-truth policy:
 
@@ -185,7 +206,8 @@ get_design_context(project="my-project", limit=200, offset=200, relation_offset=
 `scope` is an exact match, so `packages.app` does not include `packages.application`. Results are
 ordered by qualified name and return `filtered_total`, `has_more_by_type`, and
 `has_more_relations`; advance `offset` and `relation_offset` until both node and relation pages are
-complete. The Design tab performs this paging automatically.
+complete. The Design tab sends token/scope filters to the server, loads an initial bounded page, and
+fetches additional pages only when **Load more** is selected.
 
 The tool returns project-local systems, tokens, components, modes, and their core relations. For
 broader exploration, use graph tools:
@@ -207,8 +229,8 @@ values, components, modes, and connected usages/aliases.
 | `DesignComponent` | A component declared by portable design frontmatter. |
 | `DesignMode` | A DTCG resolver modifier context such as `theme: dark`. |
 
-Core relationships are `PROVIDES`, `ALIASES_TO`, `OVERRIDES`, `USES_TOKEN`, `DOCUMENTED_BY`,
-`GUIDED_BY`, and `GENERATED_AS`.
+Core relationships are `PROVIDES`, `ALIASES_TO`, `OVERRIDES`, `USES_TOKEN`, `DEFINES_TOKEN`,
+`DOCUMENTED_BY`, `GUIDED_BY`, and `GENERATED_AS`.
 
 ## Global Memory is opt-in
 

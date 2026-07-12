@@ -1,11 +1,16 @@
-import { useCallback, useEffect, useState } from "react";
-import { GraphTab } from "./components/GraphTab";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { StatsTab } from "./components/StatsTab";
 import { ControlTab } from "./components/ControlTab";
 import { DesignTab } from "./components/DesignTab";
 import { MemoryTab } from "./components/MemoryTab";
 import type { TabId } from "./lib/types";
 import { useUiMessages } from "./lib/i18n";
+
+/* The WebGL graph owns nearly all of the Three.js dependency tree. Keep it out
+ * of the Projects/Memory/Control startup path and fetch it only when selected. */
+const GraphTab = lazy(() =>
+  import("./components/GraphTab").then((module) => ({ default: module.GraphTab })),
+);
 
 const TAB_IDS: TabId[] = ["graph", "design", "stats", "memory", "control"];
 
@@ -124,19 +129,27 @@ export function App() {
 
       {/* Content */}
       <main className="flex-1 min-h-0">
-        {activeTab === "graph" ? (
-          <GraphTab project={selectedProject} />
-        ) : activeTab === "design" ? (
-          <DesignTab project={selectedProject} />
-        ) : activeTab === "memory" ? (
-          <MemoryTab projectContext={selectedProject} />
-        ) : activeTab === "control" ? (
-          <ControlTab />
-        ) : (
-          <StatsTab
-            onSelectProject={(p) => navigate("graph", p)}
-          />
-        )}
+        <Suspense
+          fallback={
+            <div className="flex h-full items-center justify-center text-sm text-foreground/40">
+              {t.common.loading}
+            </div>
+          }
+        >
+          {activeTab === "graph" ? (
+            <GraphTab project={selectedProject} />
+          ) : activeTab === "design" ? (
+            <DesignTab project={selectedProject} />
+          ) : activeTab === "memory" ? (
+            <MemoryTab projectContext={selectedProject} />
+          ) : activeTab === "control" ? (
+            <ControlTab />
+          ) : (
+            <StatsTab
+              onSelectProject={(p) => navigate("graph", p)}
+            />
+          )}
+        </Suspense>
       </main>
     </div>
   );

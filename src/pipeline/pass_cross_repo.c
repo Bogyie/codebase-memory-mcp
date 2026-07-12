@@ -18,6 +18,7 @@
 #include "foundation/compat_fs.h"
 
 #include <sqlite3/sqlite3.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,12 +54,23 @@ static const char *cr_itoa(int v) {
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
 static const char *cr_cache_dir(void) {
-    const char *dir = cbm_resolve_cache_dir();
-    return dir ? dir : cbm_tmpdir();
+    return cbm_resolve_cache_dir();
 }
 
-static void cr_db_path(const char *project, char *buf, size_t bufsz) {
-    snprintf(buf, bufsz, "%s/%s.db", cr_cache_dir(), project);
+static bool cr_db_path(const char *project, char *buf, size_t bufsz) {
+    const char *dir = cr_cache_dir();
+    if (!dir || !project || !buf || bufsz == 0) {
+        if (buf && bufsz > 0) {
+            buf[0] = '\0';
+        }
+        return false;
+    }
+    int n = snprintf(buf, bufsz, "%s/%s.db", dir, project);
+    if (n <= 0 || (size_t)n >= bufsz) {
+        buf[0] = '\0';
+        return false;
+    }
+    return true;
 }
 
 /* Extract a JSON string property from properties_json.
@@ -695,8 +707,14 @@ static int match_typed_routes(cbm_store_t *src_store, const char *src_project,
 /* ── Collect target projects ─────────────────────────────────────── */
 
 /* When target_projects = ["*"], scan the cache directory for all .db files. */
+static void free_project_list(char **projects, int count);
+
 static int collect_all_projects(char ***out) {
     const char *dir = cr_cache_dir();
+    if (!dir) {
+        *out = NULL;
+        return 0;
+    }
     cbm_dir_t *d = cbm_opendir(dir);
     if (!d) {
         *out = NULL;
@@ -706,6 +724,11 @@ static int collect_all_projects(char ***out) {
     int cap = CR_INIT_CAP;
     int count = 0;
     char **projects = malloc((size_t)cap * sizeof(char *));
+    if (!projects) {
+        cbm_closedir(d);
+        *out = NULL;
+        return CBM_NOT_FOUND;
+    }
 
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
@@ -720,18 +743,39 @@ static int collect_all_projects(char ***out) {
             continue;
         }
         if (count >= cap) {
+            if (cap > INT_MAX / PAIR_LEN || (size_t)(cap * PAIR_LEN) > SIZE_MAX / sizeof(char *)) {
+                free_project_list(projects, count);
+                cbm_closedir(d);
+                *out = NULL;
+                return CBM_NOT_FOUND;
+            }
             cap *= PAIR_LEN;
             char **tmp = realloc(projects, (size_t)cap * sizeof(char *));
             if (!tmp) {
-                break;
+                free_project_list(projects, count);
+                cbm_closedir(d);
+                *out = NULL;
+                return CBM_NOT_FOUND;
             }
             projects = tmp;
         }
         /* Strip .db extension */
         projects[count] = malloc(len - PAIR_LEN);
+        if (!projects[count]) {
+            free_project_list(projects, count);
+            cbm_closedir(d);
+            *out = NULL;
+            return CBM_NOT_FOUND;
+        }
         memcpy(projects[count], ent->name, len - CR_DB_EXT_LEN);
         projects[count][len - CR_DB_EXT_LEN] = '\0';
         count++;
+    }
+    if (cbm_dir_had_error(d)) {
+        free_project_list(projects, count);
+        cbm_closedir(d);
+        *out = NULL;
+        return CBM_NOT_FOUND;
     }
     cbm_closedir(d);
 
@@ -756,7 +800,9 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
 
     /* Open source project store (read-write) */
     char src_path[CR_PATH_BUF];
-    cr_db_path(project, src_path, sizeof(src_path));
+    if (!cr_db_path(project, src_path, sizeof(src_path))) {
+        return result;
+    }
     cbm_store_t *src_store = cbm_store_open_path(src_path);
     if (!src_store) {
         return result;
@@ -786,7 +832,9 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
         }
 
         char tgt_path[CR_PATH_BUF];
-        cr_db_path(tgt, tgt_path, sizeof(tgt_path));
+        if (!cr_db_path(tgt, tgt_path, sizeof(tgt_path))) {
+            continue;
+        }
 
         /* Open target store read-write (for bidirectional edge writes) */
         cbm_store_t *tgt_store = cbm_store_open_path(tgt_path);

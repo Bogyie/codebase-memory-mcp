@@ -145,6 +145,33 @@ auditable. Repository-specific details and ADRs stay local unless explicitly pro
 import, and synchronization are explicit operations because bundles include raw source bytes and
 may contain sensitive data.
 
+`memory_commit` enforces that authorization at the API boundary: every initial commit and
+idempotent retry must include `user_approved: true`. A missing or false value does not consume the
+operation ID or change proposal state.
+
+Inline `content` ingest remains available everywhere. Reading a local `path` is disabled by
+default because an MCP caller must not gain ambient access to arbitrary user files. Configure a
+platform path-list in `CBM_MEMORY_INGEST_ROOTS` to admit regular, non-symlink files under specific
+roots. `CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST=1` is an explicit operator opt-in that removes only the
+root boundary; regular-file and symlink checks still apply.
+
+Ingested bytes are durably written to private staging first. After the canonical database
+transaction begins, the staged inode is exposed through a no-replace hard link for projection
+verification and remains linked to staging until commit. Staging and raw-prefix directories must
+be plain directories inside canonical Memory home; symlink/reparse escapes are rejected. On
+rollback, the private stage is removed but an already promoted content-addressed target is retained
+as an orphan. This avoids a non-atomic check-then-unlink that could delete a concurrent writer's
+replacement; a later ingest verifies the object before reusing it.
+
+On POSIX, Memory startup also performs best-effort garbage collection with a 24-hour grace
+period. It traverses staging and raw-object directories relative to verified directory
+descriptors, keeps staging owned by a live process, and deletes an unreferenced raw object only
+after obtaining an exclusive inode lease. Ingest and import retain a conflicting shared lease and
+a private hard-link until their database transaction finishes, including when an older orphan is
+being reused. A database lookup error is fail-closed and retains the object. Automatic raw-object
+garbage collection is currently non-mutating on Windows; deployments that override
+`CBM_MEMORY_HOME` there should use a user-private ACL and monitor stale staging separately.
+
 ## Code graph integration
 
 Memory stores symbolic `CodeRef` values (project, qualified name, file, and optional commit/tree
@@ -156,10 +183,11 @@ diagnostic query from becoming an implicit durable write.
 
 After a repository index completes, the indexer publishes an opaque graph generation only after
 file hashes, coverage metadata, and FTS are durable. Replacements are built in a sibling staging
-database and atomically installed only after the completion marker and checkpoint succeed. A
-failed rebuild therefore leaves the previous completed database at its published path. Long-running
-MCP readers keep serving that snapshot while a replacement is being built, then reopen after the
-completed file is installed. CodeRef validation runs against that completed graph. It updates only references
+database and copied into the live destination with a SQLite backup transaction only after the
+completion marker and checkpoint succeed. A failed rebuild therefore leaves the previous completed
+generation available. Existing readers retain a consistent SQLite snapshot during publication and
+later read transactions observe the completed generation; no pathname replacement or live-sidecar
+deletion is required. CodeRef validation runs against that completed graph. It updates only references
 whose resolved/missing result actually changed; a no-op reindex therefore does not create a Memory
 epoch or CodeRef revision. Connected memory is marked for review only when validation detects a
 real resolution change.
@@ -173,6 +201,10 @@ contradictions, stale claims, temporal overlap, broken links, orphan pages, dupl
 context-free experiences, decisions without alternatives or review criteria, circular/self
 support, retrieval concentration, single-agent dominance, dirty code references, pending
 materialization, and conflicting proposals.
+
+Wiki materialization failures are retried with bounded exponential backoff. `memory_status`
+separates failed and exhausted outbox work, and its `entities.total` counts entities only;
+relations remain available as a separate counter.
 
 Frequently reused or high-impact memory receives higher audit priority, never higher truth
 weight.
@@ -194,8 +226,17 @@ Phase 5 implements only:
 Bundles contain the raw source bytes by design. Before configuring a remote, users must treat the
 bundle as potentially sensitive and choose a repository with suitable visibility. Credentials are
 left to Git credential helpers or SSH agents and are never embedded in Memory metadata or logs.
+Omitting `path` keeps export/import inside managed `CBM_MEMORY_HOME` defaults. An external path
+requires `allow_external_path: true` together with `user_approved: true`. Replacing an existing
+export also requires `overwrite: true` and `user_approved: true`; races that create the destination
+are rejected rather than overwritten implicitly.
 Imports validate raw hashes, canonical relation/revision integrity, merge logical rows in a short
 transaction, rebuild the graph/FTS projection, and materialize current wiki revisions through the
-local outbox. The live database file is never replaced.
+local outbox. Raw objects are decoded into a private staging directory first and promoted with
+no-replace semantics only after the database transaction begins. A rejected or failed import
+rolls back canonical rows and removes private staging files. Already promoted content-addressed
+objects may remain as orphans rather than being conditionally unlinked; pre-existing
+objects remain untouched. Import staging and raw-prefix directories are canonical-home bounded and
+reject symlink/reparse entries. The live database file is never replaced.
 
 Remote ACLs, multi-user authorization, and a hosted database service are out of scope.

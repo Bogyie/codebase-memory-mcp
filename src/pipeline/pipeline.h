@@ -47,7 +47,7 @@ typedef enum {
 /* Create a new pipeline. Caller owns the result. */
 cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm_index_mode_t mode);
 
-/* Enable persistent artifact export (.codebase-memory/graph.db.zst).
+/* Enable generation-addressed persistent artifact export (.codebase-memory/).
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
@@ -132,6 +132,10 @@ void cbm_pipeline_get_ignored(const cbm_pipeline_t *p, cbm_ignored_file_t **out,
  * false if another pipeline is already running (non-blocking).
  * Use this in the watcher — skip reindex if busy. */
 bool cbm_pipeline_try_lock(void);
+/* True only for the thread that currently acquired the process-wide pipeline
+ * lock. Supervisor wrappers use this to share the watcher's existing lock
+ * without recursively deadlocking. */
+bool cbm_pipeline_lock_held_by_current_thread(void);
 
 /* Acquire the global index lock, blocking until available.
  * Use this in MCP handler and autoindex — wait for busy watcher to finish. */

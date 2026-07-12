@@ -21,8 +21,11 @@ concurrency:
 
 jobs:
   security:
+    permissions:
+      actions: read
+      contents: read
+      security-events: read
     uses: ./.github/workflows/_security.yml
-    secrets: inherit
 
   lint:
     uses: ./.github/workflows/_lint.yml

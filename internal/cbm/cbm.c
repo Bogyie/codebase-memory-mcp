@@ -17,6 +17,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"  // cbm_fopen — crash-supervisor per-file marker write
 #include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
+#include "foundation/sha256.h"
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
 #include "foundation/constants.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
@@ -539,26 +540,52 @@ static int count_params_from_signature(const char *sig) {
  * production runs), so a single overwrite-style marker would race across
  * workers and — worse — go stale during non-extract phases, blaming
  * whatever file was extracted LAST (that mis-quarantined four innocent
- * ms-typescript fixtures, one 15-minute retry at a time). Instead every
- * worker APPENDS one short line per event: "S <rel_path>" when it STARTS
- * work on a file, "D <rel_path>" when it finishes it. A single short
- * append of one line is atomic in practice on every target platform, and
- * the parent discards a torn final line by design. The parent's suspect
+ * ms-typescript fixtures, one 15-minute retry at a time). Every worker appends
+ * a binary length-prefixed S/D record. Unlike the old line format this can
+ * represent every legal non-NUL path, including tabs/newlines and paths longer
+ * than a fixed fgets buffer. A process-wide append lock keeps the header and
+ * payload contiguous across parallel extraction threads; the parent discards a
+ * torn final record after a crash. The parent's suspect
  * set after a crash/hang = files with an S but no D — exactly the
  * in-flight set; a file is only quarantined after appearing in the
  * suspect set of TWO CONSECUTIVE failed runs, so a stale or merely
  * unlucky in-flight file is never quarantined alone. The env var is set
  * solely by the supervisor during recovery — a no-op on normal runs. */
+enum { CBM_INDEX_RECORD_HEADER = 5 };
+#define CBM_INDEX_RECORD_MAX (1024U * 1024U)
+static atomic_flag g_index_journal_lock = ATOMIC_FLAG_INIT;
+
+bool cbm_index_journal_append(const char *path, char event, const char *rel_path) {
+    if (!path || !path[0] || !rel_path || !rel_path[0] ||
+        (event != 'S' && event != 'D' && event != 'C' && event != 'H')) {
+        return false;
+    }
+    size_t len = strlen(rel_path);
+    if (len == 0 || len > CBM_INDEX_RECORD_MAX || len > UINT32_MAX) {
+        return false;
+    }
+    while (atomic_flag_test_and_set_explicit(&g_index_journal_lock, memory_order_acquire)) {
+        cbm_usleep(1000);
+    }
+    unsigned char header[CBM_INDEX_RECORD_HEADER] = {
+        (unsigned char)event, (unsigned char)(len >> 24U), (unsigned char)(len >> 16U),
+        (unsigned char)(len >> 8U), (unsigned char)len};
+    FILE *f = cbm_fopen(path, "ab");
+    bool ok = f && fwrite(header, 1, sizeof(header), f) == sizeof(header) &&
+              fwrite(rel_path, 1, len, f) == len && fflush(f) == 0;
+    if (f && fclose(f) != 0) {
+        ok = false;
+    }
+    atomic_flag_clear_explicit(&g_index_journal_lock, memory_order_release);
+    return ok;
+}
+
 static void cbm_index_mark(const char *rel_path, char event) {
     const char *mf = getenv("CBM_INDEX_MARKER_FILE");
-    if (!mf || !mf[0] || !rel_path || !rel_path[0]) {
+    if (!mf || !mf[0]) {
         return;
     }
-    FILE *f = cbm_fopen(mf, "ab");
-    if (f) {
-        (void)fprintf(f, "%c %s\n", event, rel_path);
-        (void)fclose(f);
-    }
+    (void)cbm_index_journal_append(mf, event, rel_path);
 }
 
 void cbm_index_mark_start(const char *rel_path) {
@@ -571,7 +598,7 @@ void cbm_index_mark_done(const char *rel_path) {
 
 /* ── Crash-quarantine set (Stage 3c skip-and-continue) ──────────────────────
  * After a crash the supervisor re-runs the worker single-threaded, passing
- * CBM_INDEX_QUARANTINE_FILE — a newline-delimited list of repo-relative paths
+ * CBM_INDEX_QUARANTINE_FILE — a binary length-prefixed list of repo-relative paths
  * that already crashed the indexer and MUST NOT be extracted again. Owned here,
  * next to the other env-driven extract hooks (marker + fault injector), so the
  * single hard guard lives at the one choke point every pass funnels through
@@ -600,37 +627,30 @@ static void cbm_quarantine_load(void) {
         (void)fclose(f);
         return;
     }
-    char line[2048];
-    while (fgets(line, sizeof(line), f)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-            line[--len] = '\0';
+    unsigned char header[CBM_INDEX_RECORD_HEADER];
+    while (fread(header, 1, sizeof(header), f) == sizeof(header)) {
+        size_t len = ((size_t)header[1] << 24U) | ((size_t)header[2] << 16U) |
+                     ((size_t)header[3] << 8U) | (size_t)header[4];
+        if ((header[0] != 'C' && header[0] != 'H') || len == 0 || len > CBM_INDEX_RECORD_MAX) {
+            break;
         }
-        if (len == 0) {
-            continue;
+        char *key = malloc((size_t)len + 1U);
+        if (!key || fread(key, 1, len, f) != len) {
+            free(key);
+            break; /* torn final record or OOM: preserve the complete prefix */
         }
-        /* Line format: "path\tphase" where phase is "crash" or "hang". A bare
-         * "path" line (no tab) is tolerated and defaults to phase "crash" for
-         * backward compatibility with older quarantine files. */
-        char *tab = strchr(line, '\t');
-        const char *phase = "crash";
-        if (tab) {
-            *tab = '\0';
-            if (tab[1]) {
-                phase = tab + 1;
-            }
-        }
-        if (line[0] == '\0') {
-            continue; /* empty path (line began with a tab) — skip */
-        }
+        key[len] = '\0';
+        const char *phase = header[0] == 'H' ? "hang" : "crash";
         /* The table borrows the key + value pointers, so dup both. Intentionally
          * never freed: the set lives for the whole (short-lived worker) process.
          * The value stores the phase so cbm_index_quarantine_phase() can report
          * "crash" vs "hang"; membership (cbm_index_is_quarantined) is value != NULL. */
-        char *key = cbm_strdup(line);
         char *pval = cbm_strdup(phase);
-        if (key && pval) {
+        if (pval) {
             cbm_ht_set(set, key, (void *)pval);
+        } else {
+            free(key);
+            free(pval);
         }
     }
     (void)fclose(f);
@@ -666,6 +686,13 @@ const char *cbm_index_quarantine_phase(const char *rel_path) {
         return NULL;
     }
     return (const char *)cbm_ht_get(g_quarantine_set, rel_path);
+}
+
+void cbm_index_quarantine_reset_for_test(void) {
+    /* Tests call this only after fork, where leaking the inherited read-only
+     * table is harmless and avoids needing ownership-aware hash-table teardown. */
+    g_quarantine_set = NULL;
+    atomic_store(&g_quarantine_state, CBM_QSET_UNINIT);
 }
 
 static void cbm_test_fault_inject(const char *rel_path) {
@@ -746,6 +773,165 @@ static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
     acc->starts[acc->count] = ts_node_start_point(n).row + 1;
     acc->ends[acc->count] = ts_node_end_point(n).row + 1;
     acc->count++;
+}
+
+static void cbm_error_regions_push_lines(cbm_error_regions_t *acc, uint32_t start, uint32_t end) {
+    if (!acc || start == 0 || end < start) {
+        return;
+    }
+    for (int i = 0; i < acc->count; i++) {
+        if (end + 1 < acc->starts[i] || start > acc->ends[i] + 1) {
+            continue;
+        }
+        if (start < acc->starts[i]) {
+            acc->starts[i] = start;
+        }
+        if (end > acc->ends[i]) {
+            acc->ends[i] = end;
+        }
+        return;
+    }
+    if (acc->count >= CBM_MAX_ERROR_REGIONS) {
+        return;
+    }
+    acc->starts[acc->count] = start;
+    acc->ends[acc->count] = end;
+    acc->count++;
+}
+
+typedef enum {
+    CBM_PP_NONE = 0,
+    CBM_PP_IF,
+    CBM_PP_BRANCH,
+    CBM_PP_END,
+} cbm_pp_directive_t;
+
+static bool cbm_pp_word(const char *start, const char *end, const char *word) {
+    size_t length = strlen(word);
+    return (size_t)(end - start) >= length && strncmp(start, word, length) == 0 &&
+           (start + length == end || start[length] == ' ' || start[length] == '\t');
+}
+
+static cbm_pp_directive_t cbm_pp_directive(const char *start, const char *end) {
+    while (start < end && (*start == ' ' || *start == '\t')) {
+        start++;
+    }
+    if (start == end || *start != '#') {
+        return CBM_PP_NONE;
+    }
+    start++;
+    while (start < end && (*start == ' ' || *start == '\t')) {
+        start++;
+    }
+    if (cbm_pp_word(start, end, "if") || cbm_pp_word(start, end, "ifdef") ||
+        cbm_pp_word(start, end, "ifndef")) {
+        return CBM_PP_IF;
+    }
+    if (cbm_pp_word(start, end, "else") || cbm_pp_word(start, end, "elif")) {
+        return CBM_PP_BRANCH;
+    }
+    return cbm_pp_word(start, end, "endif") ? CBM_PP_END : CBM_PP_NONE;
+}
+
+/* Count braces outside strings and comments. Preprocessor branches that each
+ * open (or close) syntax completed after #endif are valid after preprocessing
+ * but can look balanced to tree-sitter while still swallowing an enclosing
+ * function definition. Record those ranges as best-effort misses even when
+ * the parse tree itself does not expose an ERROR node. */
+static int cbm_c_line_brace_delta(const char *start, const char *end, bool *in_block_comment) {
+    int delta = 0;
+    char quote = '\0';
+    bool escaped = false;
+    for (const char *p = start; p < end; p++) {
+        if (*in_block_comment) {
+            if (*p == '*' && p + 1 < end && p[1] == '/') {
+                *in_block_comment = false;
+                p++;
+            }
+            continue;
+        }
+        if (quote) {
+            if (escaped) {
+                escaped = false;
+            } else if (*p == '\\') {
+                escaped = true;
+            } else if (*p == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+        if (*p == '/' && p + 1 < end && p[1] == '/') {
+            break;
+        }
+        if (*p == '/' && p + 1 < end && p[1] == '*') {
+            *in_block_comment = true;
+            p++;
+            continue;
+        }
+        if (*p == '\'' || *p == '"') {
+            quote = *p;
+        } else if (*p == '{') {
+            delta++;
+        } else if (*p == '}') {
+            delta--;
+        }
+    }
+    return delta;
+}
+
+static void cbm_collect_c_preprocessor_hazards(const char *source, int source_len,
+                                               cbm_error_regions_t *acc) {
+    enum { PP_STACK_MAX = 64 };
+    typedef struct {
+        uint32_t start_line;
+        int branch_delta;
+        bool hazard;
+    } pp_frame_t;
+    pp_frame_t stack[PP_STACK_MAX];
+    int depth = 0;
+    uint32_t line = 1;
+    bool in_block_comment = false;
+    const char *cursor = source;
+    const char *limit = source + source_len;
+    while (cursor < limit) {
+        const char *end = memchr(cursor, '\n', (size_t)(limit - cursor));
+        if (!end) {
+            end = limit;
+        }
+        cbm_pp_directive_t directive =
+            in_block_comment ? CBM_PP_NONE : cbm_pp_directive(cursor, end);
+        if (directive == CBM_PP_IF) {
+            if (depth < PP_STACK_MAX) {
+                stack[depth++] = (pp_frame_t){line, 0, false};
+            }
+        } else if (directive == CBM_PP_BRANCH && depth > 0) {
+            pp_frame_t *frame = &stack[depth - 1];
+            frame->hazard |= frame->branch_delta != 0;
+            frame->branch_delta = 0;
+        } else if (directive == CBM_PP_END && depth > 0) {
+            pp_frame_t frame = stack[--depth];
+            frame.hazard |= frame.branch_delta != 0;
+            if (frame.hazard) {
+                cbm_error_regions_push_lines(acc, frame.start_line, line);
+            }
+        } else {
+            int delta = cbm_c_line_brace_delta(cursor, end, &in_block_comment);
+            if (depth > 0) {
+                stack[depth - 1].branch_delta += delta;
+            }
+        }
+        if (end == limit) {
+            break;
+        }
+        cursor = end + 1;
+        line++;
+    }
+    while (depth > 0) {
+        pp_frame_t frame = stack[--depth];
+        if (frame.hazard || frame.branch_delta != 0) {
+            cbm_error_regions_push_lines(acc, frame.start_line, line);
+        }
+    }
 }
 
 static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc) {
@@ -874,6 +1060,14 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
 
     cbm_arena_init(&result->arena);
     CBMArena *a = &result->arena;
+
+    /* Bind the result to the exact bytes this extraction will parse. File-path
+     * hashing in the persistence tail is inherently racy: the path may name a
+     * newer generation by then. Keeping the digest on the extraction result
+     * lets the orchestrator reject such a mixed-generation snapshot. */
+    if (source && source_len >= 0) {
+        cbm_sha256_hex(source, (size_t)source_len, result->source_sha256);
+    }
 
     /* Crash-quarantine hard guard (Stage 3c): a file the supervisor pinned as a
      * crasher must NEVER be parsed again. Return a clean empty result BEFORE the
@@ -1215,12 +1409,18 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
      * subtracted first — a region fully re-extracted as definitions is not a
      * miss, and a fully recovered file is not flagged at all. Detection aid
      * only: the absence of this flag is NOT a completeness guarantee. */
-    if (ts_node_has_error(root)) {
+    {
         cbm_error_regions_t regs = {{0}, {0}, 0};
-        if (strcmp(ts_node_type(root), "ERROR") == 0) {
-            cbm_error_regions_push(&regs, root); /* whole file unparseable */
-        } else {
-            cbm_collect_error_regions(root, &regs);
+        if (ts_node_has_error(root)) {
+            if (strcmp(ts_node_type(root), "ERROR") == 0) {
+                cbm_error_regions_push(&regs, root); /* whole file unparseable */
+            } else {
+                cbm_collect_error_regions(root, &regs);
+            }
+        }
+        if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_OBJC ||
+            language == CBM_LANG_CUDA) {
+            cbm_collect_c_preprocessor_hazards(source, source_len, &regs);
         }
         cbm_subtract_recovered_regions(&regs, &result->defs);
         if (regs.count > 0) {

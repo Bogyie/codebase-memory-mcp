@@ -57,6 +57,8 @@ enum {
     ST_METHOD_PROP_LEN = 8,
     ST_PATH_PROP_LEN = 6,
     ST_HANDLER_PROP_LEN = 9,
+    ST_BACKUP_BUSY_RETRIES = 50,
+    ST_BACKUP_BUSY_TIMEOUT_MS = 100,
 };
 
 #define SLEN(s) (sizeof(s) - 1)
@@ -67,6 +69,13 @@ enum {
 #include "foundation/log.h"
 #include "foundation/compat_regex.h"
 #include "foundation/str_util.h"
+#ifdef _WIN32
+#include "foundation/win_utf8.h"
+#include <windows.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#endif
 
 #define XXH_INLINE_ALL
 #include "xxhash/xxhash.h"
@@ -290,12 +299,59 @@ static int init_schema(cbm_store_t *s) {
         "CREATE TABLE IF NOT EXISTS index_snapshots ("
         "  project TEXT PRIMARY KEY,"
         "  generation TEXT NOT NULL,"
+        "  config_fingerprint TEXT NOT NULL DEFAULT '',"
+        "  input_fingerprint TEXT NOT NULL DEFAULT '',"
+        "  index_mode INTEGER NOT NULL DEFAULT -1,"
         "  completed_at TEXT NOT NULL"
         ");";
 
     int rc = exec_sql(s, ddl);
     if (rc != CBM_STORE_OK) {
         return rc;
+    }
+
+    /* Additive migration for completed DBs created before configuration was
+     * made part of the index generation.  Empty is intentionally the legacy
+     * value: the next pipeline run treats it as unknown and performs one full
+     * rebuild before incremental routing resumes. */
+    {
+        sqlite3_stmt *probe = NULL;
+        if (sqlite3_prepare_v2(s->db, "SELECT config_fingerprint FROM index_snapshots LIMIT 0;",
+                               CBM_NOT_FOUND, &probe, NULL) != SQLITE_OK) {
+            sqlite3_finalize(probe);
+            if (exec_sql(s, "ALTER TABLE index_snapshots ADD COLUMN config_fingerprint TEXT "
+                            "NOT NULL DEFAULT '';") != CBM_STORE_OK) {
+                return CBM_STORE_ERR;
+            }
+        } else {
+            sqlite3_finalize(probe);
+        }
+    }
+    {
+        sqlite3_stmt *probe = NULL;
+        if (sqlite3_prepare_v2(s->db, "SELECT input_fingerprint FROM index_snapshots LIMIT 0;",
+                               CBM_NOT_FOUND, &probe, NULL) != SQLITE_OK) {
+            sqlite3_finalize(probe);
+            if (exec_sql(s, "ALTER TABLE index_snapshots ADD COLUMN input_fingerprint TEXT "
+                            "NOT NULL DEFAULT '';") != CBM_STORE_OK) {
+                return CBM_STORE_ERR;
+            }
+        } else {
+            sqlite3_finalize(probe);
+        }
+    }
+    {
+        sqlite3_stmt *probe = NULL;
+        if (sqlite3_prepare_v2(s->db, "SELECT index_mode FROM index_snapshots LIMIT 0;",
+                               CBM_NOT_FOUND, &probe, NULL) != SQLITE_OK) {
+            sqlite3_finalize(probe);
+            if (exec_sql(s, "ALTER TABLE index_snapshots ADD COLUMN index_mode INTEGER NOT NULL "
+                            "DEFAULT -1;") != CBM_STORE_OK) {
+                return CBM_STORE_ERR;
+            }
+        } else {
+            sqlite3_finalize(probe);
+        }
     }
 
     /* Schema-compat probe (#768): DBs created before the local_name_gen
@@ -923,10 +979,16 @@ cbm_store_t *cbm_store_open(const char *project) {
     }
     const char *cdir = cbm_resolve_cache_dir();
     if (!cdir) {
-        cdir = cbm_tmpdir();
+        /* A predictable shared-temp `<project>.db` lets another local user
+         * pre-create or substitute the store when no trusted home/cache root
+         * exists. Callers must provide a real cache root instead. */
+        return NULL;
     }
     char path[CBM_SZ_1K];
-    snprintf(path, sizeof(path), "%s/%s.db", cdir, project);
+    int n = snprintf(path, sizeof(path), "%s/%s.db", cdir, project);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        return NULL;
+    }
     return store_open_internal(path, false);
 }
 
@@ -1077,70 +1139,374 @@ int cbm_store_checkpoint(cbm_store_t *s) {
 
 /* ── Dump ───────────────────────────────────────────────────────── */
 
-/* Dump entire in-memory database to a file via sqlite3_backup.
- * Writes to a temp file first, then atomically renames for crash safety.
- * sqlite3_backup_step(-1) copies ALL B-tree pages in one call —
- * the file on disk is an exact replica of the in-memory page layout. */
+typedef struct {
+#ifdef _WIN32
+    HANDLE handle;
+    DWORD volume;
+    DWORD index_high;
+    DWORD index_low;
+#else
+    int fd;
+    dev_t dev;
+    ino_t ino;
+#endif
+    int64_t size;
+    bool created;
+} store_held_file_t;
+
+static cbm_store_snapshot_install_hook_fn g_snapshot_install_hook;
+static void *g_snapshot_install_hook_userdata;
+
+void cbm_store_set_snapshot_install_hook_for_test(cbm_store_snapshot_install_hook_fn hook,
+                                                  void *userdata) {
+    g_snapshot_install_hook = hook;
+    g_snapshot_install_hook_userdata = userdata;
+}
+
+static void store_held_file_close(store_held_file_t *held) {
+    if (!held) {
+        return;
+    }
+#ifdef _WIN32
+    if (held->handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(held->handle);
+        held->handle = INVALID_HANDLE_VALUE;
+    }
+#else
+    if (held->fd >= 0) {
+        close(held->fd);
+        held->fd = -1;
+    }
+#endif
+}
+
+static bool store_held_file_open(const char *path, bool writable, bool create_exclusive,
+                                 store_held_file_t *held) {
+    if (!path || !held) {
+        return false;
+    }
+    memset(held, 0, sizeof(*held));
+    held->created = create_exclusive;
+#ifdef _WIN32
+    held->handle = INVALID_HANDLE_VALUE;
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return false;
+    }
+    DWORD disposition = create_exclusive ? CREATE_NEW : OPEN_EXISTING;
+    DWORD access = GENERIC_READ | (writable ? GENERIC_WRITE : 0);
+    HANDLE handle =
+        CreateFileW(wide, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                    disposition, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    DWORD attrs = GetFileAttributesW(wide);
+    free(wide);
+    if (handle == INVALID_HANDLE_VALUE || attrs == INVALID_FILE_ATTRIBUTES ||
+        (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+        if (handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+        }
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    if (GetFileType(handle) != FILE_TYPE_DISK || !GetFileInformationByHandle(handle, &info)) {
+        CloseHandle(handle);
+        return false;
+    }
+    held->handle = handle;
+    held->volume = info.dwVolumeSerialNumber;
+    held->index_high = info.nFileIndexHigh;
+    held->index_low = info.nFileIndexLow;
+    held->size = (int64_t)(((uint64_t)info.nFileSizeHigh << 32) | (uint64_t)info.nFileSizeLow);
+#else
+    held->fd = -1;
+    int flags = writable ? O_RDWR : O_RDONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    if (create_exclusive) {
+        flags |= O_CREAT | O_EXCL;
+    }
+    int fd = open(path, flags, 0600);
+    if (fd < 0) {
+        return false;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return false;
+    }
+    held->fd = fd;
+    held->dev = st.st_dev;
+    held->ino = st.st_ino;
+    held->size = (int64_t)st.st_size;
+#endif
+    return true;
+}
+
+static bool store_held_file_matches_path(const store_held_file_t *held, const char *path) {
+    if (!held || !path) {
+        return false;
+    }
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return false;
+    }
+    HANDLE current = CreateFileW(
+        wide, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    DWORD attrs = GetFileAttributesW(wide);
+    free(wide);
+    if (current == INVALID_HANDLE_VALUE || attrs == INVALID_FILE_ATTRIBUTES ||
+        (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        if (current != INVALID_HANDLE_VALUE) {
+            CloseHandle(current);
+        }
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    bool matches = GetFileInformationByHandle(current, &info) &&
+                   info.dwVolumeSerialNumber == held->volume &&
+                   info.nFileIndexHigh == held->index_high && info.nFileIndexLow == held->index_low;
+    CloseHandle(current);
+    return matches;
+#else
+    struct stat named;
+    return lstat(path, &named) == 0 && S_ISREG(named.st_mode) && named.st_dev == held->dev &&
+           named.st_ino == held->ino;
+#endif
+}
+
+static void store_held_file_abort(store_held_file_t *held, const char *path) {
+    bool remove_owned = held && held->created && store_held_file_matches_path(held, path);
+    store_held_file_close(held);
+    if (remove_owned) {
+        (void)cbm_unlink(path);
+        cbm_remove_db_sidecars(path);
+    }
+}
+
+/* Publish a store through SQLite's backup transaction. The destination is
+ * updated atomically at commit without replacing its pathname or unlinking
+ * WAL/SHM files that may still belong to active readers. */
+static int store_install_snapshot_db(cbm_store_t *owner, sqlite3 *source_db,
+                                     const char *dest_path) {
+    if (!source_db || !dest_path || !dest_path[0]) {
+        return CBM_STORE_ERR;
+    }
+
+    /* Create the complete parent path without truncating it.  A fixed stack
+     * copy previously turned a long destination into an unrelated directory
+     * and then ignored the mkdir failure. */
+    const char *slash = strrchr(dest_path, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(dest_path, '\\');
+    if (backslash && (!slash || backslash > slash)) {
+        slash = backslash;
+    }
+#endif
+    if (slash) {
+        size_t dir_len = slash == dest_path ? 1U : (size_t)(slash - dest_path);
+        if (dir_len == 0 || dir_len == SIZE_MAX) {
+            return CBM_STORE_ERR;
+        }
+        char *dir = (char *)malloc(dir_len + 1U);
+        if (!dir) {
+            return CBM_STORE_ERR;
+        }
+        memcpy(dir, dest_path, dir_len);
+        dir[dir_len] = '\0';
+        bool made_parent = cbm_mkdir_p(dir, 0755);
+        free(dir);
+        if (!made_parent) {
+            if (owner) {
+                store_set_error(owner, "snapshot install: cannot create destination parent");
+            }
+            return CBM_STORE_ERR;
+        }
+    }
+
+    int dest_probe = cbm_path_probe(dest_path);
+    if (dest_probe < 0) {
+        return CBM_STORE_ERR;
+    }
+    store_held_file_t held_dest;
+    bool create_dest = dest_probe == 0;
+    bool held_open = store_held_file_open(dest_path, true, create_dest, &held_dest);
+    /* Another publisher may win the CREATE_NEW/O_EXCL race after our absent
+     * probe. Re-open that exact regular file without following links; SQLite's
+     * busy handling below serializes the two backup transactions. */
+    if (!held_open && create_dest && cbm_path_probe(dest_path) == 1) {
+        held_open = store_held_file_open(dest_path, true, false, &held_dest);
+    }
+    if (!held_open) {
+        if (owner) {
+            store_set_error(owner, "snapshot install: cannot reserve regular destination");
+        }
+        return CBM_STORE_ERR;
+    }
+    bool dest_existed = !held_dest.created;
+    bool dest_was_empty = held_dest.size == 0;
+
+    cbm_store_snapshot_install_hook_fn install_hook = g_snapshot_install_hook;
+    void *install_hook_userdata = g_snapshot_install_hook_userdata;
+    g_snapshot_install_hook = NULL;
+    g_snapshot_install_hook_userdata = NULL;
+    if (install_hook) {
+        install_hook(dest_path, install_hook_userdata);
+    }
+
+    sqlite3 *dest_db = NULL;
+    int rc =
+        sqlite3_open_v2(dest_path, &dest_db,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL);
+    if (rc != SQLITE_OK) {
+        if (owner) {
+            store_set_error(owner, "snapshot install: cannot open destination");
+        }
+        if (dest_db) {
+            sqlite3_close(dest_db);
+        }
+        store_held_file_abort(&held_dest, dest_path);
+        return CBM_STORE_ERR;
+    }
+    /* sqlite3_open_v2 resolved the pathname while the reservation stayed
+     * open. Before the first PRAGMA can write, prove the name still denotes
+     * the exact regular file we reserved. */
+    if (!store_held_file_matches_path(&held_dest, dest_path)) {
+        sqlite3_close(dest_db);
+        store_held_file_abort(&held_dest, dest_path);
+        return CBM_STORE_ERR;
+    }
+
+    /* sqlite3_backup cannot change the page size of a WAL destination.  A
+     * freshly opened destination otherwise starts at SQLite's default page
+     * size, while graph-buffer dumps deliberately use a larger one.  Enabling
+     * WAL first would therefore make the very first install fail with
+     * SQLITE_READONLY.  Bind an empty destination to the source page size
+     * before entering WAL mode.  Existing graph stores were created by this
+     * same path and must already have the matching size; do not VACUUM or
+     * switch their journal mode underneath live readers merely to coerce it. */
+    sqlite3_stmt *page_stmt = NULL;
+    int source_page_size = 0;
+    if (sqlite3_prepare_v2(source_db, "PRAGMA page_size;", CBM_NOT_FOUND, &page_stmt, NULL) !=
+            SQLITE_OK ||
+        sqlite3_step(page_stmt) != SQLITE_ROW ||
+        (source_page_size = sqlite3_column_int(page_stmt, 0)) <= 0) {
+        sqlite3_finalize(page_stmt);
+        sqlite3_close(dest_db);
+        store_held_file_abort(&held_dest, dest_path);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(page_stmt);
+    if (!dest_existed || dest_was_empty) {
+        char page_sql[64];
+        int n = snprintf(page_sql, sizeof(page_sql), "PRAGMA page_size=%d;", source_page_size);
+        if (n < 0 || n >= (int)sizeof(page_sql) ||
+            sqlite3_exec(dest_db, page_sql, NULL, NULL, NULL) != SQLITE_OK) {
+            sqlite3_close(dest_db);
+            store_held_file_abort(&held_dest, dest_path);
+            return CBM_STORE_ERR;
+        }
+    }
+
+    /* Establish the destination's durable journal contract before publishing
+     * any source pages. Doing this after sqlite3_backup_finish() could report
+     * failure even though the new graph had already committed. */
+    (void)sqlite3_busy_timeout(dest_db, ST_BACKUP_BUSY_TIMEOUT_MS);
+    int journal_rc = SQLITE_ERROR;
+    for (int attempt = 0; attempt <= ST_BACKUP_BUSY_RETRIES; attempt++) {
+        journal_rc = sqlite3_exec(dest_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+        if (journal_rc != SQLITE_BUSY && journal_rc != SQLITE_LOCKED) {
+            break;
+        }
+        cbm_usleep(ST_RETRY_WAIT_US);
+    }
+    if (journal_rc != SQLITE_OK) {
+        if (owner) {
+            store_set_error(owner, "snapshot install: cannot enable WAL");
+        }
+        sqlite3_close(dest_db);
+        store_held_file_abort(&held_dest, dest_path);
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_backup *bk = sqlite3_backup_init(dest_db, "main", source_db, "main");
+    if (!bk) {
+        if (owner) {
+            store_set_error(owner, "snapshot install: backup init failed");
+        }
+        sqlite3_close(dest_db);
+        store_held_file_abort(&held_dest, dest_path);
+        return CBM_STORE_ERR;
+    }
+
+    for (int attempt = 0; attempt <= ST_BACKUP_BUSY_RETRIES; attempt++) {
+        rc = sqlite3_backup_step(bk, CBM_NOT_FOUND); /* copy ALL pages in one shot */
+        if (rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
+            break;
+        }
+        cbm_usleep(ST_RETRY_WAIT_US);
+    }
+    int finish_rc = sqlite3_backup_finish(bk);
+
+    if (rc != SQLITE_DONE || finish_rc != SQLITE_OK) {
+        if (owner) {
+            store_set_error(owner, "snapshot install: backup transaction failed");
+        }
+        sqlite3_close(dest_db);
+        store_held_file_abort(&held_dest, dest_path);
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_close(dest_db);
+    store_held_file_close(&held_dest);
+
+    return CBM_STORE_OK;
+}
+
+int cbm_store_install_snapshot_file(const char *source_path, const char *dest_path) {
+    if (!source_path || !source_path[0] || !dest_path || !dest_path[0] ||
+        strcmp(source_path, dest_path) == 0) {
+        return CBM_STORE_ERR;
+    }
+    store_held_file_t held_source;
+    if (!store_held_file_open(source_path, false, false, &held_source)) {
+        return CBM_STORE_ERR;
+    }
+    if (cbm_path_probe(dest_path) == 1 && store_held_file_matches_path(&held_source, dest_path)) {
+        store_held_file_close(&held_source);
+        return CBM_STORE_ERR;
+    }
+    sqlite3 *source_db = NULL;
+    if (sqlite3_open_v2(source_path, &source_db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+                        NULL) != SQLITE_OK) {
+        if (source_db) {
+            sqlite3_close(source_db);
+        }
+        store_held_file_close(&held_source);
+        return CBM_STORE_ERR;
+    }
+    if (!store_held_file_matches_path(&held_source, source_path)) {
+        sqlite3_close(source_db);
+        store_held_file_close(&held_source);
+        return CBM_STORE_ERR;
+    }
+    int rc = store_install_snapshot_db(NULL, source_db, dest_path);
+    sqlite3_close(source_db);
+    store_held_file_close(&held_source);
+    return rc;
+}
+
 int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     if (!s || !dest_path) {
         return CBM_STORE_ERR;
     }
 
-    /* Ensure parent directory exists */
-    char dir[CBM_SZ_1K];
-    snprintf(dir, sizeof(dir), "%s", dest_path);
-    char *sl = strrchr(dir, '/');
-    if (sl) {
-        *sl = '\0';
-        (void)cbm_mkdir(dir);
-    }
-
-    /* Write to temp file for atomic swap */
-    char tmp_path[CBM_SZ_1K];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dest_path);
-    (void)unlink(tmp_path);
-
-    sqlite3 *dest_db = NULL;
-    int rc = sqlite3_open(tmp_path, &dest_db);
-    if (rc != SQLITE_OK) {
-        store_set_error(s, "dump: cannot open temp file");
-        return CBM_STORE_ERR;
-    }
-
-    sqlite3_backup *bk = sqlite3_backup_init(dest_db, "main", s->db, "main");
-    if (!bk) {
-        store_set_error(s, "dump: backup init failed");
-        sqlite3_close(dest_db);
-        (void)unlink(tmp_path);
-        return CBM_STORE_ERR;
-    }
-
-    rc = sqlite3_backup_step(bk, CBM_NOT_FOUND); /* copy ALL pages in one shot */
-    sqlite3_backup_finish(bk);
-
-    if (rc != SQLITE_DONE) {
-        store_set_error(s, "dump: backup step failed");
-        sqlite3_close(dest_db);
-        (void)unlink(tmp_path);
-        return CBM_STORE_ERR;
-    }
-
-    /* Enable WAL on the dumped file so readers can connect concurrently */
-    sqlite3_exec(dest_db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
-    sqlite3_close(dest_db);
-
-    /* Remove the DESTINATION's leftover sidecars before installing: a
-     * stale WAL from a crashed session would be replayed on top of the
-     * fresh file at the next open — SQLite validates the WAL against its
-     * own header/checksums, not against the main file (#897). */
-    cbm_remove_db_sidecars(dest_path);
-    if (cbm_rename_replace(tmp_path, dest_path) != 0) {
-        store_set_error(s, "dump: rename failed");
-        (void)unlink(tmp_path);
-        return CBM_STORE_ERR;
-    }
-
-    return CBM_STORE_OK;
+    return store_install_snapshot_db(s, s->db, dest_path);
 }
 
 /* ── Project CRUD ───────────────────────────────────────────────── */
@@ -2191,27 +2557,48 @@ int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_co
     return exec_sql(s, "COMMIT;");
 }
 
-int cbm_store_mark_index_complete(cbm_store_t *s, const char *project) {
-    if (!s || !s->db || !project || !project[0]) {
+int cbm_store_mark_index_complete_with_inputs(cbm_store_t *s, const char *project,
+                                              const char *config_fingerprint,
+                                              const char *input_fingerprint, int index_mode) {
+    if (!s || !s->db || !project || !project[0] || !config_fingerprint || !input_fingerprint) {
         return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt = NULL;
     const char *sql =
-        "INSERT INTO index_snapshots(project,generation,completed_at) "
-        "VALUES(?1,lower(hex(randomblob(16))),strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+        "INSERT INTO "
+        "index_snapshots(project,generation,config_fingerprint,input_fingerprint,index_mode,"
+        "completed_at) "
+        "VALUES(?1,lower(hex(randomblob(16))),?2,?3,?4,"
+        "strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
         "ON CONFLICT(project) DO UPDATE SET generation=excluded.generation,"
+        "config_fingerprint=excluded.config_fingerprint,"
+        "input_fingerprint=excluded.input_fingerprint,"
+        "index_mode=excluded.index_mode,"
         "completed_at=excluded.completed_at;";
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "index snapshot prepare");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, config_fingerprint);
+    bind_text(stmt, ST_COL_3, input_fingerprint);
+    sqlite3_bind_int(stmt, CBM_SZ_4, index_mode);
     int rc = sqlite3_step(stmt) == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
     if (rc != CBM_STORE_OK) {
         store_set_error_sqlite(s, "index snapshot write");
     }
     sqlite3_finalize(stmt);
     return rc;
+}
+
+int cbm_store_mark_index_complete_with_config(cbm_store_t *s, const char *project,
+                                              const char *config_fingerprint) {
+    return cbm_store_mark_index_complete_with_inputs(s, project, config_fingerprint,
+                                                     config_fingerprint, -1);
+}
+
+int cbm_store_mark_index_complete(cbm_store_t *s, const char *project) {
+    return cbm_store_mark_index_complete_with_config(s, project, "");
 }
 
 int cbm_store_get_index_generation(cbm_store_t *s, const char *project, char **generation) {
@@ -2222,8 +2609,7 @@ int cbm_store_get_index_generation(cbm_store_t *s, const char *project, char **g
         return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db,
-                           "SELECT generation FROM index_snapshots WHERE project=?1;",
+    if (sqlite3_prepare_v2(s->db, "SELECT generation FROM index_snapshots WHERE project=?1;",
                            CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         /* Legacy databases do not have index_snapshots. Callers may continue
          * using an already-open legacy store, but must not treat it as a newly
@@ -2238,6 +2624,88 @@ int cbm_store_get_index_generation(cbm_store_t *s, const char *project, char **g
         rc = *generation ? CBM_STORE_OK : CBM_STORE_ERR;
     } else if (step != SQLITE_DONE) {
         store_set_error_sqlite(s, "index snapshot read");
+        rc = CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+int cbm_store_get_index_config_fingerprint(cbm_store_t *s, const char *project,
+                                           char **fingerprint) {
+    if (fingerprint) {
+        *fingerprint = NULL;
+    }
+    if (!s || !s->db || !project || !fingerprint) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT config_fingerprint FROM index_snapshots WHERE project=?1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int step = sqlite3_step(stmt);
+    int rc = CBM_STORE_NOT_FOUND;
+    if (step == SQLITE_ROW) {
+        const unsigned char *text = sqlite3_column_text(stmt, 0);
+        *fingerprint = heap_strdup(text ? (const char *)text : "");
+        rc = *fingerprint ? CBM_STORE_OK : CBM_STORE_ERR;
+    } else if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "index config fingerprint read");
+        rc = CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+int cbm_store_get_index_input_fingerprint(cbm_store_t *s, const char *project, char **fingerprint) {
+    if (fingerprint) {
+        *fingerprint = NULL;
+    }
+    if (!s || !s->db || !project || !fingerprint) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "SELECT input_fingerprint FROM index_snapshots WHERE project=?1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int step = sqlite3_step(stmt);
+    int rc = CBM_STORE_NOT_FOUND;
+    if (step == SQLITE_ROW) {
+        const unsigned char *value = sqlite3_column_text(stmt, 0);
+        *fingerprint = heap_strdup(value ? (const char *)value : "");
+        rc = *fingerprint ? CBM_STORE_OK : CBM_STORE_ERR;
+    } else if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "index input fingerprint read");
+        rc = CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+int cbm_store_get_index_mode(cbm_store_t *s, const char *project, int *index_mode) {
+    if (index_mode) {
+        *index_mode = -1;
+    }
+    if (!s || !s->db || !project || !index_mode) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "SELECT index_mode FROM index_snapshots WHERE project=?1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int step = sqlite3_step(stmt);
+    int rc = CBM_STORE_NOT_FOUND;
+    if (step == SQLITE_ROW) {
+        *index_mode = sqlite3_column_int(stmt, 0);
+        rc = CBM_STORE_OK;
+    } else if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "index mode read");
         rc = CBM_STORE_ERR;
     }
     sqlite3_finalize(stmt);

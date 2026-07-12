@@ -1,13 +1,15 @@
 # Reusable: security-static + CodeQL gate.
-# Runs independently from lint/test/build — does not block the main pipeline.
-# Affects overall workflow success status.
+# Runs as a separate reusable job group. Whether it blocks later jobs depends
+# on the caller; release workflows make it a publication prerequisite.
 name: Security Gate
 
 on:
   workflow_call: {}
 
 permissions:
+  actions: read
   contents: read
+  security-events: read
 
 jobs:
   security-static:
@@ -67,20 +69,30 @@ jobs:
           done
           echo "BLOCKED: CodeQL timeout"; exit 1
 
-      - name: Check for open code scanning alerts
+      - name: Check for open first-party CodeQL alerts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          ANALYSIS_SHA: ${{ github.sha }}
         run: |
           echo "Waiting 60s for alert API to settle..."
           sleep 60
-          ALERTS=$(gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' --jq 'length' 2>/dev/null || echo "0")
-          sleep 15
-          ALERTS2=$(gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' --jq 'length' 2>/dev/null || echo "0")
-          [ "$ALERTS" -lt "$ALERTS2" ] && ALERTS=$ALERTS2
-          if [ "$ALERTS" -gt 0 ]; then
-            echo "BLOCKED: $ALERTS open alert(s)"
-            gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' \
-              --jq '.[] | "  #\(.number) [\(.rule.security_severity_level // .rule.severity)] \(.rule.id) — \(.most_recent_instance.location.path):\(.most_recent_instance.location.start_line)"' 2>/dev/null || true
+          API='repos/${{ github.repository }}/code-scanning/alerts?state=open&tool_name=CodeQL&per_page=100'
+          if ! JSON=$(gh api --paginate --slurp "$API"); then
+            echo "BLOCKED: unable to read code scanning alerts" >&2
             exit 1
           fi
-          echo "=== CodeQL gate passed (0 alerts) ==="
+          ALERTS=$(jq --arg head "$CURRENT_SHA" --arg analysis "$ANALYSIS_SHA" '[.[][] | select(.most_recent_instance.commit_sha == $head or .most_recent_instance.commit_sha == $analysis) | select(.most_recent_instance.location.path | startswith("internal/cbm/vendored/") | not)] | length' <<<"$JSON")
+          sleep 15
+          if ! JSON2=$(gh api --paginate --slurp "$API"); then
+            echo "BLOCKED: unable to re-read code scanning alerts" >&2
+            exit 1
+          fi
+          ALERTS2=$(jq --arg head "$CURRENT_SHA" --arg analysis "$ANALYSIS_SHA" '[.[][] | select(.most_recent_instance.commit_sha == $head or .most_recent_instance.commit_sha == $analysis) | select(.most_recent_instance.location.path | startswith("internal/cbm/vendored/") | not)] | length' <<<"$JSON2")
+          [ "$ALERTS" -lt "$ALERTS2" ] && ALERTS=$ALERTS2
+          if [ "$ALERTS" -gt 0 ]; then
+            echo "BLOCKED: $ALERTS open first-party CodeQL alert(s) on $CURRENT_SHA"
+            jq -r --arg head "$CURRENT_SHA" --arg analysis "$ANALYSIS_SHA" '.[][] | select(.most_recent_instance.commit_sha == $head or .most_recent_instance.commit_sha == $analysis) | select(.most_recent_instance.location.path | startswith("internal/cbm/vendored/") | not) | "  #\(.number) [\(.rule.security_severity_level // .rule.severity)] \(.rule.id) — \(.most_recent_instance.location.path):\(.most_recent_instance.location.start_line)"' <<<"$JSON2"
+            exit 1
+          fi
+          echo "=== CodeQL gate passed (0 open first-party alerts on $CURRENT_SHA) ==="

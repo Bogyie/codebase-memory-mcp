@@ -7,6 +7,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <store/store.h>
+#include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -696,6 +697,17 @@ TEST(store_dump_to_file) {
     int rc = cbm_store_dump_to_file(s, path);
     ASSERT_EQ(rc, CBM_STORE_OK);
     cbm_store_close(s);
+
+    /* The journal contract must be established before publication, not by
+     * the higher-level store opener after the new pages are already live. */
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open_v2(path, &raw, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    sqlite3_stmt *journal = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(raw, "PRAGMA journal_mode;", -1, &journal, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(journal), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(journal, 0), "wal");
+    sqlite3_finalize(journal);
+    sqlite3_close(raw);
 
     /* Open dumped file and verify data */
     cbm_store_t *disk = cbm_store_open_path(path);

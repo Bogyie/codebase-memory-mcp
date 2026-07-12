@@ -229,6 +229,15 @@ static int incremental_setup(void) {
         return -1;
     }
 
+    /* --branch selects the 0.99.1 tag and leaves this fixture detached, so a
+     * default detect_changes call would otherwise have no local `main` ref to
+     * compare. Keep the fixture aligned with the tool schema's default while
+     * the explicit HEAD/since tests below continue to cover detached refs. */
+    snprintf(cmd, sizeof(cmd), "git -C '%s' branch -f main HEAD 2>&1", g_repodir);
+    if (system(cmd) != 0) {
+        return -1;
+    }
+
     g_project = cbm_project_name_from_path(g_repodir);
     if (!g_project)
         return -1;

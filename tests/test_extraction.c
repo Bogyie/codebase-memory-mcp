@@ -933,6 +933,34 @@ TEST(yaml_variables) {
     PASS();
 }
 
+TEST(yaml_config_paths_escape_dots_and_backslashes_per_segment) {
+    CBMFileResult *r =
+        extract("a.b: literal\na:\n  b: nested\na\\\\b: slash\n", CBM_LANG_YAML, "t", "config.yml");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *literal_dot = NULL;
+    const CBMDefinition *nested_dot = NULL;
+    const CBMDefinition *literal_slash = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *definition = &r->defs.items[i];
+        if (definition->config_path && strcmp(definition->config_path, "a\\.b") == 0) {
+            literal_dot = definition;
+        } else if (definition->config_path && strcmp(definition->config_path, "a.b") == 0) {
+            nested_dot = definition;
+        } else if (definition->config_path && strcmp(definition->config_path, "a\\\\\\\\b") == 0) {
+            literal_slash = definition;
+        }
+    }
+    ASSERT_NOT_NULL(literal_dot);
+    ASSERT_NOT_NULL(nested_dot);
+    ASSERT_NOT_NULL(literal_slash);
+    ASSERT_TRUE(strcmp(literal_dot->qualified_name, nested_dot->qualified_name) != 0);
+    ASSERT_NOT_NULL(strstr(literal_dot->qualified_name, "a\\.b"));
+    ASSERT_NOT_NULL(strstr(nested_dot->qualified_name, "a.b"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(yaml_config_path_cap_is_shared_across_documents) {
     size_t cap = 65536;
     char *source = malloc(cap);
@@ -3618,6 +3646,7 @@ SUITE(extraction) {
 
     /* Markup/Config */
     RUN_TEST(yaml_variables);
+    RUN_TEST(yaml_config_paths_escape_dots_and_backslashes_per_segment);
     RUN_TEST(yaml_config_path_cap_is_shared_across_documents);
     RUN_TEST(hcl_blocks);
     RUN_TEST(sql_create_table);

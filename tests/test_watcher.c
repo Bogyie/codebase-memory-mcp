@@ -6,6 +6,8 @@
  */
 #include "../src/foundation/compat.h"
 #include "../src/foundation/platform.h"
+#include "../src/foundation/subprocess.h"
+#include "../src/git/git_context.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <watcher/watcher.h>
@@ -17,6 +19,10 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+extern bool cbm_watcher_build_db_paths_for_test(const char *cache_dir, const char *project_name,
+                                                char *path, size_t path_size, char *wal,
+                                                size_t wal_size, char *shm, size_t shm_size);
+
 /* Portable git: `git -C "<dir>" <args>` with identity + non-interactive
  * config injected via -c, so it needs no global config and no POSIX shell
  * (runs under cmd.exe on Windows). Returns the git exit status. */
@@ -27,6 +33,56 @@ static int wt_git(const char *dir, const char *args) {
              "-c init.defaultBranch=master -c commit.gpgsign=false %s",
              dir, args);
     return system(cmd);
+}
+
+/* Direct argv helper for path/injection regressions. Unlike wt_git(), this can
+ * safely pass quotes, newlines, leading dashes, and other shell syntax as data. */
+static int wt_gitv_bin(const char *git_binary, const char *dir, const char *const *args) {
+    if (!git_binary || !dir || !args) {
+        return -1;
+    }
+    const char *argv[32];
+    size_t argc = 0;
+    argv[argc++] = git_binary;
+    argv[argc++] = "-C";
+    argv[argc++] = dir;
+    argv[argc++] = "-c";
+    argv[argc++] = "user.name=t";
+    argv[argc++] = "-c";
+    argv[argc++] = "user.email=t@t.io";
+    argv[argc++] = "-c";
+    argv[argc++] = "init.defaultBranch=master";
+    argv[argc++] = "-c";
+    argv[argc++] = "commit.gpgsign=false";
+    for (size_t i = 0; args[i]; i++) {
+        if (argc + 1U >= sizeof(argv) / sizeof(argv[0])) {
+            return -1;
+        }
+        argv[argc++] = args[i];
+    }
+    argv[argc] = NULL;
+
+    cbm_proc_opts_t opts = {
+        .bin = git_binary,
+        .argv = argv,
+        .quiet_timeout_ms = 30000,
+        .discard_stderr = true,
+    };
+    char *data = NULL;
+    size_t len = 0;
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_proc_result_t process;
+    int rc = cbm_subprocess_capture(&opts, 4U * 1024U * 1024U, &data, &len, digest, &process);
+    free(data);
+    return rc;
+}
+
+static int wt_gitv(const char *dir, const char *const *args) {
+    char git_binary[4096];
+    if (!cbm_git_resolve_binary(git_binary, sizeof(git_binary))) {
+        return -1;
+    }
+    return wt_gitv_bin(git_binary, dir, args);
 }
 /* Build "<dir>/<rel>" into buf (forward slashes work on Windows + git). */
 static const char *wt_path(char *buf, size_t n, const char *dir, const char *rel) {
@@ -295,6 +351,19 @@ TEST(watcher_prunes_sustained_missing_root) {
     cbm_watcher_free(w);
     cbm_store_close(store);
     prune_fixture_teardown(&f);
+    PASS();
+}
+
+TEST(watcher_rejects_truncated_database_sidecar_paths) {
+    char cache[1024];
+    memset(cache, 'c', sizeof(cache) - 1U);
+    cache[0] = '/';
+    cache[sizeof(cache) - 1U] = '\0';
+    char db[1024] = "unchanged-db";
+    char wal[1024] = "unchanged-wal";
+    char shm[1024] = "unchanged-shm";
+    ASSERT_FALSE(cbm_watcher_build_db_paths_for_test(cache, "stale-project", db, sizeof(db), wal,
+                                                     sizeof(wal), shm, sizeof(shm)));
     PASS();
 }
 
@@ -597,6 +666,240 @@ TEST(watcher_detects_new_file) {
     cbm_watcher_free(w);
     cbm_store_close(store);
     th_rmtree(tmpdir);
+    PASS();
+}
+
+#ifndef _WIN32
+TEST(watcher_repo_path_is_argv_data) {
+    char base[256];
+    snprintf(base, sizeof(base), "/tmp/cbm_watcher_argv_path_XXXXXX");
+    if (!cbm_mkdtemp(base)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    const char *marker = "cbm_watcher_shell_injected";
+    (void)cbm_unlink(marker);
+    char repo[768];
+    snprintf(repo, sizeof(repo), "%s/-repo\";touch %s;#'$()\n", base, marker);
+    if (th_mkdir_p(repo) != 0) {
+        th_rmtree(base);
+        FAIL("special repo mkdir failed");
+    }
+
+    const char *init_args[] = {"init", "-q", NULL};
+    const char *tracked_name = "-tracked\nfile.txt";
+    const char *add_args[] = {"add", "--", tracked_name, NULL};
+    const char *commit_args[] = {"commit", "-q", "-m", "init", NULL};
+    char tracked_path[1024];
+    snprintf(tracked_path, sizeof(tracked_path), "%s/%s", repo, tracked_name);
+    if (wt_gitv(repo, init_args) != 0 || th_write_file(tracked_path, "hello\n") != 0 ||
+        wt_gitv(repo, add_args) != 0 || wt_gitv(repo, commit_args) != 0) {
+        th_rmtree(base);
+        FAIL("special repo setup failed");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "argv-repo", repo);
+    int watched = cbm_watcher_watch_count(w);
+    index_call_count = 0;
+    cbm_watcher_poll_once(w);
+    th_append_file(tracked_path, "dirty\n");
+    cbm_watcher_touch(w, "argv-repo");
+    cbm_watcher_poll_once(w);
+    int callbacks = index_call_count;
+    bool injected = access(marker, F_OK) == 0;
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(base);
+    (void)cbm_unlink(marker);
+
+    ASSERT_EQ(watched, 1);
+    ASSERT_EQ(callbacks, 1);
+    ASSERT_FALSE(injected);
+    PASS();
+}
+
+TEST(watcher_git_environment_is_not_shell_or_relative_path) {
+    char base[256];
+    snprintf(base, sizeof(base), "/tmp/cbm_watcher_git_env_XXXXXX");
+    if (!cbm_mkdtemp(base)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char repo[512];
+    char fakebin[512];
+    char fakegit[640];
+    char fake_marker[640];
+    char bin_marker[640];
+    snprintf(repo, sizeof(repo), "%s/repo", base);
+    snprintf(fakebin, sizeof(fakebin), "%s/fakebin", base);
+    snprintf(fakegit, sizeof(fakegit), "%s/git", fakebin);
+    snprintf(fake_marker, sizeof(fake_marker), "%s/fake-git-ran", base);
+    snprintf(bin_marker, sizeof(bin_marker), "%s/cbm-git-bin-injected", base);
+    if (th_mkdir_p(repo) != 0 || th_mkdir_p(fakebin) != 0) {
+        th_rmtree(base);
+        FAIL("environment fixture mkdir failed");
+    }
+
+    char git_binary[4096];
+    if (!cbm_git_resolve_binary(git_binary, sizeof(git_binary))) {
+        th_rmtree(base);
+        FAIL("absolute git resolution failed");
+    }
+    const char *init_args[] = {"init", "-q", NULL};
+    const char *add_args[] = {"add", "--", "file.txt", NULL};
+    const char *commit_args[] = {"commit", "-q", "-m", "init", NULL};
+    char tracked[640];
+    snprintf(tracked, sizeof(tracked), "%s/file.txt", repo);
+    if (wt_gitv_bin(git_binary, repo, init_args) != 0 || th_write_file(tracked, "hello\n") != 0 ||
+        wt_gitv_bin(git_binary, repo, add_args) != 0 ||
+        wt_gitv_bin(git_binary, repo, commit_args) != 0) {
+        th_rmtree(base);
+        FAIL("environment repo setup failed");
+    }
+
+    char fake_script[1024];
+    snprintf(fake_script, sizeof(fake_script), "#!/bin/sh\nprintf pwned > '%s'\nexit 0\n",
+             fake_marker);
+    if (th_write_file(fakegit, fake_script) != 0) {
+        th_rmtree(base);
+        FAIL("fake git creation failed");
+    }
+    th_make_executable(fakegit);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "env-repo", repo);
+    index_call_count = 0;
+    cbm_watcher_poll_once(w); /* establish a trusted baseline first */
+
+    char cwd[4096];
+    const char *path_now = getenv("PATH");
+    const char *git_bin_now = getenv("CBM_GIT_BIN");
+    char *saved_path = path_now ? strdup(path_now) : NULL;
+    char *saved_git_bin = git_bin_now ? strdup(git_bin_now) : NULL;
+    bool had_path = path_now != NULL;
+    bool had_git_bin = git_bin_now != NULL;
+    if (!getcwd(cwd, sizeof(cwd)) || (had_path && !saved_path) || (had_git_bin && !saved_git_bin)) {
+        free(saved_path);
+        free(saved_git_bin);
+        cbm_watcher_free(w);
+        cbm_store_close(store);
+        th_rmtree(base);
+        FAIL("environment snapshot failed");
+    }
+
+    int env_rc = chdir(base);
+    char git_dir[4096];
+    snprintf(git_dir, sizeof(git_dir), "%s", git_binary);
+    char *git_slash = strrchr(git_dir, '/');
+    if (git_slash) {
+        *git_slash = '\0';
+    } else {
+        env_rc = -1;
+        git_dir[0] = '\0';
+    }
+    char poisoned_path[4352];
+    snprintf(poisoned_path, sizeof(poisoned_path), "fakebin:%s", git_dir);
+    env_rc |= cbm_setenv("PATH", poisoned_path, 1);
+    env_rc |=
+        cbm_setenv("CBM_GIT_BIN", "fakebin/git;touch cbm-git-bin-injected;#$(echo injected)", 1);
+    th_append_file(tracked, "dirty\n");
+    cbm_watcher_touch(w, "env-repo");
+    cbm_watcher_poll_once(w);
+    int detected_callbacks = index_call_count;
+
+    /* Restore a clean work tree without environment-based executable search,
+     * then remove the trusted absolute PATH entry entirely. The next poll must
+     * still trigger conservatively when git cannot be resolved. */
+    const char *checkout_args[] = {"checkout", "--", "file.txt", NULL};
+    env_rc |= wt_gitv_bin(git_binary, repo, checkout_args);
+    env_rc |= cbm_setenv("PATH", "fakebin", 1);
+    cbm_watcher_touch(w, "env-repo");
+    cbm_watcher_poll_once(w);
+    int fail_closed_callbacks = index_call_count;
+    bool fake_ran = access(fake_marker, F_OK) == 0;
+    bool bin_injected = access(bin_marker, F_OK) == 0;
+
+    if (had_path) {
+        (void)cbm_setenv("PATH", saved_path, 1);
+    } else {
+        (void)cbm_unsetenv("PATH");
+    }
+    if (had_git_bin) {
+        (void)cbm_setenv("CBM_GIT_BIN", saved_git_bin, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_GIT_BIN");
+    }
+    (void)chdir(cwd);
+    free(saved_path);
+    free(saved_git_bin);
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(base);
+
+    ASSERT_EQ(env_rc, 0);
+    ASSERT_EQ(detected_callbacks, 1);    /* trusted absolute git still detects the edit */
+    ASSERT_EQ(fail_closed_callbacks, 2); /* unresolved git is never treated as "clean" */
+    ASSERT_FALSE(fake_ran);              /* relative PATH component was not executable search */
+    ASSERT_FALSE(bin_injected);
+    PASS();
+}
+#endif
+
+TEST(watcher_detects_dirty_submodule_without_foreach_shell) {
+    char base[256];
+    snprintf(base, sizeof(base), "/tmp/cbm_watcher_submodule_XXXXXX");
+    if (!cbm_mkdtemp(base)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char parent[512];
+    char child[512];
+    char path[768];
+    snprintf(parent, sizeof(parent), "%s/parent", base);
+    snprintf(child, sizeof(child), "%s/child", base);
+    if (th_mkdir_p(parent) != 0 || th_mkdir_p(child) != 0) {
+        th_rmtree(base);
+        FAIL("submodule fixture mkdir failed");
+    }
+
+    const char *init_args[] = {"init", "-q", NULL};
+    const char *add_file_args[] = {"add", "--", "file.txt", NULL};
+    const char *commit_init_args[] = {"commit", "-q", "-m", "init", NULL};
+    snprintf(path, sizeof(path), "%s/file.txt", child);
+    if (wt_gitv(child, init_args) != 0 || th_write_file(path, "child\n") != 0 ||
+        wt_gitv(child, add_file_args) != 0 || wt_gitv(child, commit_init_args) != 0 ||
+        wt_gitv(parent, init_args) != 0) {
+        th_rmtree(base);
+        FAIL("submodule repositories setup failed");
+    }
+
+    const char *submodule_args[] = {
+        "-c", "protocol.file.allow=always", "submodule", "add", "--", child, "modules/child", NULL};
+    const char *add_submodule_args[] = {"add", "--", ".gitmodules", "modules/child", NULL};
+    if (wt_gitv(parent, submodule_args) != 0 || wt_gitv(parent, add_submodule_args) != 0 ||
+        wt_gitv(parent, commit_init_args) != 0) {
+        th_rmtree(base);
+        FAIL("submodule add failed");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "submodule-repo", parent);
+    index_call_count = 0;
+    cbm_watcher_poll_once(w);
+
+    snprintf(path, sizeof(path), "%s/modules/child/file.txt", parent);
+    th_append_file(path, "dirty\n");
+    cbm_watcher_touch(w, "submodule-repo");
+    cbm_watcher_poll_once(w);
+    int callbacks = index_call_count;
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(base);
+    ASSERT_EQ(callbacks, 1);
     PASS();
 }
 
@@ -1782,8 +2085,14 @@ TEST(watcher_callback_data_passed) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
-    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
     wt_git(tmpdir, "add file.txt");
     wt_git(tmpdir, "commit -q -m init");
 
@@ -1903,6 +2212,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_poll_no_projects);
     RUN_TEST(watcher_poll_nonexistent_path);
     RUN_TEST(watcher_prunes_sustained_missing_root);
+    RUN_TEST(watcher_rejects_truncated_database_sidecar_paths);
     RUN_TEST(watcher_grace_window_blocks_prune);
     RUN_TEST(watcher_root_missing_errno_classification);
     RUN_TEST(watcher_root_restore_resets_prune_streak);
@@ -1913,6 +2223,11 @@ SUITE(watcher) {
     RUN_TEST(watcher_detects_git_commit);
     RUN_TEST(watcher_detects_dirty_worktree);
     RUN_TEST(watcher_detects_new_file);
+#ifndef _WIN32
+    RUN_TEST(watcher_repo_path_is_argv_data);
+    RUN_TEST(watcher_git_environment_is_not_shell_or_relative_path);
+#endif
+    RUN_TEST(watcher_detects_dirty_submodule_without_foreach_shell);
     RUN_TEST(watcher_no_change_no_reindex);
     RUN_TEST(watcher_multiple_projects);
 

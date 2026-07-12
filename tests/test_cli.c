@@ -10,6 +10,7 @@
  * Total: 47 Go tests → 47 C tests
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
@@ -25,6 +26,14 @@
 
 /* Internal migration helper kept out of the public CLI API. */
 extern int cbm_cleanup_legacy_codex_instructions(const char *home, bool dry_run);
+extern int cbm_cli_download_to_fd_for_test(const char *url, int output_fd, size_t max_bytes);
+extern char *cbm_cli_parse_latest_tag_for_test(const char *headers, size_t header_len);
+extern int cbm_cli_publish_verified_for_test(const char *path, const unsigned char *data,
+                                             int length, bool verification_ok);
+#ifdef __APPLE__
+extern int cbm_cli_resolve_apple_tool_for_test(const char *name, const char *env_name, char *out,
+                                               size_t out_size);
+#endif
 
 /* Exact Go-era generated file written to
  * ~/.codex/instructions/codebase-memory-mcp.md. Its byte hash is used by the
@@ -572,6 +581,93 @@ TEST(cli_uninstall_removes_skills) {
     PASS();
 }
 
+TEST(cli_skill_removal_does_not_follow_symlink) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink fixture; Windows reparse handling is covered statically");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-skill-link-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char skills_dir[512];
+    char outside_dir[512];
+    char outside_file[768];
+    char skill_link[768];
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", tmpdir);
+    snprintf(outside_dir, sizeof(outside_dir), "%s/outside", tmpdir);
+    snprintf(outside_file, sizeof(outside_file), "%s/must-survive.txt", outside_dir);
+    snprintf(skill_link, sizeof(skill_link), "%s/codebase-memory", skills_dir);
+    ASSERT_EQ(test_mkdirp(skills_dir), 0);
+    ASSERT_EQ(test_mkdirp(outside_dir), 0);
+    write_test_file(outside_file, "must survive");
+    ASSERT_EQ(symlink(outside_dir, skill_link), 0);
+
+    ASSERT_EQ(cbm_remove_skills(skills_dir, false), 0);
+    ASSERT_STR_EQ(read_test_file(outside_file), "must survive");
+    struct stat link_st;
+    ASSERT_EQ(lstat(skill_link, &link_st), 0);
+    ASSERT_TRUE(S_ISLNK(link_st.st_mode));
+
+    test_rmdir_r(tmpdir);
+    PASS();
+#endif
+}
+
+TEST(cli_skill_force_refuses_symlink_destination) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink fixture; Windows reparse handling is covered statically");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-skill-file-link-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char skills_dir[512];
+    char skill_dir[768];
+    char skill_file[896];
+    char outside_file[768];
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", tmpdir);
+    snprintf(skill_dir, sizeof(skill_dir), "%s/codebase-memory", skills_dir);
+    snprintf(skill_file, sizeof(skill_file), "%s/SKILL.md", skill_dir);
+    snprintf(outside_file, sizeof(outside_file), "%s/must-survive.md", tmpdir);
+    ASSERT_EQ(test_mkdirp(skill_dir), 0);
+    write_test_file(outside_file, "user-owned content");
+    ASSERT_EQ(symlink(outside_file, skill_file), 0);
+
+    ASSERT_EQ(cbm_install_skills(skills_dir, true, false), 0);
+    ASSERT_STR_EQ(read_test_file(outside_file), "user-owned content");
+
+    test_rmdir_r(tmpdir);
+    PASS();
+#endif
+}
+
+TEST(cli_skill_removal_handles_more_than_256_directories) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-skill-wide-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char skills_dir[512];
+    char skill_dir[768];
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", tmpdir);
+    snprintf(skill_dir, sizeof(skill_dir), "%s/codebase-memory", skills_dir);
+    ASSERT_EQ(test_mkdirp(skill_dir), 0);
+    for (int i = 0; i < 300; i++) {
+        char child[896];
+        char file[1024];
+        snprintf(child, sizeof(child), "%s/d-%03d", skill_dir, i);
+        ASSERT_EQ(test_mkdirp(child), 0);
+        snprintf(file, sizeof(file), "%s/value", child);
+        write_test_file(file, "x");
+    }
+
+    ASSERT_EQ(cbm_remove_skills(skills_dir, false), CBM_SKILL_COUNT);
+    struct stat st;
+    ASSERT_NEQ(stat(skill_dir, &st), 0);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_remove_old_monolithic_skill) {
     /* Port of TestRemoveOldMonolithicSkill */
     char tmpdir[256];
@@ -609,6 +705,7 @@ TEST(cli_skill_files_content) {
     /* Exploring capabilities */
     ASSERT(strstr(sk[0].content, "search_graph") != NULL);
     ASSERT(strstr(sk[0].content, "get_graph_schema") != NULL);
+    ASSERT(strstr(sk[0].content, "source_state=\"current\"") != NULL);
 
     /* Tracing capabilities */
     ASSERT(strstr(sk[0].content, "trace_path") != NULL);
@@ -622,10 +719,16 @@ TEST(cli_skill_files_content) {
     /* Reference capabilities */
     ASSERT(strstr(sk[0].content, "query_graph") != NULL);
     ASSERT(strstr(sk[0].content, "Cypher") != NULL);
-    ASSERT(strstr(sk[0].content, "23 MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "24 MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "memory_status") != NULL);
+    ASSERT(strstr(sk[0].content, "DEFINES_TOKEN") != NULL);
+    ASSERT(strstr(sk[0].content, "OVERRIDES") != NULL);
+    ASSERT(strstr(sk[0].content, "IMPLEMENTS, OVERRIDE,") == NULL);
     ASSERT(strstr(sk[0].content, "get_design_context") != NULL);
     ASSERT(strstr(sk[0].content, "Global Memory Retrieval") != NULL);
     ASSERT(strstr(sk[0].content, "Do not search for an opposing view by default") != NULL);
+    ASSERT(strstr(sk[0].content, "user_approved=true") != NULL);
+    ASSERT(strstr(sk[0].content, "allow_external_path=true") != NULL);
 
     /* Gotchas section */
     ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
@@ -642,6 +745,8 @@ TEST(cli_codex_instructions) {
     ASSERT(codex == shared);
     ASSERT(strstr(codex, "Codebase Knowledge Graph") != NULL);
     ASSERT(strstr(codex, "Global Memory") != NULL);
+    ASSERT(strstr(codex, "user_approved=true") != NULL);
+    ASSERT(strstr(codex, "allow_external_path=true") != NULL);
     PASS();
 }
 
@@ -1281,6 +1386,34 @@ TEST(cli_install_same_file_guard_issue472) {
     PASS();
 }
 
+TEST(cli_install_binary_copy_preserves_nul_bytes) {
+    char tmpdir[1024];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-binary-nul-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char src[512];
+    char dst[512];
+    snprintf(src, sizeof(src), "%s/source", tmpdir);
+    snprintf(dst, sizeof(dst), "%s/installed", tmpdir);
+    static const unsigned char expected[] = {'M', 'Z', 0x00, 0x7f, 'B', 0x00, 'X'};
+    FILE *source = fopen(src, "wb");
+    ASSERT_NOT_NULL(source);
+    ASSERT_EQ(fwrite(expected, 1, sizeof(expected), source), sizeof(expected));
+    ASSERT_EQ(fclose(source), 0);
+
+    ASSERT_EQ(cbm_copy_binary_to_target(src, dst), 0);
+    unsigned char actual[sizeof(expected) + 1U] = {0};
+    FILE *installed = fopen(dst, "rb");
+    ASSERT_NOT_NULL(installed);
+    size_t actual_len = fread(actual, 1, sizeof(actual), installed);
+    ASSERT_EQ(fclose(installed), 0);
+    ASSERT_EQ(actual_len, sizeof(expected));
+    ASSERT_MEM_EQ(actual, expected, sizeof(expected));
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_update_target_uses_official_install_receipt) {
     char home[256];
     snprintf(home, sizeof(home), "/tmp/cli-update-receipt-XXXXXX");
@@ -1307,8 +1440,7 @@ TEST(cli_update_target_uses_official_install_receipt) {
     write_test_file(receipt, body);
 
     char out[1024];
-    ASSERT_EQ(cbm_resolve_update_target(home, managed, out, sizeof(out)),
-              0);
+    ASSERT_EQ(cbm_resolve_update_target(home, managed, out, sizeof(out)), 0);
     ASSERT_STR_EQ(out, managed);
 
     test_rmdir_r(home);
@@ -1714,6 +1846,155 @@ TEST(cli_install_and_uninstall) {
     }
 
     test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_index_management_uses_explicit_home_and_preserves_internal_dbs) {
+    const char *prior_env = getenv("CBM_CACHE_DIR");
+    char *saved_env = prior_env ? strdup(prior_env) : NULL;
+    (void)cbm_unsetenv("CBM_CACHE_DIR");
+
+    char home[256];
+    snprintf(home, sizeof(home), "/tmp/cli-index-home-XXXXXX");
+    bool setup_ok = cbm_mkdtemp(home) != NULL;
+    char cache[512];
+    char project[640];
+    char wal[648];
+    char shm[648];
+    char config[640];
+    char memory[640];
+    snprintf(cache, sizeof(cache), "%s/.cache/codebase-memory-mcp", home);
+    snprintf(project, sizeof(project), "%s/project.db", cache);
+    snprintf(wal, sizeof(wal), "%s-wal", project);
+    snprintf(shm, sizeof(shm), "%s-shm", project);
+    snprintf(config, sizeof(config), "%s/_config.db", cache);
+    snprintf(memory, sizeof(memory), "%s/_global_memory.db", cache);
+    if (setup_ok) {
+        setup_ok = test_mkdirp(cache) == 0;
+    }
+    if (setup_ok) {
+        write_test_file(project, "project");
+        write_test_file(wal, "wal");
+        write_test_file(shm, "shm");
+        write_test_file(config, "settings");
+        write_test_file(memory, "memory");
+    }
+
+    int listed = setup_ok ? cbm_list_indexes(home) : -99;
+    int removed = setup_ok ? cbm_remove_indexes(home) : -99;
+    struct stat st;
+    bool project_removed = stat(project, &st) != 0;
+    bool wal_removed = stat(wal, &st) != 0;
+    bool shm_removed = stat(shm, &st) != 0;
+    bool config_preserved = stat(config, &st) == 0;
+    bool memory_preserved = stat(memory, &st) == 0;
+
+    if (saved_env) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_env, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_env);
+    test_rmdir_r(home);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_EQ(listed, 1);
+    ASSERT_EQ(removed, 1);
+    ASSERT_TRUE(project_removed);
+    ASSERT_TRUE(wal_removed);
+    ASSERT_TRUE(shm_removed);
+    ASSERT_TRUE(config_preserved);
+    ASSERT_TRUE(memory_preserved);
+    PASS();
+}
+
+TEST(cli_config_rejects_overlong_cache_directory) {
+    const char *prior_env = getenv("CBM_CACHE_DIR");
+    char *saved_env = prior_env ? strdup(prior_env) : NULL;
+    char overlong[2048];
+    memset(overlong, 'x', sizeof(overlong) - 1U);
+    overlong[sizeof(overlong) - 1U] = '\0';
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", overlong, 1), 0);
+
+    char *args[] = {"list"};
+    int rc = cbm_cmd_config(1, args);
+
+    if (saved_env) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_env, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_env);
+    ASSERT_NEQ(rc, 0);
+    PASS();
+}
+
+TEST(cli_index_management_rejects_overlong_override_without_fallback) {
+    const char *prior_env = getenv("CBM_CACHE_DIR");
+    char *saved_env = prior_env ? strdup(prior_env) : NULL;
+
+    char home[256];
+    snprintf(home, sizeof(home), "/tmp/cli-index-overlong-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(home));
+    char cache[512];
+    char sentinel[640];
+    snprintf(cache, sizeof(cache), "%s/.cache/codebase-memory-mcp", home);
+    snprintf(sentinel, sizeof(sentinel), "%s/must-survive.db", cache);
+    ASSERT_EQ(test_mkdirp(cache), 0);
+    write_test_file(sentinel, "default cache sentinel");
+
+    char overlong[2048];
+    memset(overlong, 'x', sizeof(overlong) - 1U);
+    overlong[sizeof(overlong) - 1U] = '\0';
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", overlong, 1), 0);
+    int listed = cbm_list_indexes(home);
+    int removed = cbm_remove_indexes(home);
+    struct stat st;
+    bool survived = stat(sentinel, &st) == 0;
+
+    if (saved_env) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_env, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_env);
+    test_rmdir_r(home);
+
+    ASSERT_EQ(listed, -1);
+    ASSERT_EQ(removed, -1);
+    ASSERT_TRUE(survived);
+    PASS();
+}
+
+TEST(cli_config_uses_explicit_cache_without_home) {
+    const char *names[] = {"HOME", "USERPROFILE", "CBM_CACHE_DIR"};
+    char *saved[3] = {0};
+    bool was_set[3] = {false};
+    for (size_t i = 0; i < 3; i++) {
+        const char *value = getenv(names[i]);
+        was_set[i] = value != NULL;
+        saved[i] = value ? strdup(value) : NULL;
+    }
+
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cli-config-no-home-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    ASSERT_EQ(cbm_unsetenv("HOME"), 0);
+    ASSERT_EQ(cbm_unsetenv("USERPROFILE"), 0);
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    char *args[] = {"list"};
+    int rc = cbm_cmd_config(1, args);
+
+    for (size_t i = 0; i < 3; i++) {
+        if (was_set[i]) {
+            (void)cbm_setenv(names[i], saved[i], 1);
+        } else {
+            (void)cbm_unsetenv(names[i]);
+        }
+        free(saved[i]);
+    }
+    test_rmdir_r(cache);
+    ASSERT_EQ(rc, 0);
     PASS();
 }
 
@@ -3099,11 +3380,40 @@ TEST(cli_config_persists) {
  *  Group H: cbm_replace_binary (update command helper)
  * ═══════════════════════════════════════════════════════════════════ */
 
+TEST(update_publish_verification_rolls_back_previous_binary) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-update-rollback-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char target[512];
+    char new_target[512];
+    snprintf(target, sizeof(target), "%s/codebase-memory-mcp", tmpdir);
+    snprintf(new_target, sizeof(new_target), "%s/new-codebase-memory-mcp", tmpdir);
+    write_test_file(target, "known-good-old-binary");
+
+    static const unsigned char replacement[] = "broken-new-binary";
+    ASSERT_NEQ(
+        cbm_cli_publish_verified_for_test(target, replacement, (int)sizeof(replacement) - 1, false),
+        0);
+    ASSERT_STR_EQ(read_test_file(target), "known-good-old-binary");
+
+    ASSERT_EQ(
+        cbm_cli_publish_verified_for_test(target, replacement, (int)sizeof(replacement) - 1, true),
+        0);
+    ASSERT_STR_EQ(read_test_file(target), "broken-new-binary");
+
+    ASSERT_NEQ(cbm_cli_publish_verified_for_test(new_target, replacement,
+                                                 (int)sizeof(replacement) - 1, false),
+               0);
+    ASSERT_EQ(cbm_path_probe(new_target), 0);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 #ifndef _WIN32
 
 TEST(replace_binary_overwrites_readonly) {
     /* Simulate #114: existing binary has mode 0500 (no write permission).
-     * cbm_replace_binary must unlink first, then create with 0755. */
+     * Atomic rename must replace it without opening the target for writes. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-replace-XXXXXX");
     if (!cbm_mkdtemp(tmpdir)) {
@@ -3143,6 +3453,30 @@ TEST(replace_binary_overwrites_readonly) {
     PASS();
 }
 
+TEST(replace_binary_replaces_symlink_not_target) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-replace-link-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char outside[512];
+    char target[512];
+    snprintf(outside, sizeof(outside), "%s/user-owned", tmpdir);
+    snprintf(target, sizeof(target), "%s/codebase-memory-mcp", tmpdir);
+    write_test_file(outside, "must survive");
+    ASSERT_EQ(symlink(outside, target), 0);
+
+    static const unsigned char replacement[] = "new executable";
+    ASSERT_EQ(cbm_replace_binary(target, replacement, (int)sizeof(replacement) - 1, 0755), 0);
+    ASSERT_STR_EQ(read_test_file(outside), "must survive");
+    ASSERT_STR_EQ(read_test_file(target), "new executable");
+    struct stat st;
+    ASSERT_EQ(lstat(target, &st), 0);
+    ASSERT_TRUE(S_ISREG(st.st_mode));
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(replace_binary_creates_new_file) {
     /* If no existing file, cbm_replace_binary should create it. */
     char tmpdir[256];
@@ -3167,6 +3501,27 @@ TEST(replace_binary_creates_new_file) {
 
     remove(path);
     rmdir(tmpdir);
+    PASS();
+}
+
+TEST(replace_binary_failure_keeps_target_and_cleans_staging) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-replace-fail-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char target[512];
+    snprintf(target, sizeof(target), "%s/existing-directory", tmpdir);
+    ASSERT_EQ(mkdir(target, 0700), 0);
+    static const unsigned char replacement[] = "must not publish";
+    ASSERT_NEQ(cbm_replace_binary(target, replacement, (int)sizeof(replacement) - 1, 0755), 0);
+
+    struct stat st;
+    ASSERT_EQ(lstat(target, &st), 0);
+    ASSERT_TRUE(S_ISDIR(st.st_mode));
+    ASSERT_EQ(rmdir(target), 0);
+    /* The parent can be removed only if the unique .new staging file was
+     * cleaned on the failed rename path. */
+    ASSERT_EQ(rmdir(tmpdir), 0);
     PASS();
 }
 
@@ -3350,6 +3705,176 @@ TEST(cli_release_checksum_requires_exact_valid_entry) {
     PASS();
 }
 
+TEST(cli_latest_tag_parser_is_bounded_and_strict) {
+    const char short_headers[] = "L\nLoc\nLocation\n";
+    ASSERT_NULL(cbm_cli_parse_latest_tag_for_test(short_headers, sizeof(short_headers) - 1U));
+
+    const char valid_headers[] =
+        "HTTP/2 302\r\nLoCaTiOn:\thttps://github.com/DustinBrett/daedalOS/releases/tag/"
+        "v1.2.3-rc.1+build\t\r\n\r\n";
+    char *tag = cbm_cli_parse_latest_tag_for_test(valid_headers, sizeof(valid_headers) - 1U);
+    ASSERT_NOT_NULL(tag);
+    ASSERT_STR_EQ(tag, "v1.2.3-rc.1+build");
+    free(tag);
+
+    const char traversal[] = "Location: https://example.invalid/tag/v1.2.3?asset=../../evil\r\n";
+    ASSERT_NULL(cbm_cli_parse_latest_tag_for_test(traversal, sizeof(traversal) - 1U));
+
+    const char embedded_nul[] = {'L', 'o', 'c', 'a', 't', 'i', 'o', 'n', ':', ' ', 'v', '1', '\0',
+                                 'L', 'o', 'c', 'a', 't', 'i', 'o', 'n', ':', ' ', 'v', '9', '\n'};
+    ASSERT_NULL(cbm_cli_parse_latest_tag_for_test(embedded_nul, sizeof(embedded_nul)));
+    PASS();
+}
+
+TEST(cli_update_download_uses_private_bounded_descriptor) {
+#ifdef _WIN32
+    SKIP_PLATFORM(
+        "POSIX executable fixture; Windows absolute curl resolution is reviewed statically");
+#else
+    const char *prior = getenv("CBM_CURL_BIN");
+    char *saved = prior ? strdup(prior) : NULL;
+    const char *prior_path = getenv("PATH");
+    char *saved_path = prior_path ? strdup(prior_path) : NULL;
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-curl-fd-XXXXXX");
+    bool setup_ok = cbm_mkdtemp(tmpdir) != NULL;
+    char fake_curl[512];
+    char path_curl[512];
+    char output_path[512];
+    snprintf(fake_curl, sizeof(fake_curl), "%s/fake-curl", tmpdir);
+    snprintf(path_curl, sizeof(path_curl), "%s/curl", tmpdir);
+    snprintf(output_path, sizeof(output_path), "%s/output-XXXXXX", tmpdir);
+    if (setup_ok) {
+        write_test_file(fake_curl, "#!/bin/sh\nprintf 'stderr-must-not-be-captured' >&2\n"
+                                   "printf 'private-download'\n");
+        write_test_file(path_curl, "#!/bin/sh\nprintf 'path-fallback-must-not-run'\n");
+        setup_ok = chmod(fake_curl, 0700) == 0 && chmod(path_curl, 0700) == 0 &&
+                   cbm_setenv("CBM_CURL_BIN", fake_curl, 1) == 0;
+    }
+    int fd = setup_ok ? cbm_mkstemp(output_path) : -1;
+    if (fd >= 0) {
+        static const char stale[] = "stale-trailing-bytes-that-must-be-truncated";
+        setup_ok = write(fd, stale, sizeof(stale) - 1U) == (ssize_t)(sizeof(stale) - 1U);
+    }
+    int first_rc =
+        fd >= 0 ? cbm_cli_download_to_fd_for_test("https://unused.invalid", fd, 64) : -99;
+    char payload[64] = {0};
+    ssize_t payload_len = -1;
+    if (fd >= 0 && lseek(fd, 0, SEEK_SET) == 0) {
+        payload_len = read(fd, payload, sizeof(payload) - 1U);
+    }
+    if (fd >= 0) {
+        close(fd);
+        unlink(output_path);
+    }
+
+    snprintf(output_path, sizeof(output_path), "%s/invalid-override-XXXXXX", tmpdir);
+    fd = setup_ok ? cbm_mkstemp(output_path) : -1;
+    bool invalid_setup = fd >= 0 && cbm_setenv("PATH", tmpdir, 1) == 0 &&
+                         cbm_setenv("CBM_CURL_BIN", "relative-curl", 1) == 0;
+    int invalid_override_rc =
+        invalid_setup ? cbm_cli_download_to_fd_for_test("https://unused.invalid", fd, 64) : 0;
+    if (fd >= 0) {
+        close(fd);
+        unlink(output_path);
+    }
+
+    if (setup_ok) {
+        write_test_file(fake_curl, "#!/bin/sh\nprintf '01234567890123456789'\n");
+        (void)chmod(fake_curl, 0700);
+        setup_ok = cbm_setenv("CBM_CURL_BIN", fake_curl, 1) == 0;
+    }
+    snprintf(output_path, sizeof(output_path), "%s/capped-XXXXXX", tmpdir);
+    fd = setup_ok ? cbm_mkstemp(output_path) : -1;
+    int capped_rc = fd >= 0 ? cbm_cli_download_to_fd_for_test("https://unused.invalid", fd, 5) : 0;
+    if (fd >= 0) {
+        close(fd);
+        unlink(output_path);
+    }
+
+    if (saved) {
+        (void)cbm_setenv("CBM_CURL_BIN", saved, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CURL_BIN");
+    }
+    if (saved_path) {
+        (void)cbm_setenv("PATH", saved_path, 1);
+    } else {
+        (void)cbm_unsetenv("PATH");
+    }
+    free(saved);
+    free(saved_path);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_EQ(payload_len, (ssize_t)strlen("private-download"));
+    ASSERT_STR_EQ(payload, "private-download");
+    ASSERT_TRUE(invalid_setup);
+    ASSERT_NEQ(invalid_override_rc, 0);
+    ASSERT_NEQ(capped_rc, 0);
+    PASS();
+#endif
+}
+
+#ifdef __APPLE__
+TEST(cli_apple_system_tool_resolution_is_not_path_hijacked) {
+    const char *prior_override = getenv("CBM_XATTR_BIN");
+    char *saved_override = prior_override ? strdup(prior_override) : NULL;
+    const char *prior_path = getenv("PATH");
+    char *saved_path = prior_path ? strdup(prior_path) : NULL;
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-apple-tool-XXXXXX");
+    bool setup_ok = cbm_mkdtemp(tmpdir) != NULL;
+    char fake_xattr[512];
+    snprintf(fake_xattr, sizeof(fake_xattr), "%s/xattr", tmpdir);
+    if (setup_ok) {
+        setup_ok = write_test_file(fake_xattr, "#!/bin/sh\nexit 99\n") == 0 &&
+                   chmod(fake_xattr, 0700) == 0 && cbm_setenv("PATH", tmpdir, 1) == 0 &&
+                   cbm_unsetenv("CBM_XATTR_BIN") == 0;
+    }
+
+    char system_path[4096] = {0};
+    int system_rc = setup_ok ? cbm_cli_resolve_apple_tool_for_test("xattr", "CBM_XATTR_BIN",
+                                                                   system_path, sizeof(system_path))
+                             : -99;
+    int invalid_rc = setup_ok && cbm_setenv("CBM_XATTR_BIN", "relative-xattr", 1) == 0
+                         ? cbm_cli_resolve_apple_tool_for_test("xattr", "CBM_XATTR_BIN",
+                                                               system_path, sizeof(system_path))
+                         : 0;
+    char override_path[4096] = {0};
+    int override_rc = setup_ok && cbm_setenv("CBM_XATTR_BIN", fake_xattr, 1) == 0
+                          ? cbm_cli_resolve_apple_tool_for_test(
+                                "xattr", "CBM_XATTR_BIN", override_path, sizeof(override_path))
+                          : -99;
+
+    if (saved_override) {
+        (void)cbm_setenv("CBM_XATTR_BIN", saved_override, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_XATTR_BIN");
+    }
+    if (saved_path) {
+        (void)cbm_setenv("PATH", saved_path, 1);
+    } else {
+        (void)cbm_unsetenv("PATH");
+    }
+    free(saved_override);
+    free(saved_path);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_EQ(system_rc, 0);
+    ASSERT_STR_NEQ(system_path, fake_xattr);
+    ASSERT_EQ(system_path[0], '/');
+    ASSERT_NEQ(invalid_rc, 0);
+    ASSERT_EQ(override_rc, 0);
+    ASSERT_STR_NEQ(override_path, system_path);
+    ASSERT_NOT_NULL(strstr(override_path, "/cli-apple-tool-"));
+    PASS();
+}
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Suite definition
  * ═══════════════════════════════════════════════════════════════════ */
@@ -3357,6 +3882,11 @@ TEST(cli_release_checksum_requires_exact_valid_entry) {
 SUITE(cli) {
     RUN_TEST(cli_sha256_file_matches_known_vector);
     RUN_TEST(cli_release_checksum_requires_exact_valid_entry);
+    RUN_TEST(cli_latest_tag_parser_is_bounded_and_strict);
+    RUN_TEST(cli_update_download_uses_private_bounded_descriptor);
+#ifdef __APPLE__
+    RUN_TEST(cli_apple_system_tool_resolution_is_not_path_hijacked);
+#endif
     /* Version (2 tests — selfupdate_test.go) */
     RUN_TEST(cli_compare_versions);
     RUN_TEST(cli_version_get_set);
@@ -3376,11 +3906,14 @@ SUITE(cli) {
     /* Dry-run flag parsing (1 test — install_test.go) */
     RUN_TEST(cli_dry_run_flags);
 
-    /* Skill management (7 tests — install_test.go) */
+    /* Skill management */
     RUN_TEST(cli_skill_creation);
     RUN_TEST(cli_skill_idempotent);
     RUN_TEST(cli_skill_force_overwrite);
     RUN_TEST(cli_uninstall_removes_skills);
+    RUN_TEST(cli_skill_removal_does_not_follow_symlink);
+    RUN_TEST(cli_skill_force_refuses_symlink_destination);
+    RUN_TEST(cli_skill_removal_handles_more_than_256_directories);
     RUN_TEST(cli_remove_old_monolithic_skill);
     RUN_TEST(cli_skill_files_content);
     RUN_TEST(cli_codex_instructions);
@@ -3432,10 +3965,15 @@ SUITE(cli) {
 
     /* Full lifecycle (1 test — cli_test.go) */
     RUN_TEST(cli_install_and_uninstall);
+    RUN_TEST(cli_index_management_uses_explicit_home_and_preserves_internal_dbs);
+    RUN_TEST(cli_config_rejects_overlong_cache_directory);
+    RUN_TEST(cli_index_management_rejects_overlong_override_without_fallback);
+    RUN_TEST(cli_config_uses_explicit_cache_without_home);
 
     /* Binary swap on install --force (#472) */
     RUN_TEST(cli_install_copies_binary_to_target_issue472);
     RUN_TEST(cli_install_same_file_guard_issue472);
+    RUN_TEST(cli_install_binary_copy_preserves_nul_bytes);
     RUN_TEST(cli_update_target_uses_official_install_receipt);
     RUN_TEST(cli_update_target_rejects_unmanaged_binary);
     RUN_TEST(cli_update_target_rejects_stale_official_receipt);
@@ -3521,9 +4059,12 @@ SUITE(cli) {
     RUN_TEST(cli_config_persists);
 
     /* Replace binary (update command helper — group H) */
+    RUN_TEST(update_publish_verification_rolls_back_previous_binary);
 #ifndef _WIN32
     RUN_TEST(replace_binary_overwrites_readonly);
     RUN_TEST(replace_binary_creates_new_file);
+    RUN_TEST(replace_binary_replaces_symlink_not_target);
+    RUN_TEST(replace_binary_failure_keeps_target_and_cleans_staging);
 #endif
 
     /* CLI tool-argument flags / per-tool --help (#680) */

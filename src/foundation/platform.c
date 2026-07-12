@@ -5,6 +5,7 @@
  */
 #include "platform.h"
 
+#include "compat.h"
 #include "foundation/constants.h"
 #include <fcntl.h>
 #include <stdint.h>
@@ -25,6 +26,18 @@ static void cbm_canonicalize_drive(char *path) {
         (path[2] == '/' || path[2] == '\0')) {
         path[0] = (char)(path[0] - 'a' + 'A');
     }
+}
+
+uint64_t cbm_qpc_ticks_to_ns(uint64_t ticks, uint64_t frequency) {
+    if (frequency == 0) {
+        return 0;
+    }
+    /* QPC frequencies are bounded well below UINT64_MAX / 1e9 on supported
+     * Windows systems. Splitting the quotient and remainder avoids the much
+     * earlier overflow in ticks * 1e9 (about 30 minutes at 10 MHz). */
+    uint64_t seconds = ticks / frequency;
+    uint64_t remainder = ticks % frequency;
+    return seconds * 1000000000ULL + (remainder * 1000000000ULL) / frequency;
 }
 
 #ifdef _WIN32
@@ -88,9 +101,11 @@ void cbm_munmap(void *addr, size_t size) {
 
 uint64_t cbm_now_ns(void) {
     LARGE_INTEGER freq, count;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&count);
-    return (uint64_t)count.QuadPart * 1000000000ULL / (uint64_t)freq.QuadPart;
+    if (!QueryPerformanceFrequency(&freq) || freq.QuadPart <= 0 ||
+        !QueryPerformanceCounter(&count) || count.QuadPart < 0) {
+        return 0;
+    }
+    return cbm_qpc_ticks_to_ns((uint64_t)count.QuadPart, (uint64_t)freq.QuadPart);
 }
 
 #define CBM_USEC_PER_SEC 1000000ULL
@@ -271,8 +286,9 @@ int64_t cbm_file_size(const char *path) {
 }
 
 char *cbm_normalize_path_sep(char *path) {
-    /* Normalize on ALL platforms — backslash paths can arrive via stored
-     * data, cross-platform DB files, or Windows-style arguments. */
+    /* This helper also accepts serialized/remote Windows paths on POSIX. Local
+     * POSIX environment resolvers deliberately do not call it because a
+     * backslash is an ordinary filename byte there. */
     if (path) {
         for (char *p = path; *p; p++) {
             if (*p == '\\') {
@@ -288,57 +304,157 @@ char *cbm_normalize_path_sep(char *path) {
 
 /* ── Environment variables ──────────────────────────── */
 
-/* Thread-safe getenv: iterates environ directly instead of calling getenv().
- * getenv() is flagged by concurrency-mt-unsafe because the returned pointer
- * can be invalidated by setenv/putenv in another thread. We copy to a
- * caller-owned buffer immediately. */
-#ifdef _WIN32
-#include <stdlib.h>
-#define CBM_ENVIRON _environ
-#elif defined(__APPLE__)
+/* Copy environment values instead of returning process-environment storage.
+ * Like getenv(), this requires callers not to mutate the process environment
+ * concurrently. */
+#if defined(__APPLE__)
 #include <crt_externs.h>
 #define CBM_ENVIRON (*_NSGetEnviron())
-#else
+#elif !defined(_WIN32)
 extern char **environ;
 #define CBM_ENVIRON environ
 #endif
 
 const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
+    if (!buf || buf_sz == 0) {
+        return NULL;
+    }
+    if (!name || !name[0]) {
+        buf[0] = '\0';
+        return NULL;
+    }
+
+#ifdef _WIN32
+    wchar_t *wide_name = cbm_utf8_to_wide(name);
+    if (!wide_name) {
+        buf[0] = '\0';
+        return NULL;
+    }
+    SetLastError(ERROR_SUCCESS);
+    DWORD needed = GetEnvironmentVariableW(wide_name, NULL, 0);
+    DWORD error = GetLastError();
+    if (needed == 0 && error == ERROR_ENVVAR_NOT_FOUND) {
+        free(wide_name);
+        if (!fallback) {
+            buf[0] = '\0';
+            return NULL;
+        }
+        size_t fallback_len = strlen(fallback);
+        if (fallback_len >= buf_sz) {
+            buf[0] = '\0';
+            return NULL;
+        }
+        memmove(buf, fallback, fallback_len + 1U);
+        return buf;
+    }
+    if (needed == 0 && error == ERROR_SUCCESS) {
+        /* Present-but-empty is a valid environment value. Path resolvers treat
+         * it as unset, matching POSIX getenv semantics. */
+        buf[0] = '\0';
+        free(wide_name);
+        return buf;
+    }
+    if (needed == 0) {
+        free(wide_name);
+        buf[0] = '\0';
+        return NULL;
+    }
+    wchar_t *wide_value = malloc((size_t)needed * sizeof(*wide_value));
+    if (!wide_value) {
+        free(wide_name);
+        buf[0] = '\0';
+        return NULL;
+    }
+    DWORD written = GetEnvironmentVariableW(wide_name, wide_value, needed);
+    free(wide_name);
+    if (written >= needed) {
+        free(wide_value);
+        buf[0] = '\0';
+        return NULL;
+    }
+    char *value = cbm_wide_to_utf8(wide_value);
+    free(wide_value);
+    if (!value) {
+        buf[0] = '\0';
+        return NULL;
+    }
+    size_t value_len = strlen(value);
+    if (value_len >= buf_sz) {
+        free(value);
+        buf[0] = '\0';
+        return NULL;
+    }
+    memmove(buf, value, value_len + 1U);
+    free(value);
+    return buf;
+#else
+    const char *value = NULL;
     char **env = CBM_ENVIRON;
     if (env) {
         size_t nlen = strlen(name);
         for (; *env; env++) {
             if (strncmp(*env, name, nlen) == 0 && (*env)[nlen] == '=') {
-                snprintf(buf, buf_sz, "%s", *env + nlen + SKIP_ONE);
-                return buf;
+                value = *env + nlen + SKIP_ONE;
+                break;
             }
         }
     }
-    if (fallback) {
-        snprintf(buf, buf_sz, "%s", fallback);
-        return buf;
+    if (!value) {
+        value = fallback;
     }
-    buf[0] = '\0';
-    return NULL;
+    if (!value) {
+        buf[0] = '\0';
+        return NULL;
+    }
+
+    size_t value_len = strlen(value);
+    if (value_len >= buf_sz) {
+        buf[0] = '\0';
+        return NULL;
+    }
+    memmove(buf, value, value_len + 1);
+    return buf;
+#endif
 }
 
 /* ── Home directory (cross-platform) ───────────────────── */
 
-const char *cbm_get_home_dir(void) {
-    static char buf[CBM_SZ_1K];
-    char tmp[CBM_SZ_256] = "";
+static const char *cbm_path_with_suffix(char *buf, size_t buf_sz, const char *base,
+                                        const char *suffix) {
+    if (!buf || buf_sz == 0 || !base || !suffix) {
+        if (buf && buf_sz > 0) {
+            buf[0] = '\0';
+        }
+        return NULL;
+    }
+    int written = snprintf(buf, buf_sz, "%s%s", base, suffix);
+    if (written < 0 || (size_t)written >= buf_sz) {
+        buf[0] = '\0';
+        return NULL;
+    }
+    return buf;
+}
 
-    cbm_safe_getenv("HOME", tmp, sizeof(tmp), NULL);
-    if (tmp[0]) {
-        snprintf(buf, sizeof(buf), "%s", tmp);
+const char *cbm_get_home_dir(void) {
+    static CBM_TLS char buf[CBM_SZ_1K];
+
+    if (!cbm_safe_getenv("HOME", buf, sizeof(buf), "")) {
+        return NULL;
+    }
+    if (buf[0]) {
+#ifdef _WIN32
         cbm_normalize_path_sep(buf);
+#endif
         return buf;
     }
 
-    cbm_safe_getenv("USERPROFILE", tmp, sizeof(tmp), NULL);
-    if (tmp[0]) {
-        snprintf(buf, sizeof(buf), "%s", tmp);
+    if (!cbm_safe_getenv("USERPROFILE", buf, sizeof(buf), "")) {
+        return NULL;
+    }
+    if (buf[0]) {
+#ifdef _WIN32
         cbm_normalize_path_sep(buf);
+#endif
         return buf;
     }
     return NULL;
@@ -347,66 +463,12 @@ const char *cbm_get_home_dir(void) {
 /* ── App config directories (cross-platform) ────────── */
 
 const char *cbm_app_config_dir(void) {
-    static char buf[CBM_SZ_1K];
-    char tmp[CBM_SZ_256] = "";
+    static CBM_TLS char buf[CBM_SZ_1K];
 #ifdef _WIN32
-    cbm_safe_getenv("APPDATA", tmp, sizeof(tmp), NULL);
-    if (tmp[0]) {
-        snprintf(buf, sizeof(buf), "%s", tmp);
-        cbm_normalize_path_sep(buf);
-        return buf;
+    if (!cbm_safe_getenv("APPDATA", buf, sizeof(buf), "")) {
+        return NULL;
     }
-    const char *home = cbm_get_home_dir();
-    if (home) {
-        snprintf(buf, sizeof(buf), "%s/AppData/Roaming", home);
-        return buf;
-    }
-    return NULL;
-#else
-    /* Linux: XDG_CONFIG_HOME or ~/.config */
-    cbm_safe_getenv("XDG_CONFIG_HOME", tmp, sizeof(tmp), NULL);
-    if (tmp[0]) {
-        snprintf(buf, sizeof(buf), "%s", tmp);
-        return buf;
-    }
-    const char *home = cbm_get_home_dir();
-    if (home) {
-        snprintf(buf, sizeof(buf), "%s/.config", home);
-        return buf;
-    }
-    return NULL;
-#endif /* _WIN32 */
-}
-
-const char *cbm_app_local_dir(void) {
-#ifdef _WIN32
-    static char buf[CBM_SZ_1K];
-    char tmp[CBM_SZ_256] = "";
-    cbm_safe_getenv("LOCALAPPDATA", tmp, sizeof(tmp), NULL);
-    if (tmp[0]) {
-        snprintf(buf, sizeof(buf), "%s", tmp);
-        cbm_normalize_path_sep(buf);
-        return buf;
-    }
-    const char *home = cbm_get_home_dir();
-    if (home) {
-        snprintf(buf, sizeof(buf), "%s/AppData/Local", home);
-        return buf;
-    }
-    return NULL;
-#else
-    return cbm_app_config_dir();
-#endif
-}
-
-/* ── Cache directory ────────────────────────── */
-
-const char *cbm_resolve_cache_dir(void) {
-    static char buf[CBM_SZ_1K];
-    char tmp[CBM_SZ_256] = "";
-    cbm_safe_getenv("CBM_CACHE_DIR", tmp, sizeof(tmp), NULL);
-    if (tmp[0]) {
-        snprintf(buf, sizeof(buf), "%s", tmp);
+    if (buf[0]) {
         cbm_normalize_path_sep(buf);
         return buf;
     }
@@ -414,6 +476,64 @@ const char *cbm_resolve_cache_dir(void) {
     if (!home) {
         return NULL;
     }
-    snprintf(buf, sizeof(buf), "%s/.cache/codebase-memory-mcp", home);
-    return buf;
+    return cbm_path_with_suffix(buf, sizeof(buf), home, "/AppData/Roaming");
+#else
+    /* macOS/Linux: XDG_CONFIG_HOME or ~/.config */
+    if (!cbm_safe_getenv("XDG_CONFIG_HOME", buf, sizeof(buf), "")) {
+        return NULL;
+    }
+    if (buf[0]) {
+        return buf;
+    }
+    const char *home = cbm_get_home_dir();
+    if (!home) {
+        return NULL;
+    }
+    return cbm_path_with_suffix(buf, sizeof(buf), home, "/.config");
+#endif /* _WIN32 */
+}
+
+const char *cbm_app_local_dir(void) {
+    static CBM_TLS char buf[CBM_SZ_1K];
+#ifdef _WIN32
+    if (!cbm_safe_getenv("LOCALAPPDATA", buf, sizeof(buf), "")) {
+        return NULL;
+    }
+    if (buf[0]) {
+        cbm_normalize_path_sep(buf);
+        return buf;
+    }
+    const char *home = cbm_get_home_dir();
+    if (!home) {
+        return NULL;
+    }
+    return cbm_path_with_suffix(buf, sizeof(buf), home, "/AppData/Local");
+#else
+    const char *config = cbm_app_config_dir();
+    if (!config) {
+        buf[0] = '\0';
+        return NULL;
+    }
+    return cbm_path_with_suffix(buf, sizeof(buf), config, "");
+#endif
+}
+
+/* ── Cache directory ────────────────────────── */
+
+const char *cbm_resolve_cache_dir(void) {
+    static CBM_TLS char buf[CBM_SZ_1K];
+    if (!cbm_safe_getenv("CBM_CACHE_DIR", buf, sizeof(buf), "")) {
+        return NULL;
+    }
+    if (buf[0]) {
+#ifdef _WIN32
+        cbm_normalize_path_sep(buf);
+#endif
+        return buf;
+    }
+    const char *home = cbm_get_home_dir();
+    if (!home) {
+        return NULL;
+    }
+    return cbm_path_with_suffix(buf, sizeof(buf), home, "/.cache/codebase-memory-mcp");
 }

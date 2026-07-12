@@ -13,6 +13,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <store/store.h>
+#include <sqlite3/sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,10 +36,8 @@ TEST(checkpoint_does_not_truncate_wal) {
     ASSERT(s != NULL);
 
     /* Grow WAL beyond zero bytes via direct SQL. */
-    int rc_sql = cbm_store_exec(
-        s,
-        "INSERT OR IGNORE INTO projects(name, indexed_at, root_path) "
-        "VALUES('p', '2026-01-01', '/tmp/p');");
+    int rc_sql = cbm_store_exec(s, "INSERT OR IGNORE INTO projects(name, indexed_at, root_path) "
+                                   "VALUES('p', '2026-01-01', '/tmp/p');");
     ASSERT_EQ(rc_sql, 0);
     for (int i = 0; i < N_ROWS; i++) {
         char sql[256];
@@ -77,8 +76,7 @@ TEST(checkpoint_does_not_truncate_wal) {
 TEST(index_snapshot_generation_is_published_explicitly) {
     enum { PATH_BUF = 256, PATH_BUF_EXT = 300 };
     char db_path[PATH_BUF];
-    snprintf(db_path, sizeof(db_path), "%s/cbm_test_generation_%d.db", cbm_tmpdir(),
-             (int)getpid());
+    snprintf(db_path, sizeof(db_path), "%s/cbm_test_generation_%d.db", cbm_tmpdir(), (int)getpid());
     char wal_path[PATH_BUF_EXT];
     char shm_path[PATH_BUF_EXT];
     snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
@@ -92,8 +90,7 @@ TEST(index_snapshot_generation_is_published_explicitly) {
     ASSERT_EQ(cbm_store_upsert_project(s, "snapshot-test", "/tmp/snapshot-test"), CBM_STORE_OK);
 
     char *generation = NULL;
-    ASSERT_EQ(cbm_store_get_index_generation(s, "snapshot-test", &generation),
-              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(cbm_store_get_index_generation(s, "snapshot-test", &generation), CBM_STORE_NOT_FOUND);
     ASSERT_NULL(generation);
     ASSERT_EQ(cbm_store_mark_index_complete(s, "snapshot-test"), CBM_STORE_OK);
     ASSERT_EQ(cbm_store_get_index_generation(s, "snapshot-test", &generation), CBM_STORE_OK);
@@ -116,13 +113,46 @@ TEST(index_snapshot_generation_is_published_explicitly) {
     PASS();
 }
 
+TEST(index_snapshot_config_fingerprint_is_published_atomically) {
+    char db_path[256];
+    snprintf(db_path, sizeof(db_path), "%s/cbm_test_config_generation_%d.db", cbm_tmpdir(),
+             (int)getpid());
+    unlink(db_path);
 
-/* #897: any code path installing a fresh DB file must delete the
- * destination's -wal/-shm first. SQLite decides whether to replay a WAL
- * purely from the sidecar's own header/checksums — a leftover WAL from a
- * crashed previous session is recovered ON TOP of the freshly installed
- * file at the next open, splicing old-generation pages into it (short
- * indexes, btreeInitPage failures, or resurrected stale rows).
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "config-snapshot", "/tmp/config-snapshot"), CBM_STORE_OK);
+
+    char *fingerprint = NULL;
+    ASSERT_EQ(cbm_store_get_index_config_fingerprint(s, "config-snapshot", &fingerprint),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_NULL(fingerprint);
+    ASSERT_EQ(cbm_store_mark_index_complete_with_config(s, "config-snapshot", "config-one"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_index_config_fingerprint(s, "config-snapshot", &fingerprint),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(fingerprint, "config-one");
+    free(fingerprint);
+    fingerprint = NULL;
+
+    /* The legacy completion API remains compatible and intentionally marks
+     * the config generation unknown, forcing one conservative full rebuild. */
+    ASSERT_EQ(cbm_store_mark_index_complete(s, "config-snapshot"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_index_config_fingerprint(s, "config-snapshot", &fingerprint),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(fingerprint, "");
+    free(fingerprint);
+
+    cbm_store_close(s);
+    unlink(db_path);
+    PASS();
+}
+
+/* #897: any code path installing a fresh snapshot must consume or supersede
+ * the destination's WAL through SQLite rather than replacing the main file
+ * underneath it. SQLite decides whether to replay a WAL from its own
+ * header/checksums, so pathname-only replacement can splice old-generation
+ * pages into the new main file.
  *
  * Repro (per the issue): hot-copy a live WAL aside, close cleanly, restore
  * the copy as the crashed-session leftover, install a fresh generation via
@@ -225,8 +255,172 @@ TEST(dump_install_ignores_stale_wal_sidecar) {
     PASS();
 }
 
+TEST(snapshot_install_is_atomic_for_live_reader) {
+    char *td = th_mktempdir("cbm_live_snapshot");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/live.db", td);
+
+    cbm_store_t *old = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(old);
+    ASSERT_EQ(cbm_store_upsert_project(old, "live", "/tmp/live"), CBM_STORE_OK);
+    cbm_node_t stale = {.project = "live",
+                        .label = "Function",
+                        .name = "old_snapshot",
+                        .qualified_name = "live.mod.old_snapshot",
+                        .file_path = "mod.c",
+                        .start_line = 1,
+                        .end_line = 2};
+    ASSERT_TRUE(cbm_store_upsert_node(old, &stale) > 0);
+    cbm_store_close(old);
+
+    cbm_store_t *reader = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(reader);
+    ASSERT_EQ(cbm_store_exec(reader, "BEGIN;"), CBM_STORE_OK);
+    cbm_node_t *hits = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(reader, "live", "old_snapshot", &hits, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    cbm_store_free_nodes(hits, count);
+
+    cbm_store_t *fresh = cbm_store_open_memory();
+    ASSERT_NOT_NULL(fresh);
+    ASSERT_EQ(cbm_store_upsert_project(fresh, "live", "/tmp/live"), CBM_STORE_OK);
+    cbm_node_t replacement = {.project = "live",
+                              .label = "Function",
+                              .name = "new_snapshot",
+                              .qualified_name = "live.mod.new_snapshot",
+                              .file_path = "mod.c",
+                              .start_line = 1,
+                              .end_line = 2};
+    ASSERT_TRUE(cbm_store_upsert_node(fresh, &replacement) > 0);
+
+    /* Publishing must succeed without deleting sidecars or invalidating the
+     * reader's already-open transaction. */
+    ASSERT_EQ(cbm_store_dump_to_file(fresh, db_path), CBM_STORE_OK);
+    hits = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(reader, "live", "old_snapshot", &hits, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    cbm_store_free_nodes(hits, count);
+
+    ASSERT_EQ(cbm_store_exec(reader, "COMMIT;"), CBM_STORE_OK);
+    hits = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(reader, "live", "new_snapshot", &hits, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    cbm_store_free_nodes(hits, count);
+    hits = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(reader, "live", "old_snapshot", &hits, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_nodes(hits, count);
+
+    cbm_store_close(fresh);
+    cbm_store_close(reader);
+    th_rmtree(td);
+    PASS();
+}
+
+TEST(snapshot_install_preserves_source_page_size_before_wal) {
+    char *td = th_mktempdir("cbm_page_size");
+    ASSERT_NOT_NULL(td);
+    char source_path[512];
+    char dest_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/source.db", td);
+    snprintf(dest_path, sizeof(dest_path), "%s/dest.db", td);
+
+    sqlite3 *source = NULL;
+    ASSERT_EQ(sqlite3_open(source_path, &source), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(source,
+                           "PRAGMA page_size=65536; VACUUM; "
+                           "CREATE TABLE marker(value TEXT); "
+                           "INSERT INTO marker VALUES('fresh');",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(source);
+
+    /* A new destination opens at SQLite's default page size. Enabling WAL
+     * before aligning it with this 64 KiB source makes backup_step return
+     * SQLITE_READONLY. The installer must bind page size first. */
+    ASSERT_EQ(cbm_store_install_snapshot_file(source_path, dest_path), CBM_STORE_OK);
+    sqlite3 *dest = NULL;
+    ASSERT_EQ(sqlite3_open_v2(dest_path, &dest, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(dest, "PRAGMA page_size;", -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 65536);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(dest, "SELECT value FROM marker;", -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "fresh");
+    sqlite3_finalize(stmt);
+    sqlite3_close(dest);
+    th_rmtree(td);
+    PASS();
+}
+
+#ifndef _WIN32
+typedef struct {
+    char backup[512];
+    const char *victim;
+    bool swapped;
+} snapshot_swap_fixture_t;
+
+static void snapshot_swap_destination(const char *dest_path, void *userdata) {
+    snapshot_swap_fixture_t *fixture = (snapshot_swap_fixture_t *)userdata;
+    fixture->swapped =
+        rename(dest_path, fixture->backup) == 0 && symlink(fixture->victim, dest_path) == 0;
+}
+#endif
+
+TEST(snapshot_install_rejects_destination_check_open_swap) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink swap fixture");
+#else
+    char *td = th_mktempdir("cbm_snapshot_swap");
+    ASSERT_NOT_NULL(td);
+    char dest_path[512];
+    char victim_path[512];
+    snprintf(dest_path, sizeof(dest_path), "%s/dest.db", td);
+    snprintf(victim_path, sizeof(victim_path), "%s/victim.txt", td);
+    FILE *victim = fopen(victim_path, "w");
+    ASSERT_NOT_NULL(victim);
+    ASSERT_TRUE(fputs("outside-must-not-change", victim) >= 0);
+    ASSERT_EQ(fclose(victim), 0);
+
+    cbm_store_t *old = cbm_store_open_path(dest_path);
+    ASSERT_NOT_NULL(old);
+    cbm_store_close(old);
+    cbm_store_t *fresh = cbm_store_open_memory();
+    ASSERT_NOT_NULL(fresh);
+    snapshot_swap_fixture_t fixture = {.victim = victim_path};
+    snprintf(fixture.backup, sizeof(fixture.backup), "%s/original.db", td);
+    cbm_store_set_snapshot_install_hook_for_test(snapshot_swap_destination, &fixture);
+    ASSERT_EQ(cbm_store_dump_to_file(fresh, dest_path), CBM_STORE_ERR);
+    ASSERT_TRUE(fixture.swapped);
+    cbm_store_close(fresh);
+
+    char content[64] = {0};
+    victim = fopen(victim_path, "r");
+    ASSERT_NOT_NULL(victim);
+    ASSERT_NOT_NULL(fgets(content, sizeof(content), victim));
+    ASSERT_EQ(fclose(victim), 0);
+    ASSERT_STR_EQ(content, "outside-must-not-change");
+    th_rmtree(td);
+    PASS();
+#endif
+}
+
 SUITE(store_checkpoint) {
     RUN_TEST(checkpoint_does_not_truncate_wal);
     RUN_TEST(index_snapshot_generation_is_published_explicitly);
+    RUN_TEST(index_snapshot_config_fingerprint_is_published_atomically);
     RUN_TEST(dump_install_ignores_stale_wal_sidecar);
+    RUN_TEST(snapshot_install_is_atomic_for_live_reader);
+    RUN_TEST(snapshot_install_preserves_source_page_size_before_wal);
+    RUN_TEST(snapshot_install_rejects_destination_check_open_swap);
 }

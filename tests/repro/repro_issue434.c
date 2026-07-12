@@ -27,7 +27,7 @@
  *
  * Expected (correct) behaviour:
  *   Calling index_repository with persistence=true on a repo that has no
- *   prior artifact MUST create .codebase-memory/graph.db.zst after the run.
+ *   prior artifact MUST create a .codebase-memory artifact generation after the run.
  *   cbm_artifact_exists(repo_path) MUST return true after the first
  *   persistence=true index, not only after a second run.
  *
@@ -98,8 +98,7 @@ TEST(repro_issue434_persistence_honored_on_first_create) {
 
     /* Build the MCP JSON args with persistence=true */
     char args[700];
-    snprintf(args, sizeof(args),
-             "{\"repo_path\":\"%s\",\"persistence\":true}", lp.tmpdir);
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"persistence\":true}", lp.tmpdir);
 
     /* Create an MCP server and run index_repository with persistence=true.
      * This is the exact production code path that Cursor/VSCode calls. */
@@ -115,7 +114,7 @@ TEST(repro_issue434_persistence_honored_on_first_create) {
 
     /*
      * RED assertion: after a FIRST index_repository call with persistence=true
-     * the artifact MUST exist in .codebase-memory/graph.db.zst.
+     * a complete manifest/payload artifact generation MUST exist.
      *
      * On buggy code (pipeline_incremental.c dump_and_persist only checks
      * cbm_artifact_exists() not p->persistence) the artifact is NOT written
@@ -146,10 +145,10 @@ TEST(repro_issue434_persistence_honored_on_first_create) {
     /* Clean up the cache DB the pipeline wrote */
     if (proj) {
         const char *home = getenv("HOME");
-        if (!home) home = "/tmp";
+        if (!home)
+            home = "/tmp";
         char dbpath[600];
-        snprintf(dbpath, sizeof(dbpath), "%s/.cache/codebase-memory-mcp/%s.db",
-                 home, proj);
+        snprintf(dbpath, sizeof(dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, proj);
         unlink(dbpath);
         free(proj);
     }

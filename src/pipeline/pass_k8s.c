@@ -24,44 +24,26 @@
 #include "cbm.h"
 
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include <stdio.h>
 
 /* ── Internal helpers ────────────────────────────────────────────── */
 
-/* Read entire file into heap-allocated buffer. Returns NULL on error.
- * Caller must free(). Sets *out_len to byte count. */
-static char *k8s_read_file(const char *path, int *out_len) {
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
+static char *k8s_read_file(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file, int *out_len) {
+    char *source = NULL;
+    size_t source_len = 0;
+    char source_sha256[CBM_SHA256_HEX_LEN + 1];
+    long configured = cbm_max_file_bytes();
+    size_t max_bytes = configured > 0 ? (size_t)configured : 1U;
+    if (cbm_pipeline_read_selected_source(ctx, file, max_bytes, &source, &source_len,
+                                          source_sha256) != 0 ||
+        source_len == 0 || source_len > INT_MAX) {
+        free(source);
         return NULL;
     }
-
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-
-    if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
-        (void)fclose(f);
-        return NULL;
-    }
-
-    /* +pad: tree-sitter lexer lookahead reads past EOF; keep it in-bounds */
-    enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
-    if (!buf) {
-        (void)fclose(f);
-        return NULL;
-    }
-
-    size_t nread = fread(buf, SKIP_ONE, size, f);
-    (void)fclose(f);
-    if (nread > (size_t)size) {
-        nread = (size_t)size;
-    }
-    memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
-    *out_len = (int)nread;
-    return buf;
+    *out_len = (int)source_len;
+    return source;
 }
 
 /* Format int to string for logging. Thread-safe via TLS. */
@@ -83,8 +65,9 @@ static const char *k8s_basename(const char *path) {
 
 /* ── Kustomize handler ───────────────────────────────────────────── */
 
-static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const char *rel_path,
+static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file,
                              CBMFileResult *result) {
+    const char *rel_path = file->rel_path;
     /* Emit Module node for this kustomize overlay file */
     char *mod_qn = cbm_infra_qn(ctx->project_name, rel_path, "kustomize", NULL);
     if (!mod_qn) {
@@ -108,7 +91,7 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
     if (!res) {
         /* Fall back to re-extraction */
         int src_len = 0;
-        char *source = k8s_read_file(path, &src_len);
+        char *source = k8s_read_file(ctx, file, &src_len);
         if (source) {
             res = cbm_extract_file(source, src_len, CBM_LANG_KUSTOMIZE, ctx->project_name, rel_path,
                                    CBM_EXTRACT_BUDGET, NULL, NULL);
@@ -652,19 +635,19 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
 
         if (is_gomod_file(base) || lang == CBM_LANG_GOMOD || is_requirements_file(base)) {
             int dep_len = 0;
-            char *dep_src = k8s_read_file(path, &dep_len);
+            char *dep_src = k8s_read_file(ctx, &files[i], &dep_len);
             if (dep_src) {
                 handle_dep_manifest(ctx, rel, dep_src,
                                     is_requirements_file(base) ? "pypi" : "gomod");
                 free(dep_src);
             }
         } else if (cbm_is_kustomize_file(base)) {
-            handle_kustomize(ctx, path, rel, cached);
+            handle_kustomize(ctx, &files[i], cached);
             kustomize_count++;
         } else if (lang == CBM_LANG_YAML || lang == CBM_LANG_K8S) {
             /* Read source once to classify (and reuse for uncached extraction). */
             int src_len = 0;
-            char *source = k8s_read_file(path, &src_len);
+            char *source = k8s_read_file(ctx, &files[i], &src_len);
             if (source) {
                 if (is_helm_chart_file(base)) {
                     handle_helm_chart(ctx, rel, source);

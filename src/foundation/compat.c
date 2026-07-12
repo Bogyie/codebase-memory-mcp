@@ -7,11 +7,16 @@
 #include "foundation/compat.h"
 #include "foundation/constants.h"
 
+#include <stdbool.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
+#include "foundation/win_utf8.h"
+
 #include <io.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #endif
 
@@ -54,60 +59,260 @@ char *cbm_strcasestr(const char *haystack, const char *needle) {
 
 #ifdef _WIN32
 #include <direct.h>
-char *cbm_mkdtemp(char *tmpl) {
-    /* Build path in static buffer, then copy back to caller.
-     * Callers must provide buffers >= CBM_SZ_256 bytes (all test code does). */
-    static char buf[CBM_SZ_512];
-    if (strncmp(tmpl, "/tmp/", 5) == 0) {
-        const char *tmp = getenv("TEMP");
-        if (!tmp)
-            tmp = getenv("TMP");
-        if (!tmp)
-            tmp = ".";
-        snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
-    } else {
-        snprintf(buf, sizeof(buf), "%s", tmpl);
-    }
-    if (!_mktemp(buf))
-        return NULL;
-    if (_mkdir(buf) != 0)
-        return NULL;
-    /* Normalize to forward slashes. Callers embed this path in JSON repo_path
-     * (where "\t"/"\a" are invalid escapes → index fails) and pass it to git -C.
-     * Windows file APIs accept forward slashes, so the created dir is unaffected. */
-    for (char *p = buf; *p; p++) {
-        if (*p == '\\') {
-            *p = '/';
-        }
-    }
-    /* Copy result back — callers now use char[CBM_SZ_256]+ buffers */
-    strcpy(tmpl, buf);
-    return tmpl;
-}
+char *cbm_mkdtemp(char *tmpl);
 #endif
 
 /* ── mkstemp (Windows lacks it) ───────────────────────────────── */
 
 #ifdef _WIN32
-int cbm_mkstemp(char *tmpl) {
-    /* Rewrite /tmp/ to %TEMP%\ like cbm_mkdtemp */
-    static char buf[CBM_SZ_512];
-    if (strncmp(tmpl, "/tmp/", 5) == 0) {
-        const char *tmp = getenv("TEMP");
-        if (!tmp)
-            tmp = getenv("TMP");
-        if (!tmp)
-            tmp = ".";
-        snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
-    } else {
-        snprintf(buf, sizeof(buf), "%s", tmpl);
+int cbm_mkstemp(char *tmpl);
+#endif
+
+#ifdef _WIN32
+
+typedef LONG(WINAPI *cbm_bcrypt_gen_random_fn)(void *, unsigned char *, ULONG, ULONG);
+typedef BOOLEAN(APIENTRY *cbm_rtl_gen_random_fn)(PVOID, ULONG);
+
+const char *cbm_tmpdir(void) {
+    static CBM_TLS char result[CBM_PATH_MAX];
+    result[0] = '\0';
+
+    DWORD needed = GetTempPathW(0, NULL);
+    if (needed == 0 || needed > 32768U) {
+        return NULL;
     }
-    if (!_mktemp(buf))
+    wchar_t *wide = malloc(((size_t)needed + 1U) * sizeof(*wide));
+    if (!wide) {
+        return NULL;
+    }
+    DWORD written = GetTempPathW(needed + 1U, wide);
+    if (written == 0 || written > needed || wide[0] == L'\0') {
+        free(wide);
+        return NULL;
+    }
+    char *utf8 = cbm_wide_to_utf8(wide);
+    free(wide);
+    if (!utf8) {
+        return NULL;
+    }
+    size_t len = strlen(utf8);
+    if (len == 0 || len >= sizeof(result)) {
+        free(utf8);
+        return NULL;
+    }
+    memcpy(result, utf8, len + 1U);
+    free(utf8);
+    for (char *p = result; *p; p++) {
+        if (*p == '\\') {
+            *p = '/';
+        }
+    }
+    return result;
+}
+
+/* Fill from the OS CSPRNG without imposing a bcrypt link dependency.
+ * SystemFunction036 is the supported legacy primitive used by rand_s. */
+static bool cbm_secure_random(void *bytes, size_t len) {
+    if (!bytes || len == 0 || len > (size_t)ULONG_MAX) {
+        return false;
+    }
+    HMODULE bcrypt = LoadLibraryW(L"bcrypt.dll");
+    if (bcrypt) {
+        cbm_bcrypt_gen_random_fn generate =
+            (cbm_bcrypt_gen_random_fn)(void *)GetProcAddress(bcrypt, "BCryptGenRandom");
+        bool ok = generate && generate(NULL, (unsigned char *)bytes, (ULONG)len,
+                                       0x00000002UL /* system-preferred RNG */) >= 0;
+        FreeLibrary(bcrypt);
+        if (ok) {
+            return true;
+        }
+    }
+    HMODULE advapi = LoadLibraryW(L"advapi32.dll");
+    if (!advapi) {
+        return false;
+    }
+    cbm_rtl_gen_random_fn generate =
+        (cbm_rtl_gen_random_fn)(void *)GetProcAddress(advapi, "SystemFunction036");
+    bool ok = generate && generate(bytes, (ULONG)len) != FALSE;
+    FreeLibrary(advapi);
+    return ok;
+}
+
+static wchar_t *cbm_temp_template_wide(const char *tmpl, bool *expanded_tmp) {
+    if (expanded_tmp) {
+        *expanded_tmp = false;
+    }
+    if (!tmpl) {
+        return NULL;
+    }
+    if (strncmp(tmpl, "/tmp/", 5) != 0) {
+        return cbm_utf8_to_wide(tmpl);
+    }
+    DWORD need = GetTempPathW(0, NULL);
+    if (need == 0 || need > 32768U) {
+        return NULL;
+    }
+    wchar_t *temp = (wchar_t *)malloc(((size_t)need + 1U) * sizeof(*temp));
+    if (!temp) {
+        return NULL;
+    }
+    DWORD written = GetTempPathW(need + 1U, temp);
+    wchar_t *tail = cbm_utf8_to_wide(tmpl + 5);
+    if (written == 0 || written > need || !tail) {
+        free(tail);
+        free(temp);
+        return NULL;
+    }
+    size_t temp_len = wcslen(temp);
+    size_t tail_len = wcslen(tail);
+    bool separator = temp_len > 0 && temp[temp_len - 1] != L'\\' && temp[temp_len - 1] != L'/';
+    if (temp_len > SIZE_MAX - tail_len - (separator ? 2U : 1U)) {
+        free(tail);
+        free(temp);
+        return NULL;
+    }
+    size_t joined_len = temp_len + tail_len + (separator ? 1U : 0U);
+    wchar_t *joined = (wchar_t *)malloc((joined_len + 1U) * sizeof(*joined));
+    if (!joined) {
+        free(tail);
+        free(temp);
+        return NULL;
+    }
+    memcpy(joined, temp, temp_len * sizeof(*joined));
+    size_t pos = temp_len;
+    if (separator) {
+        joined[pos++] = L'\\';
+    }
+    memcpy(joined + pos, tail, (tail_len + 1U) * sizeof(*joined));
+    free(tail);
+    free(temp);
+    if (expanded_tmp) {
+        *expanded_tmp = true;
+    }
+    return joined;
+}
+
+static wchar_t *cbm_temp_x_suffix(wchar_t *path) {
+    if (!path) {
+        return NULL;
+    }
+    size_t len = wcslen(path);
+    if (len < 6U) {
+        return NULL;
+    }
+    wchar_t *suffix = path + len - 6U;
+    for (size_t i = 0; i < 6U; i++) {
+        if (suffix[i] != L'X') {
+            return NULL;
+        }
+    }
+    return suffix;
+}
+
+static bool cbm_temp_publish_path(char *tmpl, const wchar_t *created, bool expanded_tmp) {
+    char *utf8 = cbm_wide_to_utf8(created);
+    if (!utf8) {
+        return false;
+    }
+    for (char *p = utf8; *p; p++) {
+        if (*p == '\\') {
+            *p = '/';
+        }
+    }
+    size_t result_len = strlen(utf8);
+    size_t original_len = strlen(tmpl);
+    /* /tmp expansion retains the documented >=256-byte buffer contract.  All
+     * other results have exactly the input length and cannot overrun tmpl. */
+    bool fits = expanded_tmp ? result_len < CBM_SZ_256 : result_len == original_len;
+    if (fits) {
+        memcpy(tmpl, utf8, result_len + 1U);
+    }
+    free(utf8);
+    return fits;
+}
+
+static bool cbm_temp_randomize_suffix(wchar_t suffix[6]) {
+    static const wchar_t hex[] = L"0123456789abcdef";
+    unsigned char random[3];
+    if (!cbm_secure_random(random, sizeof(random))) {
+        return false;
+    }
+    uint32_t value =
+        ((uint32_t)random[0] << 16U) | ((uint32_t)random[1] << 8U) | (uint32_t)random[2];
+    for (size_t i = 0; i < 6U; i++) {
+        unsigned int shift = (unsigned int)((5U - i) * 4U);
+        suffix[i] = hex[(value >> shift) & 0x0fU];
+    }
+    return true;
+}
+
+char *cbm_mkdtemp(char *tmpl) {
+    bool expanded_tmp = false;
+    wchar_t *path = cbm_temp_template_wide(tmpl, &expanded_tmp);
+    wchar_t *suffix = cbm_temp_x_suffix(path);
+    if (!suffix) {
+        free(path);
+        return NULL;
+    }
+    for (unsigned int attempt = 0; attempt < 256U; attempt++) {
+        if (!cbm_temp_randomize_suffix(suffix)) {
+            break;
+        }
+        if (CreateDirectoryW(path, NULL)) {
+            if (cbm_temp_publish_path(tmpl, path, expanded_tmp)) {
+                free(path);
+                return tmpl;
+            }
+            (void)RemoveDirectoryW(path);
+            break;
+        }
+        DWORD error = GetLastError();
+        if (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) {
+            break;
+        }
+    }
+    free(path);
+    return NULL;
+}
+
+int cbm_mkstemp(char *tmpl) {
+    bool expanded_tmp = false;
+    wchar_t *path = cbm_temp_template_wide(tmpl, &expanded_tmp);
+    wchar_t *suffix = cbm_temp_x_suffix(path);
+    if (!suffix) {
+        free(path);
         return CBM_NOT_FOUND;
-    int fd = _open(buf, _O_CREAT | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
-    if (fd >= 0)
-        strcpy(tmpl, buf);
-    return fd;
+    }
+    for (unsigned int attempt = 0; attempt < 256U; attempt++) {
+        if (!cbm_temp_randomize_suffix(suffix)) {
+            break;
+        }
+        HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                                  FILE_ATTRIBUTE_TEMPORARY, NULL);
+        if (file != INVALID_HANDLE_VALUE) {
+            if (!cbm_temp_publish_path(tmpl, path, expanded_tmp)) {
+                CloseHandle(file);
+                (void)DeleteFileW(path);
+                free(path);
+                return CBM_NOT_FOUND;
+            }
+            int fd = _open_osfhandle((intptr_t)file, _O_RDWR | _O_BINARY);
+            if (fd < 0) {
+                CloseHandle(file);
+                (void)DeleteFileW(path);
+                free(path);
+                return CBM_NOT_FOUND;
+            }
+            free(path);
+            return fd;
+        }
+        DWORD error = GetLastError();
+        if (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) {
+            break;
+        }
+    }
+    free(path);
+    return CBM_NOT_FOUND;
 }
 #endif
 

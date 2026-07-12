@@ -464,6 +464,12 @@ cbm_registry_t *cbm_registry_new(void) {
     }
     r->exact = cbm_ht_create(CBM_SZ_1K);
     r->by_name = cbm_ht_create(CBM_SZ_512);
+    if (!r->exact || !r->by_name) {
+        cbm_ht_free(r->exact);
+        cbm_ht_free(r->by_name);
+        free(r);
+        return NULL;
+    }
     return r;
 }
 

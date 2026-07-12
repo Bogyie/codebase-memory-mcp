@@ -1,7 +1,8 @@
 /*
  * diagnostics.h — Periodic diagnostics file writer.
  *
- * When CBM_DIAGNOSTICS=1, writes /tmp/cbm-diagnostics-<pid>.json every 5s.
+ * When CBM_DIAGNOSTICS=1, writes a latest snapshot and retained trajectory in
+ * a private temporary diagnostics directory every 5s.
  * Soak tests read this file to track memory, FDs, query stats over time.
  */
 #ifndef CBM_DIAGNOSTICS_H
@@ -29,7 +30,8 @@ void cbm_diag_record_query(long long duration_us, bool is_error);
  * Call once from main(). Returns true if started. */
 bool cbm_diag_start(void);
 
-/* Stop the writer thread and delete the diagnostics file. */
+/* Stop the writer thread and delete the live snapshot. The containing private
+ * directory and trajectory are intentionally retained for postmortem use. */
 void cbm_diag_stop(void);
 
 #endif /* CBM_DIAGNOSTICS_H */

@@ -51,8 +51,10 @@ int64_t cbm_memory_snapshot_epoch(cbm_memory_t *memory);
  * portable part of the sharing format. */
 int cbm_memory_rebuild_projection(cbm_memory_t *memory);
 
-/* Recover expired leases and materialize all pending wiki outbox entries.
- * Returns the number completed by this call, or -1 on failure. */
+/* Recover expired leases and materialize eligible pending/failed wiki outbox
+ * entries. Failed entries use bounded exponential backoff and stop retrying
+ * after the implementation-defined attempt limit. Returns the number completed
+ * by this call, or -1 on an internal failure. */
 int cbm_memory_materialize_pending(cbm_memory_t *memory);
 
 /* Resolve symbolic CodeRefs against a repository graph, update their
@@ -67,12 +69,15 @@ int cbm_memory_validate_code_refs(cbm_memory_t *memory, cbm_store_t *code_store,
  * internal failure.
  *
  * ingest: {content|string, path|string, title?, origin?, media_type?,
- *          published_at?, metadata?, revision_of?}
+ *          published_at?, metadata?, revision_of?}. Path ingest is disabled by
+ *          default; configure CBM_MEMORY_INGEST_ROOTS (platform path-list) or
+ *          explicitly set CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST=1. Content ingest
+ *          is unaffected.
  * query:  {query?, mode?, current_context?, freshness?, limit?, as_of?}
  * propose:{proposal_id?, base_epoch?, agent_id?, session_id?, reason?,
  *          expected_revisions?, operations:[...]}
- * commit: {proposal_id, operation_id, agent_id?, session_id?}
- * lint:   {checks?:[...], limit?, apply?}
+ * commit: {proposal_id, operation_id, user_approved:true, agent_id?, session_id?}
+ * lint:   {checks?:[...], limit?, current_project?}; apply is rejected
  * mark_code_changes:
  *         {project, files?:[...], qualified_names?:[...], deleted?:bool, reason?:string}
  */

@@ -7,6 +7,7 @@
  */
 
 #include "memory/memory.h"
+#include "memory/memory_raw.h"
 
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
@@ -29,7 +30,14 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#define MEM_STRINGIFY_INNER(value) #value
+#define MEM_STRINGIFY(value) MEM_STRINGIFY_INNER(value)
+#define MEM_OUTBOX_MAX_ATTEMPTS 5
+#define MEM_PROJECT_RANKING_BOOST 1.0
+
 #ifdef _WIN32
+#include "foundation/win_utf8.h"
+
 #include <io.h>
 #include <process.h>
 #define getpid _getpid
@@ -44,8 +52,10 @@ enum {
     MEM_TIME_MAX = 32,
     MEM_DEFAULT_LIMIT = 10,
     MEM_MAX_LIMIT = 100,
-    MEM_MAX_SOURCE_BYTES = 16 * 1024 * 1024,
     MEM_OUTBOX_LEASE_SECONDS = 30,
+    MEM_OUTBOX_RETRY_BASE_SECONDS = 2,
+    MEM_OUTBOX_RETRY_MAX_SECONDS = 300,
+    MEM_RAW_GC_GRACE_SECONDS = 24 * 60 * 60,
 };
 
 struct cbm_memory {
@@ -519,6 +529,23 @@ static void memory_harden_sqlite_files(cbm_memory_t *m) {
 #endif
 }
 
+static bool memory_raw_object_is_referenced(const char *object_relpath, void *opaque) {
+    cbm_memory_t *m = opaque;
+    if (!m || !m->db || !object_relpath) {
+        return true;
+    }
+    sqlite3_stmt *stmt = NULL;
+    bool referenced = true;
+    if (sqlite3_prepare_v2(m->db, "SELECT 1 FROM memory_sources WHERE object_relpath=?1 LIMIT 1;",
+                           -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(stmt, 1, object_relpath, -1, SQLITE_TRANSIENT) == SQLITE_OK) {
+        int step_rc = sqlite3_step(stmt);
+        referenced = step_rc != SQLITE_DONE;
+    }
+    sqlite3_finalize(stmt);
+    return referenced;
+}
+
 cbm_memory_t *cbm_memory_open(const char *home_override) {
     char home[MEM_PATH_MAX];
     if (resolve_memory_home(home_override, home) != 0) {
@@ -584,6 +611,8 @@ cbm_memory_t *cbm_memory_open(const char *home_override) {
         free(m);
         return NULL;
     }
+    (void)cbm_memory_raw_gc(m->home, MEM_RAW_GC_GRACE_SECONDS, memory_raw_object_is_referenced, m,
+                            NULL, NULL);
     (void)memory_recover_outbox(m);
     memory_harden_sqlite_files(m);
     return m;
@@ -644,7 +673,11 @@ static int64_t memory_scalar_int64(cbm_memory_t *m, const char *sql) {
     if (!m || memory_prepare(m, sql, &stmt) != 0) {
         return -1;
     }
-    int64_t value = sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
+    int step_rc = sqlite3_step(stmt);
+    int64_t value = step_rc == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
+    if (step_rc != SQLITE_ROW) {
+        memory_set_sqlite_error(m, "read status metric");
+    }
     sqlite3_finalize(stmt);
     return value;
 }
@@ -657,6 +690,7 @@ char *cbm_memory_status_json(cbm_memory_t *m, const char *args_json) {
     if (sqlite3_exec(m->db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK) {
         return json_error("database_busy", sqlite3_errmsg(m->db));
     }
+    m->error[0] = '\0';
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
@@ -670,67 +704,85 @@ char *cbm_memory_status_json(cbm_memory_t *m, const char *args_json) {
     }
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_bool(doc, root, "ok", true);
-    yyjson_mut_obj_add_int(doc, root, "snapshot_epoch", cbm_memory_snapshot_epoch(m));
+    int64_t snapshot_epoch = cbm_memory_snapshot_epoch(m);
+    if (snapshot_epoch < 0) {
+        goto status_failed;
+    }
+    yyjson_mut_obj_add_int(doc, root, "snapshot_epoch", snapshot_epoch);
 
     struct {
         const char *name;
         const char *sql;
+        bool counts_as_entity;
     } entity_metrics[] = {
-        {"sources", "SELECT count(*) FROM memory_sources;"},
-        {"pages", "SELECT count(*) FROM memory_pages;"},
-        {"claims", "SELECT count(*) FROM memory_claims WHERE recorded_to IS NULL;"},
-        {"decisions", "SELECT count(*) FROM memory_decisions;"},
-        {"experiences", "SELECT count(*) FROM memory_experiences;"},
-        {"preferences", "SELECT count(*) FROM memory_preferences;"},
-        {"code_refs", "SELECT count(*) FROM memory_code_refs;"},
-        {"relations", "SELECT count(*) FROM memory_relations WHERE recorded_to IS NULL;"},
+        {"sources", "SELECT count(*) FROM memory_sources;", true},
+        {"pages", "SELECT count(*) FROM memory_pages;", true},
+        {"claims", "SELECT count(*) FROM memory_claims WHERE recorded_to IS NULL;", true},
+        {"decisions", "SELECT count(*) FROM memory_decisions;", true},
+        {"experiences", "SELECT count(*) FROM memory_experiences;", true},
+        {"preferences", "SELECT count(*) FROM memory_preferences;", true},
+        {"code_refs", "SELECT count(*) FROM memory_code_refs;", true},
+        {"relations", "SELECT count(*) FROM memory_relations WHERE recorded_to IS NULL;", false},
     };
     int64_t entity_total = 0;
     for (size_t i = 0; i < sizeof(entity_metrics) / sizeof(entity_metrics[0]); i++) {
         int64_t value = memory_scalar_int64(m, entity_metrics[i].sql);
+        if (value < 0) {
+            goto status_failed;
+        }
         yyjson_mut_obj_add_int(doc, entities, entity_metrics[i].name, value);
-        if (value > 0) {
+        if (entity_metrics[i].counts_as_entity) {
             entity_total += value;
         }
     }
     yyjson_mut_obj_add_int(doc, entities, "total", entity_total);
     yyjson_mut_obj_add_val(doc, root, "entities", entities);
 
-    yyjson_mut_obj_add_int(doc, maintenance, "open_dirty",
-                           memory_scalar_int64(m,
-                                               "SELECT count(*) FROM memory_dirty WHERE "
-                                               "status='open';"));
-    yyjson_mut_obj_add_int(doc, maintenance, "unresolved_code_refs",
-                           memory_scalar_int64(m,
-                                               "SELECT count(*) FROM memory_code_refs WHERE "
-                                               "resolution_status!='resolved';"));
-    yyjson_mut_obj_add_int(doc, maintenance, "missing_code_refs",
-                           memory_scalar_int64(m,
-                                               "SELECT count(*) FROM memory_code_refs WHERE "
-                                               "resolution_status='missing';"));
-    yyjson_mut_obj_add_int(doc, maintenance, "pending_outbox",
-                           memory_scalar_int64(m,
-                                               "SELECT count(*) FROM memory_outbox WHERE "
-                                               "state IN ('pending','leased','failed');"));
-    yyjson_mut_obj_add_int(doc, maintenance, "pending_proposals",
-                           memory_scalar_int64(m,
-                                               "SELECT count(*) FROM memory_proposals WHERE "
-                                               "status='pending';"));
+    struct {
+        const char *name;
+        const char *sql;
+    } maintenance_metrics[] = {
+        {"open_dirty", "SELECT count(*) FROM memory_dirty WHERE status='open';"},
+        {"unresolved_code_refs",
+         "SELECT count(*) FROM memory_code_refs WHERE resolution_status!='resolved';"},
+        {"missing_code_refs",
+         "SELECT count(*) FROM memory_code_refs WHERE resolution_status='missing';"},
+        {"pending_outbox",
+         "SELECT count(*) FROM memory_outbox WHERE state IN ('pending','leased','failed');"},
+        {"failed_outbox", "SELECT count(*) FROM memory_outbox WHERE state='failed';"},
+        {"exhausted_outbox",
+         "SELECT count(*) FROM memory_outbox WHERE state='failed' AND attempts>=" MEM_STRINGIFY(
+             MEM_OUTBOX_MAX_ATTEMPTS) ";"},
+        {"pending_proposals", "SELECT count(*) FROM memory_proposals WHERE status='pending';"},
+    };
+    for (size_t i = 0; i < sizeof(maintenance_metrics) / sizeof(maintenance_metrics[0]); i++) {
+        int64_t value = memory_scalar_int64(m, maintenance_metrics[i].sql);
+        if (value < 0) {
+            goto status_failed;
+        }
+        yyjson_mut_obj_add_int(doc, maintenance, maintenance_metrics[i].name, value);
+    }
     yyjson_mut_obj_add_val(doc, root, "maintenance", maintenance);
 
     yyjson_mut_obj_add_str(doc, projection, "strategy", "full_rebuild");
     yyjson_mut_obj_add_uint(doc, projection, "runs_in_process", m->projection_runs);
     yyjson_mut_obj_add_int(doc, projection, "last_rebuild_ms", m->projection_last_ms);
-    yyjson_mut_obj_add_int(doc, projection, "last_rebuild_documents",
-                           m->projection_last_documents);
-    yyjson_mut_obj_add_int(doc, projection, "documents",
-                           memory_scalar_int64(m, "SELECT count(*) FROM memory_documents;"));
-    yyjson_mut_obj_add_int(doc, projection, "nodes",
-                           memory_scalar_int64(
-                               m, "SELECT count(*) FROM nodes WHERE project='global-memory';"));
-    yyjson_mut_obj_add_int(doc, projection, "edges",
-                           memory_scalar_int64(
-                               m, "SELECT count(*) FROM edges WHERE project='global-memory';"));
+    yyjson_mut_obj_add_int(doc, projection, "last_rebuild_documents", m->projection_last_documents);
+    struct {
+        const char *name;
+        const char *sql;
+    } projection_metrics[] = {
+        {"documents", "SELECT count(*) FROM memory_documents;"},
+        {"nodes", "SELECT count(*) FROM nodes WHERE project='global-memory';"},
+        {"edges", "SELECT count(*) FROM edges WHERE project='global-memory';"},
+    };
+    for (size_t i = 0; i < sizeof(projection_metrics) / sizeof(projection_metrics[0]); i++) {
+        int64_t value = memory_scalar_int64(m, projection_metrics[i].sql);
+        if (value < 0) {
+            goto status_failed;
+        }
+        yyjson_mut_obj_add_int(doc, projection, projection_metrics[i].name, value);
+    }
     yyjson_mut_obj_add_val(doc, root, "projection", projection);
     if (sqlite3_exec(m->db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
         yyjson_mut_doc_free(doc);
@@ -740,6 +792,14 @@ char *cbm_memory_status_json(cbm_memory_t *m, const char *args_json) {
     char *out = json_write_mut(doc);
     yyjson_mut_doc_free(doc);
     return out;
+
+status_failed: {
+    char detail[CBM_SZ_512];
+    (void)snprintf(detail, sizeof(detail), "%s", m->error[0] ? m->error : sqlite3_errmsg(m->db));
+    yyjson_mut_doc_free(doc);
+    (void)sqlite3_exec(m->db, "ROLLBACK;", NULL, NULL, NULL);
+    return json_error("status_failed", detail);
+}
 }
 
 static char *json_error(const char *code, const char *message) {
@@ -893,56 +953,35 @@ static int memory_document_upsert(cbm_memory_t *m, const char *kind, const char 
 
 /* ── Immutable source objects ─────────────────────────────────── */
 
-static int read_file_bytes(const char *path, unsigned char **out, size_t *out_len) {
+static int memory_read_canonical_raw_object(cbm_memory_t *m, const char *relative,
+                                            unsigned char **out, size_t *out_len) {
+    if (!m || !relative || !out || !out_len) {
+        return -1;
+    }
     *out = NULL;
     *out_len = 0;
-    FILE *fp = cbm_fopen(path, "rb");
-    if (!fp) {
+    char target[MEM_PATH_MAX];
+    char target_parent[MEM_PATH_MAX];
+    char canonical_target[MEM_PATH_MAX];
+    char canonical_parent[MEM_PATH_MAX];
+    int n = snprintf(target, sizeof(target), "%s/%s", m->home, relative);
+    if (n < 0 || n >= (int)sizeof(target) ||
+        snprintf(target_parent, sizeof(target_parent), "%s", target) >=
+            (int)sizeof(target_parent)) {
         return -1;
     }
-    if (fseek(fp, 0, SEEK_END) != 0) {
-        fclose(fp);
+    char *slash = strrchr(target_parent, '/');
+    if (!slash || slash == target_parent) {
         return -1;
     }
-    long size = ftell(fp);
-    if (size < 0 || size > MEM_MAX_SOURCE_BYTES || fseek(fp, 0, SEEK_SET) != 0) {
-        fclose(fp);
+    *slash = '\0';
+    if (cbm_memory_raw_validate_object_parent(m->home, target, target_parent, canonical_target,
+                                              sizeof(canonical_target), canonical_parent,
+                                              sizeof(canonical_parent)) != 0) {
         return -1;
     }
-    unsigned char *bytes = malloc((size_t)size + 1U);
-    if (!bytes) {
-        fclose(fp);
-        return -1;
-    }
-    size_t got = fread(bytes, 1, (size_t)size, fp);
-    int failed = ferror(fp);
-    fclose(fp);
-    if (failed || got != (size_t)size) {
-        free(bytes);
-        return -1;
-    }
-    bytes[got] = 0;
-    *out = bytes;
-    *out_len = got;
-    return 0;
-}
-
-static bool raw_object_matches(const char *path, const unsigned char *bytes, size_t len,
-                               const char *expected_hash) {
-    if (!cbm_file_exists(path) || cbm_file_size(path) != (int64_t)len) {
-        return false;
-    }
-    unsigned char *existing = NULL;
-    size_t existing_len = 0;
-    if (read_file_bytes(path, &existing, &existing_len) != 0) {
-        return false;
-    }
-    char hash[CBM_SHA256_HEX_LEN + 1];
-    cbm_sha256_hex(existing, existing_len, hash);
-    bool matches = existing_len == len && strcmp(hash, expected_hash) == 0 &&
-                   (len == 0 || memcmp(existing, bytes, len) == 0);
-    free(existing);
-    return matches;
+    return cbm_memory_raw_read_regular_file(canonical_target, CBM_MEMORY_RAW_MAX_SOURCE_BYTES, out,
+                                            out_len);
 }
 
 static int durable_flush(FILE *fp) {
@@ -983,55 +1022,6 @@ static int sync_parent_directory(const char *path) {
     close(fd);
     return rc;
 #endif
-}
-
-static int write_raw_object(cbm_memory_t *m, const char *final_path, const unsigned char *bytes,
-                            size_t len, const char *hash) {
-    (void)m;
-    if (cbm_file_exists(final_path)) {
-#ifndef _WIN32
-        if (chmod(final_path, 0600) != 0) {
-            return -1;
-        }
-#endif
-        return raw_object_matches(final_path, bytes, len, hash) ? 0 : -1;
-    }
-    static atomic_uint_fast64_t sequence = 1;
-    uint64_t seq = atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
-    char temp[MEM_PATH_MAX];
-    int n = snprintf(temp, sizeof(temp), "%s.tmp.%ld.%" PRIu64, final_path, (long)getpid(), seq);
-    if (n < 0 || n >= (int)sizeof(temp)) {
-        return -1;
-    }
-    FILE *fp = cbm_fopen(temp, "wb");
-    if (!fp) {
-        return -1;
-    }
-    size_t written = len ? fwrite(bytes, 1, len, fp) : 0;
-    int flush_rc = written == len ? durable_flush(fp) : -1;
-    int close_rc = fclose(fp);
-    if (flush_rc != 0 || close_rc != 0) {
-        (void)cbm_unlink(temp);
-        return -1;
-    }
-#ifndef _WIN32
-    if (chmod(temp, 0600) != 0) {
-        (void)cbm_unlink(temp);
-        return -1;
-    }
-#endif
-    if (cbm_file_exists(final_path)) {
-        (void)cbm_unlink(temp);
-        return raw_object_matches(final_path, bytes, len, hash) ? 0 : -1;
-    }
-    if (cbm_rename_replace(temp, final_path) != 0) {
-        (void)cbm_unlink(temp);
-        return -1;
-    }
-    return raw_object_matches(final_path, bytes, len, hash) &&
-                   sync_parent_directory(final_path) == 0
-               ? 0
-               : -1;
 }
 
 static bool safe_path_component(const char *value) {
@@ -1145,6 +1135,17 @@ static void iso_after_seconds(int seconds, char out[MEM_TIME_MAX]) {
     (void)strftime(out, MEM_TIME_MAX, "%Y-%m-%dT%H:%M:%SZ", &tmv);
 }
 
+static int memory_outbox_retry_delay(int attempts) {
+    int delay = MEM_OUTBOX_RETRY_BASE_SECONDS;
+    for (int i = 1; i < attempts && delay < MEM_OUTBOX_RETRY_MAX_SECONDS; i++) {
+        delay *= 2;
+        if (delay > MEM_OUTBOX_RETRY_MAX_SECONDS) {
+            delay = MEM_OUTBOX_RETRY_MAX_SECONDS;
+        }
+    }
+    return delay;
+}
+
 static int memory_recover_outbox(cbm_memory_t *m) {
     if (!m) {
         return -1;
@@ -1160,14 +1161,18 @@ static int memory_recover_outbox(cbm_memory_t *m) {
             return processed > 0 ? processed : -1;
         }
         sqlite3_stmt *stmt = NULL;
-        const char *select_sql = "SELECT outbox_id,aggregate_id,revision FROM memory_outbox"
-                                 " WHERE state='pending' OR (state='leased' AND lease_until<=?)"
-                                 " ORDER BY outbox_id LIMIT 1;";
+        const char *select_sql =
+            "SELECT outbox_id,aggregate_id,revision,attempts FROM memory_outbox"
+            " WHERE state='pending' OR (state='leased' AND lease_until<=?)"
+            " OR (state='failed' AND attempts<? AND (lease_until IS NULL OR lease_until<=?))"
+            " ORDER BY outbox_id LIMIT 1;";
         if (memory_prepare(m, select_sql, &stmt) != 0) {
             memory_rollback(m);
             return processed > 0 ? processed : -1;
         }
         bind_text_or_null(stmt, 1, now);
+        sqlite3_bind_int(stmt, 2, MEM_OUTBOX_MAX_ATTEMPTS);
+        bind_text_or_null(stmt, 3, now);
         if (sqlite3_step(stmt) != SQLITE_ROW) {
             sqlite3_finalize(stmt);
             (void)memory_commit_tx(m);
@@ -1177,6 +1182,7 @@ static int memory_recover_outbox(cbm_memory_t *m) {
         const char *aggregate_col = (const char *)sqlite3_column_text(stmt, 1);
         char *aggregate_id = mem_strdup(aggregate_col ? aggregate_col : "");
         int revision = sqlite3_column_int(stmt, 2);
+        int attempts = sqlite3_column_int(stmt, 3) + 1;
         sqlite3_finalize(stmt);
         if (!aggregate_id) {
             memory_rollback(m);
@@ -1185,7 +1191,9 @@ static int memory_recover_outbox(cbm_memory_t *m) {
         if (memory_prepare(m,
                            "UPDATE memory_outbox SET state='leased',lease_owner=?,lease_until=?,"
                            " attempts=attempts+1 WHERE outbox_id=? AND"
-                           " (state='pending' OR (state='leased' AND lease_until<=?));",
+                           " (state='pending' OR (state='leased' AND lease_until<=?) OR"
+                           " (state='failed' AND attempts<? AND"
+                           " (lease_until IS NULL OR lease_until<=?)));",
                            &stmt) != 0) {
             free(aggregate_id);
             memory_rollback(m);
@@ -1195,6 +1203,8 @@ static int memory_recover_outbox(cbm_memory_t *m) {
         bind_text_or_null(stmt, 2, lease_until);
         sqlite3_bind_int64(stmt, 3, outbox_id);
         bind_text_or_null(stmt, 4, now);
+        sqlite3_bind_int(stmt, 5, MEM_OUTBOX_MAX_ATTEMPTS);
+        bind_text_or_null(stmt, 6, now);
         int claim_rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
         if (claim_rc != SQLITE_DONE || sqlite3_changes(m->db) != 1 || memory_commit_tx(m) != 0) {
@@ -1205,25 +1215,32 @@ static int memory_recover_outbox(cbm_memory_t *m) {
 
         int materialize_rc = materialize_page(m, aggregate_id, revision);
         iso_now(now);
+        char retry_at[MEM_TIME_MAX];
+        iso_after_seconds(memory_outbox_retry_delay(attempts), retry_at);
         if (memory_begin(m) != 0) {
             free(aggregate_id);
             return processed > 0 ? processed : -1;
         }
-        const char *finish_sql =
-            materialize_rc == 0
-                ? "UPDATE memory_outbox SET state='done',processed_at=?,lease_owner=NULL,"
-                  " lease_until=NULL,last_error=NULL WHERE outbox_id=? AND lease_owner=?;"
-                : "UPDATE memory_outbox SET state='failed',processed_at=?,lease_owner=NULL,"
-                  " lease_until=NULL,last_error='materialization failed' WHERE outbox_id=?"
-                  " AND lease_owner=?;";
+        const char *finish_sql = materialize_rc == 0
+                                     ? "UPDATE memory_outbox SET state='done',processed_at=?,"
+                                       " lease_owner=NULL,lease_until=NULL,last_error=NULL"
+                                       " WHERE outbox_id=? AND lease_owner=?;"
+                                     : "UPDATE memory_outbox SET state='failed',processed_at=?,"
+                                       " lease_owner=NULL,lease_until=?,"
+                                       " last_error='materialization failed' WHERE outbox_id=?"
+                                       " AND lease_owner=?;";
         if (memory_prepare(m, finish_sql, &stmt) != 0) {
             free(aggregate_id);
             memory_rollback(m);
             return processed > 0 ? processed : -1;
         }
         bind_text_or_null(stmt, 1, now);
-        sqlite3_bind_int64(stmt, 2, outbox_id);
-        bind_text_or_null(stmt, 3, worker);
+        int finish_index = 2;
+        if (materialize_rc != 0) {
+            bind_text_or_null(stmt, finish_index++, retry_at);
+        }
+        sqlite3_bind_int64(stmt, finish_index++, outbox_id);
+        bind_text_or_null(stmt, finish_index, worker);
         int finish_rc = sqlite3_step(stmt);
         int finish_changes = sqlite3_changes(m->db);
         sqlite3_finalize(stmt);
@@ -1232,7 +1249,9 @@ static int memory_recover_outbox(cbm_memory_t *m) {
             memory_rollback(m);
             return processed > 0 ? processed : -1;
         }
-        processed++;
+        if (materialize_rc == 0) {
+            processed++;
+        }
     }
     return processed;
 }
@@ -1306,7 +1325,61 @@ static char *ingest_result_json(cbm_memory_t *m, const char *source_id, const ch
     return out;
 }
 
-static char *memory_source_existing(cbm_memory_t *m, const char *hash) {
+static bool memory_existing_raw_matches(cbm_memory_t *m, const char *relative,
+                                        const unsigned char *bytes, size_t len,
+                                        const char *expected_hash) {
+    unsigned char *stored = NULL;
+    size_t stored_len = 0;
+    if (!m || !relative || !expected_hash || (len > 0 && !bytes) ||
+        memory_read_canonical_raw_object(m, relative, &stored, &stored_len) != 0 ||
+        stored_len != len) {
+        free(stored);
+        return false;
+    }
+    char actual_hash[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(stored, stored_len, actual_hash);
+    bool matches =
+        strcmp(actual_hash, expected_hash) == 0 && (len == 0 || memcmp(stored, bytes, len) == 0);
+    free(stored);
+    return matches;
+}
+
+static bool memory_repair_existing_raw(cbm_memory_t *m, const char *relative,
+                                       const unsigned char *bytes, size_t len,
+                                       const char *expected_hash) {
+    if (!m || !relative || !expected_hash || (len > 0 && !bytes)) {
+        return false;
+    }
+    char target[MEM_PATH_MAX];
+    char target_parent[MEM_PATH_MAX];
+    int n = snprintf(target, sizeof(target), "%s/%s", m->home, relative);
+    if (n < 0 || n >= (int)sizeof(target) ||
+        snprintf(target_parent, sizeof(target_parent), "%s", target) >=
+            (int)sizeof(target_parent)) {
+        return false;
+    }
+    char *slash = strrchr(target_parent, '/');
+    if (!slash || slash == target_parent) {
+        return false;
+    }
+    *slash = '\0';
+    for (int attempt = 0; attempt < 2; attempt++) {
+        cbm_memory_raw_stage_t *stage = NULL;
+        if (cbm_memory_raw_stage_create_repair(m->home, target, target_parent, bytes, len,
+                                               expected_hash, &stage) != 0) {
+            return false;
+        }
+        int repair_rc = cbm_memory_raw_stage_repair_promote(stage, bytes, len, expected_hash);
+        cbm_memory_raw_stage_dispose(stage, repair_rc != 0);
+        if (repair_rc == 0 && memory_existing_raw_matches(m, relative, bytes, len, expected_hash)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static char *memory_source_existing(cbm_memory_t *m, const char *hash, const unsigned char *bytes,
+                                    size_t len) {
     sqlite3_stmt *stmt = NULL;
     if (memory_prepare(m,
                        "SELECT source_id,object_relpath,title,origin FROM memory_sources"
@@ -1315,16 +1388,34 @@ static char *memory_source_existing(cbm_memory_t *m, const char *hash) {
         return NULL;
     }
     bind_text_or_null(stmt, 1, hash);
-    char *out = NULL;
+    char *source_id = NULL;
+    char *relpath = NULL;
+    char *display = NULL;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *source_id = (const char *)sqlite3_column_text(stmt, 0);
-        const char *relpath = (const char *)sqlite3_column_text(stmt, 1);
+        source_id = mem_strdup((const char *)sqlite3_column_text(stmt, 0));
+        relpath = mem_strdup((const char *)sqlite3_column_text(stmt, 1));
         const char *title = (const char *)sqlite3_column_text(stmt, 2);
         const char *origin = (const char *)sqlite3_column_text(stmt, 3);
-        out = ingest_result_json(m, source_id, hash, relpath, title && title[0] ? title : origin,
-                                 true, cbm_memory_snapshot_epoch(m));
+        display = mem_strdup(title && title[0] ? title : origin);
     }
     sqlite3_finalize(stmt);
+    if (!source_id || !relpath || !display) {
+        free(source_id);
+        free(relpath);
+        free(display);
+        return NULL;
+    }
+    bool raw_valid = memory_existing_raw_matches(m, relpath, bytes, len, hash) ||
+                     memory_repair_existing_raw(m, relpath, bytes, len, hash);
+    char *out = raw_valid
+                    ? ingest_result_json(m, source_id, hash, relpath, display, true,
+                                         cbm_memory_snapshot_epoch(m))
+                    : json_error("raw_store_failed",
+                                 "existing source row has a missing or corrupt raw object that "
+                                 "could not be repaired");
+    free(source_id);
+    free(relpath);
+    free(display);
     return out;
 }
 
@@ -1348,7 +1439,21 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
     const unsigned char *bytes = NULL;
     size_t len = 0;
     if (path) {
-        if (read_file_bytes(path, &owned_bytes, &len) != 0) {
+        cbm_memory_raw_read_result_t authorization =
+            cbm_memory_raw_read_authorized_path(path, &owned_bytes, &len);
+        if (authorization == CBM_MEMORY_RAW_READ_AUTHORITY_REQUIRED) {
+            yyjson_doc_free(doc);
+            return json_error(
+                "path_ingest_disabled",
+                "path ingest requires CBM_MEMORY_INGEST_ROOTS or explicit unsafe opt-in");
+        }
+        if (authorization == CBM_MEMORY_RAW_READ_DENIED) {
+            yyjson_doc_free(doc);
+            return json_error("source_path_not_allowed",
+                              "source path must be a regular non-symlink file within an allowed "
+                              "ingest root");
+        }
+        if (authorization != CBM_MEMORY_RAW_READ_OK || !owned_bytes) {
             yyjson_doc_free(doc);
             return json_error("source_read_failed",
                               "cannot read source path or source is too large");
@@ -1358,7 +1463,7 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
         bytes = (const unsigned char *)content;
         yyjson_val *content_val = yyjson_obj_get(root, "content");
         len = yyjson_get_len(content_val);
-        if (len > MEM_MAX_SOURCE_BYTES) {
+        if (len > CBM_MEMORY_RAW_MAX_SOURCE_BYTES) {
             yyjson_doc_free(doc);
             return json_error("source_too_large", "source exceeds 16 MiB");
         }
@@ -1366,32 +1471,11 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
 
     char hash[CBM_SHA256_HEX_LEN + 1];
     cbm_sha256_hex(bytes, len, hash);
-    char *existing = memory_source_existing(m, hash);
-    if (existing) {
-        free(owned_bytes);
-        yyjson_doc_free(doc);
-        return existing;
-    }
-
     const char *media_type = json_str(root, "media_type");
     if (!media_type) {
         media_type = "text/plain";
     }
     const char *extension = media_extension(media_type);
-    char relpath[MEM_PATH_MAX];
-    int rn = snprintf(relpath, sizeof(relpath), "raw/objects/%.2s/%s.%s", hash, hash, extension);
-    char prefix_dir[MEM_PATH_MAX];
-    int pn = snprintf(prefix_dir, sizeof(prefix_dir), "%s/%.2s", m->raw_objects_dir, hash);
-    char final_path[MEM_PATH_MAX];
-    int fn = snprintf(final_path, sizeof(final_path), "%s/%s.%s", prefix_dir, hash, extension);
-    if (rn < 0 || rn >= (int)sizeof(relpath) || pn < 0 || pn >= (int)sizeof(prefix_dir) || fn < 0 ||
-        fn >= (int)sizeof(final_path) || !cbm_mkdir_p(prefix_dir, 0700) ||
-        write_raw_object(m, final_path, bytes, len, hash) != 0) {
-        free(owned_bytes);
-        yyjson_doc_free(doc);
-        return json_error("raw_store_failed", "failed to persist immutable source object");
-    }
-
     char source_id[MEM_ID_MAX];
     (void)snprintf(source_id, sizeof(source_id), "src_%s", hash);
     const char *title = json_str(root, "title");
@@ -1417,7 +1501,39 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
         return NULL;
     }
 
+    char relpath[MEM_PATH_MAX];
+    int rn = snprintf(relpath, sizeof(relpath), "raw/objects/%.2s/%s.%s", hash, hash, extension);
+    char prefix_dir[MEM_PATH_MAX];
+    int pn = snprintf(prefix_dir, sizeof(prefix_dir), "%s/%.2s", m->raw_objects_dir, hash);
+    char final_path[MEM_PATH_MAX];
+    int fn = snprintf(final_path, sizeof(final_path), "%s/%s.%s", prefix_dir, hash, extension);
+    if (rn < 0 || rn >= (int)sizeof(relpath) || pn < 0 || pn >= (int)sizeof(prefix_dir) || fn < 0 ||
+        fn >= (int)sizeof(final_path)) {
+        free(metadata);
+        free(owned_bytes);
+        yyjson_doc_free(doc);
+        return json_error("invalid_source", "source object path is too long");
+    }
+
+    char *existing = memory_source_existing(m, hash, bytes, len);
+    if (existing) {
+        free(metadata);
+        free(owned_bytes);
+        yyjson_doc_free(doc);
+        return existing;
+    }
+
+    cbm_memory_raw_stage_t *raw_stage = NULL;
+    if (cbm_memory_raw_stage_create(m->home, final_path, prefix_dir, bytes, len, hash,
+                                    &raw_stage) != 0) {
+        free(metadata);
+        free(owned_bytes);
+        yyjson_doc_free(doc);
+        return json_error("raw_store_failed", "failed to stage immutable source object");
+    }
+
     if (memory_begin(m) != 0) {
+        cbm_memory_raw_stage_dispose(raw_stage, false);
         free(metadata);
         free(owned_bytes);
         yyjson_doc_free(doc);
@@ -1492,17 +1608,44 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
         }
     }
     free(props);
+    bool canonical_ready =
+        inserted && epoch >= 0 && node_id > 0 && doc_rc == 0 && lineage_rc == 0 && activity_rc == 0;
+    if (!canonical_ready && !m->error[0]) {
+        (void)snprintf(m->error, sizeof(m->error),
+                       "canonical source write failed (inserted=%d epoch=%" PRId64 " node=%" PRId64
+                       " document=%d lineage=%d activity=%d)",
+                       inserted ? 1 : 0, epoch, node_id, doc_rc, lineage_rc, activity_rc);
+    }
+    /* The projection verifies every source body from its canonical raw path,
+     * so expose the staged inode after canonical writes and immediately before
+     * rebuilding derived state. It remains linked to the private stage until
+     * COMMIT, allowing identity-checked rollback below. */
+    if (canonical_ready && cbm_memory_raw_stage_promote(raw_stage, bytes, len, hash) != 0) {
+        (void)snprintf(m->error, sizeof(m->error), "%s",
+                       "failed to promote immutable source object");
+        canonical_ready = false;
+    }
+    if (canonical_ready && memory_rebuild_projection_internal(m, true) != 0) {
+        canonical_ready = false;
+    }
     free(metadata);
 
-    if (!inserted || epoch < 0 || node_id <= 0 || doc_rc != 0 || lineage_rc != 0 ||
-        activity_rc != 0 || memory_rebuild_projection_internal(m, true) != 0 ||
-        memory_commit_tx(m) != 0) {
+    if (!canonical_ready) {
         memory_rollback(m);
-        char *race = memory_source_existing(m, hash);
+        cbm_memory_raw_stage_dispose(raw_stage, true);
+        char *race = memory_source_existing(m, hash, bytes, len);
         free(owned_bytes);
         yyjson_doc_free(doc);
         return race ? race : json_error("ingest_failed", m->error);
     }
+    if (memory_commit_tx(m) != 0) {
+        memory_rollback(m);
+        cbm_memory_raw_stage_dispose(raw_stage, true);
+        free(owned_bytes);
+        yyjson_doc_free(doc);
+        return json_error("ingest_failed", m->error);
+    }
+    cbm_memory_raw_stage_dispose(raw_stage, false);
 
     char *out = ingest_result_json(m, source_id, hash, relpath, title && title[0] ? title : origin,
                                    false, epoch);
@@ -2739,6 +2882,11 @@ char *cbm_memory_commit_json(cbm_memory_t *m, const char *args_json) {
         yyjson_doc_free(args_doc);
         return json_error("invalid_commit", "proposal_id and a valid operation_id are required");
     }
+    if (!approved) {
+        yyjson_doc_free(args_doc);
+        return json_error("approval_required",
+                          "memory_commit requires explicit user_approved:true authorization");
+    }
     char *proposal_id = mem_strdup(proposal_id_arg);
     char *operation_id = mem_strdup(operation_id_arg);
     yyjson_doc_free(args_doc);
@@ -3145,12 +3293,10 @@ static int project_source_bodies(cbm_memory_t *m) {
         char *origin = mem_strdup((const char *)sqlite3_column_text(stmt, 3));
         char *metadata = mem_strdup((const char *)sqlite3_column_text(stmt, 4));
         char *expected_hash = mem_strdup((const char *)sqlite3_column_text(stmt, 5));
-        char path[MEM_PATH_MAX];
         unsigned char *bytes = NULL;
         size_t len = 0;
         if (!id || !rel || !title || !origin || !metadata || !expected_hash ||
-            snprintf(path, sizeof(path), "%s/%s", m->home, rel) >= (int)sizeof(path) ||
-            read_file_bytes(path, &bytes, &len) != 0) {
+            memory_read_canonical_raw_object(m, rel, &bytes, &len) != 0) {
             rc = -1;
         } else {
             char actual_hash[CBM_SHA256_HEX_LEN + 1];
@@ -4240,17 +4386,20 @@ char *cbm_memory_query_json(cbm_memory_t *m, const char *args_json) {
                   " FROM memory_documents WHERE entity_id=?"
                   " AND (?='' OR entity_kind=?) LIMIT 1;";
         } else if (fts && sql_project_boost) {
-            sql = "SELECT d.entity_kind,d.entity_id,d.title,d.summary,"
-                  " snippet(memory_fts,2,'','',' … ',24),bm25(memory_fts),"
+            sql = "WITH ranked AS (SELECT d.entity_kind,d.entity_id,d.title,d.summary,"
+                  " snippet(memory_fts,2,'','',' … ',24) AS snippet,"
+                  " bm25(memory_fts) AS base_rank,"
                   " EXISTS(SELECT 1 FROM memory_relations r JOIN memory_code_refs c ON"
                   " ((r.target_kind='code_ref' AND r.target_id=c.code_ref_id"
                   "   AND r.source_kind=d.entity_kind AND r.source_id=d.entity_id) OR"
                   "  (r.source_kind='code_ref' AND r.source_id=c.code_ref_id"
                   "   AND r.target_kind=d.entity_kind AND r.target_id=d.entity_id))"
-                  " WHERE r.recorded_to IS NULL AND c.project=?) AS project_match"
+                  " WHERE r.recorded_to IS NULL AND c.project=?) AS project_match,d.doc_id"
                   " FROM memory_fts JOIN memory_documents d ON d.doc_id=memory_fts.rowid"
-                  " WHERE memory_fts MATCH ? AND (?='' OR d.entity_kind=?)"
-                  " ORDER BY project_match DESC,bm25(memory_fts) LIMIT ?;";
+                  " WHERE memory_fts MATCH ? AND (?='' OR d.entity_kind=?))"
+                  " SELECT entity_kind,entity_id,title,summary,snippet,base_rank,project_match"
+                  " FROM ranked ORDER BY (-base_rank + CASE WHEN project_match THEN " MEM_STRINGIFY(
+                      MEM_PROJECT_RANKING_BOOST) " ELSE 0.0 END) DESC,doc_id DESC LIMIT ?;";
         } else if (fts) {
             sql = "SELECT d.entity_kind,d.entity_id,d.title,d.summary,"
                   " snippet(memory_fts,2,'','',' … ',24),bm25(memory_fts),0"
@@ -4314,9 +4463,11 @@ char *cbm_memory_query_json(cbm_memory_t *m, const char *args_json) {
                         m, kind ? kind : "", entity_id ? entity_id : "", context_project);
                 }
                 yyjson_mut_obj_add_real(doc, item, "score", base_score);
-                yyjson_mut_obj_add_real(doc, item, "ranking_boost", project_match ? 1.0 : 0.0);
+                yyjson_mut_obj_add_real(doc, item, "ranking_boost",
+                                        project_match ? MEM_PROJECT_RANKING_BOOST : 0.0);
                 yyjson_mut_obj_add_real(doc, item, "ranking_score",
-                                        base_score + (project_match ? 1.0 : 0.0));
+                                        base_score +
+                                            (project_match ? MEM_PROJECT_RANKING_BOOST : 0.0));
                 yyjson_mut_val *boost_reasons = yyjson_mut_arr(doc);
                 if (project_match) {
                     yyjson_mut_arr_add_strcpy(doc, boost_reasons, "current_project_code_reference");
@@ -4797,32 +4948,28 @@ char *cbm_memory_lint_json(cbm_memory_t *m, const char *args_json) {
             const char *id = (const char *)sqlite3_column_text(source_stmt, 0);
             const char *rel = (const char *)sqlite3_column_text(source_stmt, 1);
             const char *expected_hash = (const char *)sqlite3_column_text(source_stmt, 2);
-            char path[MEM_PATH_MAX];
-            int n = snprintf(path, sizeof(path), "%s/%s", m->home, rel ? rel : "");
-            if (n < 0 || n >= (int)sizeof(path) || !cbm_file_exists(path)) {
+            unsigned char *bytes = NULL;
+            size_t len = 0;
+            if (memory_read_canonical_raw_object(m, rel ? rel : "", &bytes, &len) != 0) {
                 if (lint_check_selected(requested_checks, "missing_raw_object")) {
                     lint_add_issue(doc, issues, "missing_raw_object", "error", "source", id,
-                                   "canonical raw source object is missing");
+                                   "canonical raw source object is missing or unsafe");
                     issue_count++;
-                }
-            } else if (lint_check_selected(requested_checks, "raw_object_hash_mismatch")) {
-                unsigned char *bytes = NULL;
-                size_t len = 0;
-                if (read_file_bytes(path, &bytes, &len) != 0) {
+                } else if (lint_check_selected(requested_checks, "raw_object_hash_mismatch")) {
                     lint_add_issue(doc, issues, "raw_object_hash_mismatch", "error", "source", id,
                                    "canonical raw source object cannot be verified");
                     issue_count++;
-                } else {
-                    char actual_hash[CBM_SHA256_HEX_LEN + 1] = "";
-                    cbm_sha256_hex(bytes, len, actual_hash);
-                    if (!expected_hash || strcmp(actual_hash, expected_hash) != 0) {
-                        lint_add_issue(doc, issues, "raw_object_hash_mismatch", "error", "source",
-                                       id, "canonical raw source bytes do not match content_hash");
-                        issue_count++;
-                    }
                 }
-                free(bytes);
+            } else if (lint_check_selected(requested_checks, "raw_object_hash_mismatch")) {
+                char actual_hash[CBM_SHA256_HEX_LEN + 1] = "";
+                cbm_sha256_hex(bytes, len, actual_hash);
+                if (!expected_hash || strcmp(actual_hash, expected_hash) != 0) {
+                    lint_add_issue(doc, issues, "raw_object_hash_mismatch", "error", "source", id,
+                                   "canonical raw source bytes do not match content_hash");
+                    issue_count++;
+                }
             }
+            free(bytes);
         }
         sqlite3_finalize(source_stmt);
     }

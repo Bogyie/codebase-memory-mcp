@@ -76,6 +76,23 @@ static const char *C_CLEAN = "#include <stdio.h>\n"
                              "    return x + 1;\n"
                              "}\n";
 
+static const char *C_IFDEF_SPLIT_CONDITION = "static void handle_process_kill(int target_pid) {\n"
+                                             "#ifdef _WIN32\n"
+                                             "    if (target_pid == get_windows_pid()) {\n"
+                                             "#else\n"
+                                             "    if (target_pid == get_posix_pid()) {\n"
+                                             "#endif\n"
+                                             "        return;\n"
+                                             "    }\n"
+                                             "}\n";
+
+static const char *C_IFDEF_BALANCED_BRANCHES =
+    "#ifdef _WIN32\n"
+    "static int platform_pid(void) { return get_windows_pid(); }\n"
+    "#else\n"
+    "static int platform_pid(void) { return get_posix_pid(); }\n"
+    "#endif\n";
+
 /* `def broken(:` parses with an ERROR region, but tree-sitter error recovery
  * still yields the `broken` function def — a DEFINITELY RECOVERED miss. */
 static const char *PY_BROKEN_RECOVERED = "def ok():\n"
@@ -159,6 +176,29 @@ TEST(c_clean_file_not_flagged) {
     ASSERT_NULL(r->error_ranges);
     ASSERT_TRUE(has_def(r, "alpha"));
     ASSERT_TRUE(has_def(r, "beta"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(c_ifdef_split_condition_never_silently_drops_handler) {
+    CBMFileResult *r = do_extract(C_IFDEF_SPLIT_CONDITION, CBM_LANG_C, "split_condition.c");
+    ASSERT_NOT_NULL(r);
+    /* Extracting the handler is ideal; when the raw preprocessor shape defeats
+     * tree-sitter, the coverage signal must at least make the miss explicit. */
+    ASSERT_TRUE(has_def(r, "handle_process_kill") || r->parse_incomplete);
+    if (!has_def(r, "handle_process_kill")) {
+        ASSERT_NOT_NULL(r->error_ranges);
+        ASSERT_GTE(r->error_region_count, 1);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(c_ifdef_balanced_branches_do_not_add_coverage_warning) {
+    CBMFileResult *r = do_extract(C_IFDEF_BALANCED_BRANCHES, CBM_LANG_C, "balanced_condition.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_NULL(r->error_ranges);
     cbm_free_result(r);
     PASS();
 }
@@ -252,6 +292,8 @@ SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
     RUN_TEST(c_error_range_points_at_failed_region);
     RUN_TEST(c_clean_file_not_flagged);
+    RUN_TEST(c_ifdef_split_condition_never_silently_drops_handler);
+    RUN_TEST(c_ifdef_balanced_branches_do_not_add_coverage_warning);
     RUN_TEST(py_unrecovered_garbage_sets_parse_incomplete);
     RUN_TEST(py_recovered_def_not_flagged);
     RUN_TEST(py_clean_file_not_flagged);

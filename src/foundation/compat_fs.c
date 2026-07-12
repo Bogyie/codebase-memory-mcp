@@ -12,6 +12,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int cbm_dir_test_fail_after = -1;
+
+void cbm_dir_set_test_fail_after(int successful_entries) {
+    cbm_dir_test_fail_after = successful_entries;
+}
+
 #ifdef _WIN32
 
 /* ── Windows implementation ────────────────────────────────── */
@@ -35,6 +41,7 @@ struct cbm_dir {
     cbm_dirent_t entry;
     bool first;
     bool done;
+    bool had_error;
 };
 
 cbm_dir_t *cbm_opendir(const char *path) {
@@ -84,9 +91,19 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     if (!d || d->done) {
         return NULL;
     }
+    if (cbm_dir_test_fail_after == 0) {
+        cbm_dir_test_fail_after = -1;
+        d->done = true;
+        d->had_error = true;
+        return NULL;
+    }
+    if (cbm_dir_test_fail_after > 0) {
+        cbm_dir_test_fail_after--;
+    }
     if (!d->first) {
         if (!FindNextFileW(d->find_handle, &d->find_data)) {
             d->done = true;
+            d->had_error = GetLastError() != ERROR_NO_MORE_FILES;
             return NULL;
         }
     }
@@ -97,6 +114,7 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
             (d->find_data.cFileName[1] == L'.' && d->find_data.cFileName[2] == L'\0'))) {
         if (!FindNextFileW(d->find_handle, &d->find_data)) {
             d->done = true;
+            d->had_error = GetLastError() != ERROR_NO_MORE_FILES;
             return NULL;
         }
     }
@@ -104,18 +122,51 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     char *u8 = cbm_wide_to_utf8(d->find_data.cFileName);
     if (!u8) {
         d->done = true;
+        d->had_error = true;
         return NULL;
     }
     size_t nlen = strlen(u8);
     if (nlen >= CBM_DIRENT_NAME_MAX) {
-        nlen = CBM_DIRENT_NAME_MAX - SKIP_ONE;
+        free(u8);
+        d->done = true;
+        d->had_error = true;
+        return NULL;
     }
     memcpy(d->entry.name, u8, nlen);
     d->entry.name[nlen] = '\0';
     free(u8);
     d->entry.is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    d->entry.is_reparse = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
     d->entry.d_type = 0;
     return &d->entry;
+}
+
+bool cbm_dir_had_error(const cbm_dir_t *d) {
+    return !d || d->had_error;
+}
+
+bool cbm_path_is_reparse_point(const char *path) {
+    wchar_t *wpath = cbm_utf8_to_wide(path);
+    if (!wpath) {
+        return true;
+    }
+    DWORD attrs = GetFileAttributesW(wpath);
+    free(wpath);
+    return attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
+int cbm_path_probe(const char *path) {
+    wchar_t *wpath = cbm_utf8_to_wide(path);
+    if (!wpath) {
+        return -1;
+    }
+    DWORD attrs = GetFileAttributesW(wpath);
+    free(wpath);
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        return 1;
+    }
+    DWORD error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? 0 : -1;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -392,16 +443,81 @@ FILE *cbm_fopen(const char *path, const char *mode) {
     return f;
 }
 
+static bool cbm_wpath_is_directory(const wchar_t *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    DWORD attrs = GetFileAttributesW(path);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static bool cbm_wmkdir_component(wchar_t *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (_wmkdir(path) == 0) {
+        return true;
+    }
+    /* Preserve the historical symlink/junction policy: an existing reparse
+     * point is accepted when Windows resolves it as a directory. A regular
+     * file (including a file symlink) is never a successful mkdir -p step. */
+    return cbm_wpath_is_directory(path);
+}
+
+static bool cbm_wpath_separator(wchar_t value) {
+    return value == L'/' || value == L'\\';
+}
+
+static wchar_t *cbm_wskip_unc_root(wchar_t *path) {
+    /* path points at the server component. Skip both \\server\share because
+     * \\server by itself is an authority, not a directory that _wmkdir can
+     * validate. */
+    wchar_t *p = path;
+    while (*p && !cbm_wpath_separator(*p)) {
+        p++;
+    }
+    while (cbm_wpath_separator(*p)) {
+        p++;
+    }
+    while (*p && !cbm_wpath_separator(*p)) {
+        p++;
+    }
+    return *p ? p + SKIP_ONE : p;
+}
+
+static wchar_t *cbm_wmkdir_scan_start(wchar_t *path) {
+    if (!path || !path[0]) {
+        return path;
+    }
+    if (path[1] == L':' && cbm_wpath_separator(path[2])) {
+        return path + 3; /* C:\ is an indivisible root. */
+    }
+    if (!cbm_wpath_separator(path[0]) || !cbm_wpath_separator(path[1])) {
+        return path + SKIP_ONE;
+    }
+    wchar_t *p = path + 2;
+    if (p[0] == L'?' && cbm_wpath_separator(p[1])) {
+        p += 2;
+        bool extended_unc = (p[0] == L'U' || p[0] == L'u') && (p[1] == L'N' || p[1] == L'n') &&
+                            (p[2] == L'C' || p[2] == L'c') && cbm_wpath_separator(p[3]);
+        if (extended_unc) {
+            return cbm_wskip_unc_root(p + 4);
+        }
+        if (p[0] && p[1] == L':' && cbm_wpath_separator(p[2])) {
+            return p + 3; /* \\?\C:\ */
+        }
+    }
+    return cbm_wskip_unc_root(p);
+}
+
 bool cbm_mkdir_p(const char *path, int mode) {
     (void)mode;
+    if (!path || !path[0]) {
+        return false;
+    }
     wchar_t *wpath = cbm_utf8_to_wide(path);
     if (!wpath) {
         return false;
-    }
-
-    if (_wmkdir(wpath) == 0) {
-        free(wpath);
-        return true;
     }
     size_t wlen = wcslen(wpath);
     wchar_t *tmp = (wchar_t *)malloc((wlen + 1) * sizeof(wchar_t));
@@ -410,14 +526,20 @@ bool cbm_mkdir_p(const char *path, int mode) {
         return false;
     }
     wmemcpy(tmp, wpath, wlen + 1);
-    for (wchar_t *p = tmp + SKIP_ONE; *p; p++) {
+    for (wchar_t *p = cbm_wmkdir_scan_start(tmp); p && *p; p++) {
         if (*p == L'/' || *p == L'\\') {
+            wchar_t separator = *p;
             *p = L'\0';
-            _wmkdir(tmp);
-            *p = L'\\';
+            bool component_ok = cbm_wmkdir_component(tmp);
+            *p = separator;
+            if (!component_ok) {
+                free(tmp);
+                free(wpath);
+                return false;
+            }
         }
     }
-    bool ok = _wmkdir(tmp) == 0 || GetLastError() == ERROR_ALREADY_EXISTS;
+    bool ok = cbm_wmkdir_component(tmp);
     free(tmp);
     free(wpath);
     return ok;
@@ -591,6 +713,7 @@ int cbm_exec_no_shell(const char *const *argv) {
 struct cbm_dir {
     DIR *dir;
     cbm_dirent_t entry;
+    bool had_error;
 };
 
 cbm_dir_t *cbm_opendir(const char *path) {
@@ -614,8 +737,22 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     if (!d || !d->dir) {
         return NULL;
     }
+    if (cbm_dir_test_fail_after == 0) {
+        cbm_dir_test_fail_after = -1;
+        d->had_error = true;
+        return NULL;
+    }
+    if (cbm_dir_test_fail_after > 0) {
+        cbm_dir_test_fail_after--;
+    }
     struct dirent *de;
-    while ((de = readdir(d->dir)) != NULL) {
+    for (;;) {
+        errno = 0;
+        de = readdir(d->dir);
+        if (!de) {
+            d->had_error = errno != 0;
+            return NULL;
+        }
         /* Skip "." and ".." */
         if (de->d_name[0] == '.' &&
             (de->d_name[SKIP_ONE] == '\0' ||
@@ -624,15 +761,36 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         }
         size_t nlen = strlen(de->d_name);
         if (nlen >= CBM_DIRENT_NAME_MAX) {
-            nlen = CBM_DIRENT_NAME_MAX - SKIP_ONE;
+            d->had_error = true;
+            return NULL;
         }
         memcpy(d->entry.name, de->d_name, nlen);
         d->entry.name[nlen] = '\0';
         d->entry.is_dir = (de->d_type == DT_DIR);
+        d->entry.is_reparse = (de->d_type == DT_LNK);
         d->entry.d_type = de->d_type;
         return &d->entry;
     }
-    return NULL;
+}
+
+bool cbm_dir_had_error(const cbm_dir_t *d) {
+    return !d || d->had_error;
+}
+
+bool cbm_path_is_reparse_point(const char *path) {
+    struct stat st;
+    return !path || lstat(path, &st) != 0 || S_ISLNK(st.st_mode);
+}
+
+int cbm_path_probe(const char *path) {
+    if (!path) {
+        return -1;
+    }
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        return 1;
+    }
+    return errno == ENOENT || errno == ENOTDIR ? 0 : -1;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -656,12 +814,24 @@ FILE *cbm_fopen(const char *path, const char *mode) {
     return fopen(path, mode);
 }
 
-bool cbm_mkdir_p(const char *path, int mode) {
-    /* Try direct mkdir first */
-    if (mkdir(path, (mode_t)mode) == 0) {
+static bool cbm_mkdir_component(char *path, mode_t mode) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (mkdir(path, mode) == 0) {
         return true;
     }
-    /* Walk path and create each component */
+    struct stat st;
+    /* stat() intentionally follows symlinks for compatibility: a symlink to
+     * a directory remains a valid mkdir -p component, while a regular file or
+     * a symlink to one is rejected. */
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+bool cbm_mkdir_p(const char *path, int mode) {
+    if (!path || !path[0]) {
+        return false;
+    }
     char *tmp = strdup(path);
     if (!tmp) {
         return false;
@@ -669,11 +839,15 @@ bool cbm_mkdir_p(const char *path, int mode) {
     for (char *p = tmp + SKIP_ONE; *p; p++) {
         if (*p == '/') {
             *p = '\0';
-            mkdir(tmp, (mode_t)mode); /* ignore intermediate errors */
+            bool component_ok = cbm_mkdir_component(tmp, (mode_t)mode);
             *p = '/';
+            if (!component_ok) {
+                free(tmp);
+                return false;
+            }
         }
     }
-    bool ok = (mkdir(tmp, (mode_t)mode) == 0 || errno == EEXIST) != 0;
+    bool ok = cbm_mkdir_component(tmp, (mode_t)mode);
     free(tmp);
     return ok;
 }
@@ -714,12 +888,12 @@ int cbm_exec_no_shell(const char *const *argv) {
 
 #endif /* _WIN32 */
 
-/* Canonicalize an EXISTING path (collapse `..`, resolve per-OS): realpath on
- * POSIX; on Windows a wide-path GetFileAttributesW existence check +
- * GetFullPathNameW. The previous callers used the ANSI CRT (_access/
- * _fullpath) on UTF-8 input — locale-dependent by construction: on a CJK
- * system codepage (e.g. Big5) the UTF-8 bytes of a CJK path re-decode into
- * different characters and canonicalization corrupts the path (#973).
+/* Canonicalize an EXISTING path (collapse `..` and resolve symlinks/reparse
+ * points): realpath on POSIX; a wide handle plus GetFinalPathNameByHandleW on
+ * Windows. GetFullPathNameW is only lexical and leaves directory junctions in
+ * place, which is not a safe containment primitive for callers that authorize
+ * a path before reading it. The wide APIs also avoid routing UTF-8 through the
+ * locale-dependent ANSI CRT (#973).
  * Returns 0 when the path does not exist or cannot be resolved. */
 int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
     if (!path || !out || out_sz == 0) {
@@ -730,18 +904,44 @@ int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
     if (!wpath) {
         return 0;
     }
-    if (GetFileAttributesW(wpath) == INVALID_FILE_ATTRIBUTES) {
-        free(wpath);
+    enum { CANON_WIDE_MAX = 4096 };
+    HANDLE handle = CreateFileW(wpath, FILE_READ_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(wpath);
+    if (handle == INVALID_HANDLE_VALUE) {
         return 0;
     }
-    enum { CANON_WIDE_MAX = 4096 };
-    wchar_t wfull[CANON_WIDE_MAX];
-    DWORD n = GetFullPathNameW(wpath, CANON_WIDE_MAX, wfull, NULL);
-    free(wpath);
+    wchar_t wfinal[CANON_WIDE_MAX];
+    DWORD n = GetFinalPathNameByHandleW(handle, wfinal, CANON_WIDE_MAX,
+                                        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    CloseHandle(handle);
     if (n == 0 || n >= CANON_WIDE_MAX) {
         return 0;
     }
-    char *utf8 = cbm_wide_to_utf8(wfull);
+
+    /* GetFinalPathNameByHandleW emits extended-length DOS paths. Convert
+     * `\\?\C:\...` to `C:\...` and `\\?\UNC\server\share` to the normal
+     * `\\server\share` spelling used by the rest of the codebase. */
+    const wchar_t *normalized = wfinal;
+    wchar_t wunc[CANON_WIDE_MAX];
+    if (wcsncmp(wfinal, L"\\\\?\\UNC\\", 8) == 0) {
+        size_t tail_len = wcslen(wfinal + 8);
+        if (tail_len > CANON_WIDE_MAX - 3) {
+            return 0;
+        }
+        wunc[0] = L'\\';
+        wunc[1] = L'\\';
+        wmemcpy(wunc + 2, wfinal + 8, tail_len + 1);
+        normalized = wunc;
+    } else if (wcsncmp(wfinal, L"\\\\?\\", 4) == 0 &&
+               ((wfinal[4] >= L'A' && wfinal[4] <= L'Z') ||
+                (wfinal[4] >= L'a' && wfinal[4] <= L'z')) &&
+               wfinal[5] == L':') {
+        normalized = wfinal + 4;
+    }
+
+    char *utf8 = cbm_wide_to_utf8(normalized);
     if (!utf8) {
         return 0;
     }
@@ -754,8 +954,18 @@ int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
     free(utf8);
     return 1;
 #else
-    /* Callers pass >= 4K buffers (>= PATH_MAX on our platforms). */
-    return realpath(path, out) != NULL;
+    char *resolved = realpath(path, NULL);
+    if (!resolved) {
+        return 0;
+    }
+    size_t len = strlen(resolved);
+    if (len >= out_sz) {
+        free(resolved);
+        return 0;
+    }
+    memcpy(out, resolved, len + 1U);
+    free(resolved);
+    return 1;
 #endif
 }
 
@@ -769,7 +979,7 @@ int cbm_rename_replace(const char *src, const char *dst) {
     wchar_t *wdst = cbm_utf8_to_wide(dst);
     int ret = CBM_NOT_FOUND;
     if (wsrc && wdst) {
-        ret = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)
+        ret = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
                   ? 0
                   : CBM_NOT_FOUND;
     }

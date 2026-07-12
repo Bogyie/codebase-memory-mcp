@@ -556,12 +556,14 @@ static void print_help(void) {
     printf("  --port=N     Set UI port (default 9749, persisted)\n");
     printf("\nSupported agents (auto-detected):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
-    printf("  Antigravity, Aider, KiloCode, Kiro\n");
-    printf("\n23 MCP tools: index_repository, index_status, list_projects, delete_project,\n");
+    printf("  Antigravity, Aider, KiloCode, VS Code, Cursor, OpenClaw,\n");
+    printf("  Kiro, Junie\n");
+    printf("\n24 MCP tools: index_repository, index_status, list_projects, delete_project,\n");
     printf("  search_graph, search_code, trace_path, detect_changes, query_graph,\n");
     printf("  get_graph_schema, get_code_snippet, get_architecture, get_design_context,\n");
-    printf("  manage_adr, ingest_traces, memory_ingest, memory_query, memory_propose,\n");
-    printf("  memory_commit, memory_lint, memory_export, memory_import, memory_sync\n");
+    printf("  manage_adr, ingest_traces, memory_ingest, memory_query, memory_status,\n");
+    printf("  memory_propose, memory_commit, memory_lint, memory_export, memory_import,\n");
+    printf("  memory_sync\n");
 }
 
 /* ── Main ───────────────────────────────────────────────────────── */
@@ -780,11 +782,13 @@ int main(int argc, char **argv) {
 
     /* Open config store for runtime settings */
     char config_dir[CBM_SZ_1K];
-    const char *cfg_home = cbm_get_home_dir();
     cbm_config_t *runtime_config = NULL;
-    if (cfg_home) {
-        snprintf(config_dir, sizeof(config_dir), "%s", cbm_resolve_cache_dir());
+    const char *cache_dir = cbm_resolve_cache_dir();
+    int config_dir_len = cache_dir ? snprintf(config_dir, sizeof(config_dir), "%s", cache_dir) : -1;
+    if (config_dir_len > 0 && config_dir_len < (int)sizeof(config_dir)) {
         runtime_config = cbm_config_open(config_dir);
+    } else {
+        cbm_log_warn("config.cache_dir_unavailable");
     }
 
     /* Create MCP server */

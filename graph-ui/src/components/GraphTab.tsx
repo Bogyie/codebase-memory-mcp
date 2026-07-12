@@ -27,6 +27,7 @@ import { ResizeHandle } from "./ResizeHandle";
 import { ErrorBoundary } from "./ErrorBoundary";
 import type { GraphNode, GraphData, RepoInfo } from "../lib/types";
 import { colorForStatus } from "../lib/colors";
+import { formatGraphLimitNotice } from "../lib/graphLimits";
 
 /* Persist panel widths */
 function loadWidth(key: string, fallback: number): number {
@@ -57,11 +58,6 @@ function saveNodeBudget(project: string, value: number) {
 
 interface GraphTabProps {
   project: string | null;
-}
-
-export function formatGraphLimitNotice(data: GraphData | null): string | null {
-  if (!data || data.total_nodes <= data.nodes.length) return null;
-  return `Showing ${data.nodes.length.toLocaleString("en-US")} of ${data.total_nodes.toLocaleString("en-US")} nodes (${data.edges.length.toLocaleString("en-US")} edges). Raise the node budget or use filters.`;
 }
 
 export function GraphTab({ project }: GraphTabProps) {

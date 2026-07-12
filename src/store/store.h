@@ -277,6 +277,19 @@ int64_t cbm_store_resolve_mmap_size(void);
 /* Dump in-memory database to a file. */
 int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path);
 
+/* Atomically publish a completed file-backed snapshot into dest_path using
+ * SQLite's backup transaction. Unlike pathname replacement, this is safe
+ * while other processes keep read-only connections to dest_path open: their
+ * current read transaction keeps the old snapshot and the next transaction
+ * observes the newly committed generation. */
+int cbm_store_install_snapshot_file(const char *source_path, const char *dest_path);
+
+/* One-shot test seam after the destination file is reserved but before SQLite
+ * opens its pathname. Production callers must leave this unset. */
+typedef void (*cbm_store_snapshot_install_hook_fn)(const char *dest_path, void *userdata);
+void cbm_store_set_snapshot_install_hook_for_test(cbm_store_snapshot_install_hook_fn hook,
+                                                  void *userdata);
+
 /* ── Project CRUD ───────────────────────────────────────────────── */
 
 int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path);
@@ -432,9 +445,26 @@ int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_co
  * The generated opaque ID changes on every successful publish. */
 int cbm_store_mark_index_complete(cbm_store_t *s, const char *project);
 
+/* Completion-marker variant used by the index pipeline.  Stores the
+ * effective user-config fingerprint in the same index_snapshots row and SQL
+ * statement as the new generation ID.  The legacy API above remains source
+ * and behavior compatible and writes an empty fingerprint. */
+int cbm_store_mark_index_complete_with_config(cbm_store_t *s, const char *project,
+                                              const char *config_fingerprint);
+int cbm_store_mark_index_complete_with_inputs(cbm_store_t *s, const char *project,
+                                              const char *config_fingerprint,
+                                              const char *input_fingerprint, int index_mode);
+
 /* Return the latest completed generation. Caller owns *generation. A missing
  * row (or a legacy DB without this table) returns CBM_STORE_NOT_FOUND. */
 int cbm_store_get_index_generation(cbm_store_t *s, const char *project, char **generation);
+
+/* Return the effective user-config fingerprint attached to the completed
+ * generation. Caller owns *fingerprint. A missing row/column (legacy DB)
+ * returns CBM_STORE_NOT_FOUND. */
+int cbm_store_get_index_config_fingerprint(cbm_store_t *s, const char *project, char **fingerprint);
+int cbm_store_get_index_input_fingerprint(cbm_store_t *s, const char *project, char **fingerprint);
+int cbm_store_get_index_mode(cbm_store_t *s, const char *project, int *index_mode);
 
 /* Fetch all coverage rows (ordered by rel_path). Caller frees via
  * cbm_store_free_coverage. */

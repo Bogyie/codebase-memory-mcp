@@ -24,8 +24,8 @@ void cbm_ui_config_load(cbm_ui_config_t *cfg);
 /* Save config to disk. Creates directory if needed. */
 void cbm_ui_config_save(const cbm_ui_config_t *cfg);
 
-/* Get the config file path. Writes to buf (up to bufsz bytes).
- * Exposed for testing. */
-void cbm_ui_config_path(char *buf, int bufsz);
+/* Get the config file path. Returns false (and writes an empty string) when no
+ * private per-user cache directory is available or the path does not fit. */
+bool cbm_ui_config_path(char *buf, int bufsz);
 
 #endif /* CBM_UI_CONFIG_H */

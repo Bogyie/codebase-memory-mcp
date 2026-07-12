@@ -27,6 +27,7 @@ enum {
 #include <ctype.h>
 #include "foundation/compat_fs.h"
 #include "foundation/compat_regex.h"
+#include "foundation/sha256.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -316,47 +317,51 @@ static int scan_line(const char *line, file_type_t ft, char *key_out, size_t key
 /* Scan a single file for env URL bindings. Returns number of bindings added. */
 static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
                          cbm_env_binding_t *out, int max_out) {
-    FILE *f = cbm_fopen(full_path, "r");
-    if (!f) {
-        return 0;
-    }
-
-    struct stat fst;
-    if (fstat(fileno(f), &fst) != 0 || fst.st_size > (long)CBM_SZ_1K * CBM_SZ_1K) {
-        (void)fclose(f);
-        return 0;
+    char *source = NULL;
+    size_t source_len = 0;
+    char source_sha256[CBM_SHA256_HEX_LEN + 1];
+    if (cbm_sha256_file_read_hex(full_path, (size_t)CBM_SZ_1K * CBM_SZ_1K, &source, &source_len,
+                                 source_sha256) != CBM_SHA256_FILE_HASHED ||
+        memchr(source, '\0', source_len) != NULL) {
+        free(source);
+        return CBM_NOT_FOUND;
     }
 
     int count = 0;
-    char line[CBM_SZ_2K];
-    while (fgets(line, sizeof(line), f) && count < max_out) {
-        size_t ll = strlen(line);
-        while (ll > 0 && (line[ll - SKIP_ONE] == '\n' || line[ll - SKIP_ONE] == '\r')) {
-            line[--ll] = '\0';
+    char *cursor = source;
+    char *end = source + source_len;
+    while (cursor < end && count < max_out) {
+        char *newline = memchr(cursor, '\n', (size_t)(end - cursor));
+        char *line_end = newline ? newline : end;
+        if ((size_t)(line_end - cursor) >= CBM_SZ_2K) {
+            free(source);
+            return CBM_NOT_FOUND;
+        }
+        char saved = *line_end;
+        *line_end = '\0';
+        size_t ll = (size_t)(line_end - cursor);
+        while (ll > 0 && cursor[ll - SKIP_ONE] == '\r') {
+            cursor[--ll] = '\0';
         }
 
         char key[CBM_SZ_128];
         char value[CBM_SZ_512];
-        if (!scan_line(line, ft, key, sizeof(key), value, sizeof(value))) {
-            continue;
+        if (scan_line(cursor, ft, key, sizeof(key), value, sizeof(value)) &&
+            (strncmp(value, "http://", SLEN("http://")) == 0 ||
+             strncmp(value, "https://", SLEN("https://")) == 0) &&
+            !cbm_is_secret_binding(key, value) && !cbm_is_secret_value(value)) {
+            strncpy(out[count].key, key, sizeof(out[count].key) - 1);
+            out[count].key[sizeof(out[count].key) - SKIP_ONE] = '\0';
+            strncpy(out[count].value, value, sizeof(out[count].value) - 1);
+            out[count].value[sizeof(out[count].value) - SKIP_ONE] = '\0';
+            strncpy(out[count].file_path, rel, sizeof(out[count].file_path) - 1);
+            out[count].file_path[sizeof(out[count].file_path) - SKIP_ONE] = '\0';
+            count++;
         }
-        if (strncmp(value, "http://", SLEN("http://")) != 0 &&
-            strncmp(value, "https://", SLEN("https://")) != 0) {
-            continue;
-        }
-        if (cbm_is_secret_binding(key, value) || cbm_is_secret_value(value)) {
-            continue;
-        }
-
-        strncpy(out[count].key, key, sizeof(out[count].key) - 1);
-        out[count].key[sizeof(out[count].key) - SKIP_ONE] = '\0';
-        strncpy(out[count].value, value, sizeof(out[count].value) - 1);
-        out[count].value[sizeof(out[count].value) - SKIP_ONE] = '\0';
-        strncpy(out[count].file_path, rel, sizeof(out[count].file_path) - 1);
-        out[count].file_path[sizeof(out[count].file_path) - SKIP_ONE] = '\0';
-        count++;
+        *line_end = saved;
+        cursor = newline ? newline + 1 : end;
     }
-    (void)fclose(f);
+    free(source);
     return count;
 }
 
@@ -365,7 +370,13 @@ static int process_env_entry(cbm_dirent_t *ent, const char *dir_path, const char
                              cbm_env_binding_t *out, int max_out, char path_stack[][CBM_SZ_512],
                              int *stack_top, char **excluded_dirs, int excluded_count) {
     char full_path[CBM_SZ_512];
-    snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->name);
+    int path_n = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->name);
+    if (path_n < 0 || path_n >= (int)sizeof(full_path)) {
+        return CBM_NOT_FOUND;
+    }
+    if (ent->is_reparse) {
+        return 0;
+    }
     const char *rel = full_path + strlen(root_path);
     while (*rel == '/') {
         rel++;
@@ -373,16 +384,21 @@ static int process_env_entry(cbm_dirent_t *ent, const char *dir_path, const char
 
     struct stat st;
     if (stat(full_path, &st) != 0) {
-        return 0;
+        return CBM_NOT_FOUND;
     }
     if (S_ISDIR(st.st_mode)) {
         if (!is_ignored_dir(ent->name) &&
-            !cbm_pipeline_relpath_is_excluded(rel, excluded_dirs, excluded_count) &&
-            *stack_top < CBM_SZ_256) {
+            !cbm_pipeline_relpath_is_excluded(rel, excluded_dirs, excluded_count)) {
+            if (*stack_top >= CBM_SZ_256) {
+                return CBM_NOT_FOUND;
+            }
             strncpy(path_stack[*stack_top], full_path, sizeof(path_stack[0]) - 1);
             path_stack[*stack_top][sizeof(path_stack[0]) - SKIP_ONE] = '\0';
             (*stack_top)++;
         }
+        return 0;
+    }
+    if (!S_ISREG(st.st_mode)) {
         return 0;
     }
     if (is_secret_file(ent->name)) {
@@ -405,8 +421,11 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
     int count = 0;
     char path_stack[CBM_SZ_256][CBM_SZ_512];
     int stack_top = SKIP_ONE;
-    strncpy(path_stack[0], root_path, sizeof(path_stack[0]) - 1);
-    path_stack[0][sizeof(path_stack[0]) - SKIP_ONE] = '\0';
+    size_t root_len = strlen(root_path);
+    if (root_len >= sizeof(path_stack[0])) {
+        return CBM_NOT_FOUND;
+    }
+    memcpy(path_stack[0], root_path, root_len + 1U);
 
     while (stack_top > 0 && count < max_out) {
         stack_top--;
@@ -416,12 +435,21 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
 
         cbm_dir_t *d = cbm_opendir(dir_path);
         if (!d) {
-            continue;
+            return CBM_NOT_FOUND;
         }
         cbm_dirent_t *ent;
         while ((ent = cbm_readdir(d)) && count < max_out) {
-            count += process_env_entry(ent, dir_path, root_path, out + count, max_out - count,
-                                       path_stack, &stack_top, excluded_dirs, excluded_count);
+            int added = process_env_entry(ent, dir_path, root_path, out + count, max_out - count,
+                                          path_stack, &stack_top, excluded_dirs, excluded_count);
+            if (added < 0) {
+                cbm_closedir(d);
+                return CBM_NOT_FOUND;
+            }
+            count += added;
+        }
+        if (cbm_dir_had_error(d)) {
+            cbm_closedir(d);
+            return CBM_NOT_FOUND;
         }
         cbm_closedir(d);
     }

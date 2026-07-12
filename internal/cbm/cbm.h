@@ -195,7 +195,7 @@ typedef struct {
     const char **return_types; // NULL-terminated array (NULL if none)
     const char *route_path;    // HTTP route path from decorator (e.g., "/api/users") or NULL
     const char *route_method;  // HTTP method from decorator (e.g., "POST") or NULL
-    const char *config_path;   // dotted config path for nested config definitions, or NULL
+    const char *config_path;   // reversible escaped dotted path for config definitions, or NULL
     int complexity;            // cyclomatic complexity
     int cognitive;             // cognitive complexity (nesting-weighted)
     int loop_count;            // number of loop constructs in the body
@@ -290,7 +290,7 @@ typedef enum {
 typedef struct {
     const char *value;             // the string literal content
     const char *enclosing_func_qn; // QN of enclosing function
-    const char *key_path;          // dotted key path from YAML/JSON nesting (NULL if flat)
+    const char *key_path;          // escaped dotted key path from YAML/JSON nesting (NULL if flat)
     CBMStringRefKind kind;         // URL, CONFIG
 } CBMStringRef;
 
@@ -459,12 +459,19 @@ typedef struct {
     bool parse_incomplete;
     const char *error_ranges;
     int error_region_count;
-    int yaml_config_defs_emitted;      // nested YAML config-path definitions retained
-    bool yaml_config_path_truncated;   // per-file YAML_CONFIG_DEF_CAP was reached
+    int yaml_config_defs_emitted;    // nested YAML config-path definitions retained
+    bool yaml_config_path_truncated; // per-file YAML_CONFIG_DEF_CAP was reached
     bool is_test_file;
     int imports_count;
     TSTree *cached_tree;     // retained parse tree (caller frees via cbm_free_tree)
     CBMLanguage cached_lang; // language of cached tree (for parser selection)
+
+    // SHA-256 of the exact source bytes passed to cbm_extract_file(). The
+    // pipeline compares this with its pre-extraction file snapshot before it
+    // is allowed to publish file_hashes. This prevents a file changed between
+    // discovery/classification and parsing from making an older/newer graph
+    // look current merely because persistence hashed the live path later.
+    char source_sha256[65];
 
     // Retained source bytes — copied into `arena` by the parallel
     // extract pass so the fused cross-file LSP step in resolve_worker
@@ -532,7 +539,13 @@ void cbm_alloc_init(void);
 // Initialize the library. Call once at startup. Returns 0 on success.
 int cbm_init(void);
 
-// True when rel_path is in the crash-quarantine set — the newline-delimited list
+// Append one binary length-prefixed crash-recovery record. `event` is S/D for
+// marker start/done or C/H for crash/hang quarantine. A record is
+// `[event:u8][path_len:u32be][path bytes]`, so every legal non-NUL filesystem
+// path (including tabs/newlines and long Windows paths) round-trips losslessly.
+bool cbm_index_journal_append(const char *path, char event, const char *rel_path);
+
+// True when rel_path is in the crash-quarantine set — the binary record list
 // of files (CBM_INDEX_QUARANTINE_FILE) the crash supervisor pinned as crashers
 // during its single-threaded recovery re-run. Loaded once, lazily; read-only
 // after load. cbm_extract_file short-circuits such files to an empty result so no
@@ -545,9 +558,12 @@ bool cbm_index_is_quarantined(const char *rel_path);
 // Drives the same lazy once-load as cbm_index_is_quarantined. Used by the pipeline
 // extract loops to report the skip's phase in skipped[] (falls back to "crash").
 const char *cbm_index_quarantine_phase(const char *rel_path);
+/* Test-only: reset the lazy loader in an isolated child process before pointing
+ * it at a synthetic journal. Never call concurrently with extraction. */
+void cbm_index_quarantine_reset_for_test(void);
 
-// Crash-supervisor marker journal (parallel-safe): appends "S <rel_path>" /
-// "D <rel_path>" to CBM_INDEX_MARKER_FILE. Files with an S but no D form the
+// Crash-supervisor marker journal (parallel-safe): appends binary S/D records
+// to CBM_INDEX_MARKER_FILE. Files with an S but no D form the
 // parent's crash/hang suspect set. No-ops when the env var is unset.
 // cbm_extract_file journals its own start/done; long-running per-file phases
 // (cross-LSP resolve) call these around their per-file work so a hang there

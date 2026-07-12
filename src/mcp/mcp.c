@@ -63,8 +63,13 @@ enum {
 #include "pipeline/artifact.h"
 #include "memory/memory.h"
 #include "memory/memory_share.h"
+#include "foundation/rooted_file.h"
+#include "foundation/sha256.h"
+#include "foundation/subprocess.h"
+#include "design/design_io.h"
 
 #ifdef _WIN32
+#include "foundation/win_utf8.h"
 #include <direct.h>
 #include <io.h>
 #include <process.h>
@@ -75,6 +80,7 @@ enum {
 #include <fcntl.h>
 #endif
 #include <yyjson/yyjson.h>
+#include <inttypes.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,6 +117,154 @@ static char *heap_strdup(const char *s) {
         memcpy(d, s, len + SKIP_ONE);
     }
     return d;
+}
+
+enum {
+    MCP_GIT_CAPTURE_MAX_BYTES = 64 * 1024 * 1024,
+    MCP_AUTO_INDEX_CAPTURE_MAX_BYTES = 8 * 1024 * 1024,
+    MCP_UPDATE_CAPTURE_MAX_BYTES = 64 * 1024,
+    MCP_EXTERNAL_TIMEOUT_MS = 30000,
+};
+
+static bool mcp_absolute_executable(const char *candidate, char *out, size_t out_size) {
+    if (!candidate || !candidate[0] || !out || out_size == 0) {
+        return false;
+    }
+#ifdef _WIN32
+    bool drive = ((candidate[0] >= 'A' && candidate[0] <= 'Z') ||
+                  (candidate[0] >= 'a' && candidate[0] <= 'z')) &&
+                 candidate[1] == ':' && (candidate[2] == '\\' || candidate[2] == '/');
+    bool unc = candidate[0] == '\\' && candidate[1] == '\\';
+    if (!drive && !unc) {
+        return false;
+    }
+#else
+    if (candidate[0] != '/') {
+        return false;
+    }
+#endif
+    if (!cbm_canonical_path(candidate, out, out_size)) {
+        return false;
+    }
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide(out);
+    if (!wide) {
+        return false;
+    }
+    DWORD attributes = GetFileAttributesW(wide);
+    free(wide);
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           !(attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE));
+#else
+    struct stat st;
+    if (stat(out, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    if (access(out, X_OK) != 0) {
+        return false;
+    }
+    return true;
+#endif
+}
+
+#ifdef _WIN32
+static bool mcp_resolve_wide_override(const wchar_t *name, char *out, size_t out_size,
+                                      bool *present) {
+    *present = false;
+    const wchar_t *configured = _wgetenv(name);
+    if (!configured || !configured[0]) {
+        return false;
+    }
+    *present = true;
+    char *utf8 = cbm_wide_to_utf8(configured);
+    if (!utf8) {
+        return false;
+    }
+    bool valid = mcp_absolute_executable(utf8, out, out_size);
+    free(utf8);
+    return valid;
+}
+#endif
+
+static bool mcp_resolve_git_binary(char *out, size_t out_size) {
+#ifdef _WIN32
+    bool configured = false;
+    if (mcp_resolve_wide_override(L"CBM_GIT_BIN", out, out_size, &configured)) {
+        return true;
+    }
+    if (configured) {
+        return false; /* an explicit invalid override never falls through to PATH */
+    }
+#else
+    const char *configured = getenv("CBM_GIT_BIN");
+    if (configured && configured[0]) {
+        return mcp_absolute_executable(configured, out, out_size);
+    }
+#endif
+    return cbm_git_resolve_binary(out, out_size);
+}
+
+#ifndef _WIN32
+static bool mcp_resolve_curl_binary(char *out, size_t out_size) {
+    const char *configured = getenv("CBM_CURL_BIN");
+    if (configured && configured[0]) {
+        return mcp_absolute_executable(configured, out, out_size);
+    }
+    static const char *const trusted[] = {"/usr/bin/curl", "/usr/local/bin/curl",
+                                          "/opt/homebrew/bin/curl", "/bin/curl"};
+    for (size_t i = 0; i < sizeof(trusted) / sizeof(*trusted); i++) {
+        if (mcp_absolute_executable(trusted[i], out, out_size)) {
+            return true;
+        }
+    }
+    return false;
+}
+#else
+static bool mcp_resolve_curl_binary(char *out, size_t out_size) {
+    bool configured = false;
+    if (mcp_resolve_wide_override(L"CBM_CURL_BIN", out, out_size, &configured)) {
+        return true;
+    }
+    if (configured) {
+        return false;
+    }
+    wchar_t system_dir[32768];
+    UINT length = GetSystemDirectoryW(system_dir, (UINT)(sizeof(system_dir) / sizeof(*system_dir)));
+    if (length == 0 || length >= sizeof(system_dir) / sizeof(*system_dir) ||
+        (size_t)length > sizeof(system_dir) / sizeof(*system_dir) - 10U) {
+        return false;
+    }
+    if (system_dir[length - SKIP_ONE] != L'\\' && system_dir[length - SKIP_ONE] != L'/') {
+        system_dir[length++] = L'\\';
+    }
+    memcpy(system_dir + length, L"curl.exe", sizeof(L"curl.exe"));
+    char *utf8 = cbm_wide_to_utf8(system_dir);
+    if (!utf8) {
+        return false;
+    }
+    bool found = mcp_absolute_executable(utf8, out, out_size);
+    free(utf8);
+    return found;
+}
+#endif
+
+static int mcp_capture_argv(const char *binary, const char *const *argv, size_t max_bytes,
+                            char **out_data, size_t *out_len, cbm_proc_result_t *out_result) {
+    if (out_data) {
+        *out_data = NULL;
+    }
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (!binary || !binary[0] || !argv || !out_data || !out_len || max_bytes == 0) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_proc_opts_t options = {.bin = binary,
+                               .argv = argv,
+                               .discard_stderr = true,
+                               .quiet_timeout_ms = MCP_EXTERNAL_TIMEOUT_MS};
+    char sha256[CBM_SHA256_HEX_LEN + 1];
+    return cbm_subprocess_capture(&options, max_bytes, out_data, out_len, sha256, out_result);
 }
 
 /* Write yyjson_mut_doc to heap-allocated JSON string.
@@ -344,7 +498,7 @@ static const tool_def_t TOOLS[] = {
      "\"Override the derived project name. Non-ASCII bytes are encoded and unsafe path characters "
      "are normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
-     "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
+     "\"Write a verified generation-addressed artifact under .codebase-memory/ for team sharing. "
      "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
      "},\"required\":[\"repo_path\"]}"},
 
@@ -636,30 +790,37 @@ static const tool_def_t TOOLS[] = {
 
     {"memory_commit", "Commit Global Memory proposal",
      "Atomically commit a proposal using entity revision compare-and-swap and an idempotent "
-     "operation ID. Semantic conflicts are rejected; last-write-wins is not used.",
+     "operation ID. Requires explicit user_approved=true authorization from the current task. "
+     "Semantic conflicts are rejected; last-write-wins is not used.",
      "{\"type\":\"object\",\"properties\":{\"proposal_id\":{\"type\":\"string\"},"
      "\"operation_id\":{\"type\":\"string\"},\"agent_id\":{\"type\":\"string\"},"
      "\"session_id\":{\"type\":\"string\"},\"user_approved\":{\"type\":\"boolean\"}},"
-     "\"required\":[\"proposal_id\",\"operation_id\"]}"},
+     "\"required\":[\"proposal_id\",\"operation_id\",\"user_approved\"]}"},
 
     {"memory_lint", "Lint Global Memory",
      "Audit unsupported or stale claims, epistemic confusion, source lineage, contradictions, "
      "temporal overlap, retrieval concentration, proposal conflicts, outbox state, and CodeRefs.",
      "{\"type\":\"object\",\"properties\":{\"checks\":{\"type\":\"array\",\"items\":{"
      "\"type\":\"string\"}},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000},"
-     "\"apply\":{\"type\":\"boolean\",\"default\":false},\"current_project\":{"
-     "\"type\":\"string\"}}}"},
+     "\"current_project\":{\"type\":\"string\"}}}"},
 
     {"memory_export", "Export Global Memory",
-     "Write a deterministic logical bundle containing canonical rows and immutable raw objects.",
-     "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}"},
+     "Write a deterministic logical bundle containing canonical rows and immutable raw objects. "
+     "Paths outside Memory home require explicit path authority and user approval; replacing an "
+     "existing bundle also requires explicit overwrite approval.",
+     "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
+     "\"allow_external_path\":{\"type\":\"boolean\",\"default\":false},"
+     "\"overwrite\":{\"type\":\"boolean\",\"default\":false},"
+     "\"user_approved\":{\"type\":\"boolean\",\"default\":false}}}"},
 
     {"memory_import", "Import Global Memory",
      "Transactionally merge a logical bundle; the live database is never swapped. Semantic "
-     "conflicts remain proposals rather than being resolved by last-write-wins.",
+     "conflicts remain proposals rather than being resolved by last-write-wins. Paths outside "
+     "Memory home require explicit path authority and user approval.",
      "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"policy\":{"
      "\"type\":\"string\",\"enum\":[\"reject\",\"keep_local\",\"keep_remote\",\"newest\"],"
-     "\"default\":\"reject\"}}}"},
+     "\"default\":\"reject\"},\"allow_external_path\":{\"type\":\"boolean\","
+     "\"default\":false},\"user_approved\":{\"type\":\"boolean\",\"default\":false}}}"},
 
     {"memory_sync", "Synchronize Global Memory",
      "Use Git, including an optional GitHub HTTPS/SSH remote, only as transport for the "
@@ -1008,19 +1169,20 @@ bool cbm_mcp_get_bool_arg(const char *args_json, const char *key) {
  * ══════════════════════════════════════════════════════════════════ */
 
 struct cbm_mcp_server {
-    cbm_store_t *store;             /* currently open project store (or NULL) */
-    cbm_memory_t *memory;           /* independent user-global memory handle (lazy) */
-    bool owns_store;                /* true if we opened the store */
-    char *current_project;          /* which project store is open for (heap) */
-    time_t store_last_used;         /* last time resolve_store was called for a named project */
+    cbm_store_t *store;                 /* currently open project store (or NULL) */
+    cbm_memory_t *memory;               /* independent user-global memory handle (lazy) */
+    bool owns_store;                    /* true if we opened the store */
+    char *current_project;              /* which project store is open for (heap) */
+    time_t store_last_used;             /* last time resolve_store was called for a named project */
     char current_store_path[CBM_SZ_1K]; /* backing path used for freshness checks */
-    uint64_t store_device;          /* cached file identity: device */
-    uint64_t store_inode;           /* cached file identity: inode/file index */
-    int64_t store_mtime_ns;         /* cached high-resolution modification time */
-    int64_t store_size;             /* cached DB size */
+    uint64_t store_device;              /* cached file identity: device */
+    uint64_t store_inode;               /* cached file identity: inode/file index */
+    int64_t store_mtime_ns;             /* cached high-resolution modification time */
+    int64_t store_size;                 /* cached DB size */
     bool store_identity_valid;
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
-    bool update_checked;            /* true after background check has been launched */
+    _Atomic bool update_checked;    /* true after background check has been launched */
+    cbm_mutex_t update_mutex;       /* publishes/clears update_notice */
     cbm_thread_t update_tid;        /* background update check thread */
     bool update_thread_active;      /* true if update thread was started and needs joining */
 
@@ -1044,6 +1206,8 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     if (!srv) {
         return NULL;
     }
+    cbm_mutex_init(&srv->update_mutex);
+    atomic_init(&srv->update_checked, false);
 
     /* If a store_path is given, open that project directly.
      * Otherwise, create an in-memory store for test/embedded use. */
@@ -1098,6 +1262,7 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     cbm_memory_close(srv->memory);
     free(srv->current_project);
     free(srv->active_request_id_str);
+    cbm_mutex_destroy(&srv->update_mutex);
     free(srv);
 }
 
@@ -1151,26 +1316,45 @@ cbm_pipeline_t *cbm_mcp_server_active_pipeline(cbm_mcp_server_t *srv) {
 
 /* ── Cache dir + project DB path helpers ───────────────────────── */
 
-/* Returns the cache directory. Writes to buf, returns buf for convenience. */
-static const char *cache_dir(char *buf, size_t bufsz) {
-    const char *dir = cbm_resolve_cache_dir();
-    if (!dir) {
-        dir = cbm_tmpdir();
+/* Resolve the persistent per-user cache directory. Never fall back to a shared
+ * temporary directory: predictable <project>.db names there could be planted
+ * by another local user and then opened as trusted indexes. */
+static bool cache_dir(char *buf, size_t bufsz) {
+    if (!buf || bufsz == 0) {
+        return false;
     }
-    snprintf(buf, bufsz, "%s", dir);
-    return buf;
+    buf[0] = '\0';
+    const char *dir = cbm_resolve_cache_dir();
+    if (!dir || !dir[0]) {
+        return false;
+    }
+    int written = snprintf(buf, bufsz, "%s", dir);
+    if (written < 0 || (size_t)written >= bufsz) {
+        buf[0] = '\0';
+        return false;
+    }
+    return true;
 }
 
 /* Returns full .db path for a project: <cache_dir>/<project>.db */
-static const char *project_db_path(const char *project, char *buf, size_t bufsz) {
-    if (!cbm_validate_project_name(project)) {
-        buf[0] = '\0';
-        return buf;
+static bool project_db_path(const char *project, char *buf, size_t bufsz) {
+    if (!buf || bufsz == 0 || !cbm_validate_project_name(project)) {
+        if (buf && bufsz > 0) {
+            buf[0] = '\0';
+        }
+        return false;
     }
     char dir[CBM_SZ_1K];
-    cache_dir(dir, sizeof(dir));
-    snprintf(buf, bufsz, "%s/%s.db", dir, project);
-    return buf;
+    if (!cache_dir(dir, sizeof(dir))) {
+        buf[0] = '\0';
+        return false;
+    }
+    int written = snprintf(buf, bufsz, "%s/%s.db", dir, project);
+    if (written < 0 || (size_t)written >= bufsz) {
+        buf[0] = '\0';
+        return false;
+    }
+    return true;
 }
 
 /* ── Store resolution ──────────────────────────────────────────── */
@@ -1203,6 +1387,37 @@ static int64_t mcp_stat_mtime_ns(const struct stat *st) {
 
 static bool read_store_identity(const char *path, uint64_t *device, uint64_t *inode,
                                 int64_t *mtime_ns, int64_t *size) {
+#ifdef _WIN32
+    if (!path) {
+        return false;
+    }
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return false;
+    }
+    HANDLE handle = CreateFileW(wide, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wide);
+    BY_HANDLE_FILE_INFORMATION info;
+    bool ok = handle != INVALID_HANDLE_VALUE && GetFileType(handle) == FILE_TYPE_DISK &&
+              GetFileInformationByHandle(handle, &info) &&
+              !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+    if (ok) {
+        *device = (uint64_t)info.dwVolumeSerialNumber;
+        *inode = ((uint64_t)info.nFileIndexHigh << 32U) | info.nFileIndexLow;
+        uint64_t ticks = ((uint64_t)info.ftLastWriteTime.dwHighDateTime << 32U) |
+                         info.ftLastWriteTime.dwLowDateTime;
+        const uint64_t windows_to_unix_epoch_100ns = 116444736000000000ULL;
+        *mtime_ns = ticks >= windows_to_unix_epoch_100ns
+                        ? (int64_t)((ticks - windows_to_unix_epoch_100ns) * 100U)
+                        : 0;
+        *size = (int64_t)(((uint64_t)info.nFileSizeHigh << 32U) | info.nFileSizeLow);
+    }
+    if (handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle);
+    }
+    return ok;
+#else
     struct stat st;
     if (!path || stat(path, &st) != 0) {
         return false;
@@ -1212,6 +1427,7 @@ static bool read_store_identity(const char *path, uint64_t *device, uint64_t *in
     *mtime_ns = mcp_stat_mtime_ns(&st);
     *size = (int64_t)st.st_size;
     return true;
+#endif
 }
 
 static void remember_store_identity(cbm_mcp_server_t *srv, const char *path) {
@@ -1221,9 +1437,8 @@ static void remember_store_identity(cbm_mcp_server_t *srv, const char *path) {
     if (path != srv->current_store_path) {
         snprintf(srv->current_store_path, sizeof(srv->current_store_path), "%s", path);
     }
-    srv->store_identity_valid =
-        read_store_identity(path, &srv->store_device, &srv->store_inode, &srv->store_mtime_ns,
-                            &srv->store_size);
+    srv->store_identity_valid = read_store_identity(path, &srv->store_device, &srv->store_inode,
+                                                    &srv->store_mtime_ns, &srv->store_size);
 }
 
 static bool cached_store_file_changed(cbm_mcp_server_t *srv) {
@@ -1304,8 +1519,8 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     /* Open project's .db file — query-only open (no SQLITE_OPEN_CREATE) to
      * prevent ghost .db file creation for unknown/unindexed projects. */
     char path[CBM_SZ_1K];
-    project_db_path(project, path, sizeof(path));
-    srv->store = cbm_store_open_path_query(path);
+    bool has_db_path = project_db_path(project, path, sizeof(path));
+    srv->store = has_db_path ? cbm_store_open_path_query(path) : NULL;
     if (srv->store) {
         /* Check DB integrity — back up (never silently delete) a corrupt DB */
         if (!cbm_store_check_integrity(srv->store)) {
@@ -1423,7 +1638,14 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
         }
         count++;
     }
+    bool enumeration_failed = cbm_dir_had_error(d);
     cbm_closedir(d);
+    if (enumeration_failed) {
+        if (out_sz > 0) {
+            out[0] = '\0';
+        }
+        return -1;
+    }
     return count;
 }
 
@@ -1461,14 +1683,28 @@ static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const
 /* Build a helpful error listing available projects. Caller must free() result. */
 static char *build_project_list_error(const char *reason) {
     char dir_path[CBM_SZ_1K];
-    cache_dir(dir_path, sizeof(dir_path));
+    if (!cache_dir(dir_path, sizeof(dir_path))) {
+        char unavailable[CBM_SZ_2K];
+        snprintf(unavailable, sizeof(unavailable),
+                 "{\"error\":\"%s\",\"hint\":\"The private cache directory is unavailable. "
+                 "Set CBM_CACHE_DIR or HOME to a trusted per-user directory.\","
+                 "\"project_list_unavailable\":true}",
+                 reason);
+        return heap_strdup(unavailable);
+    }
 
     char projects[CBM_SZ_4K] = "";
     int count = collect_db_project_names(dir_path, projects, sizeof(projects));
 
     enum { ERR_BUF_SZ = 5120 };
     char buf[ERR_BUF_SZ];
-    if (count > 0) {
+    if (count < 0) {
+        snprintf(buf, sizeof(buf),
+                 "{\"error\":\"%s\",\"hint\":\"The cache directory could not be fully "
+                 "enumerated. Retry, then check its permissions and filesystem health.\","
+                 "\"project_list_unavailable\":true}",
+                 reason);
+    } else if (count > 0) {
         snprintf(buf, sizeof(buf),
                  "{\"error\":\"%s\",\"hint\":\"Use list_projects to see all indexed projects, "
                  "then pass it as the \\\"project\\\" "
@@ -1527,10 +1763,12 @@ static bool project_has_adr(cbm_store_t *store, const char *project, const char 
         return false;
     }
 
-    char adr_path[CBM_SZ_4K];
-    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", root_path);
-    struct stat adr_st;
-    return stat(adr_path, &adr_st) == 0;
+    cbm_rooted_file_t legacy = {0};
+    bool found = cbm_rooted_file_read(root_path, ".codebase-memory/adr.md", CBM_ADR_MAX_LENGTH,
+                                      &legacy) == CBM_ROOTED_FILE_OK &&
+                 legacy.len > 0;
+    cbm_rooted_file_free(&legacy);
+    return found;
 }
 
 /* ── Tool handler implementations ─────────────────────────────── */
@@ -1599,7 +1837,9 @@ static bool db_internal_project_name(const char *full_path, char *name_out, size
 /* resolve_store_fallback_scan — see forward declaration above resolve_store. */
 static cbm_store_t *resolve_store_fallback_scan(const char *project) {
     char dir_path[CBM_SZ_1K];
-    cache_dir(dir_path, sizeof(dir_path));
+    if (!cache_dir(dir_path, sizeof(dir_path))) {
+        return NULL;
+    }
     cbm_dir_t *d = cbm_opendir(dir_path);
     if (!d) {
         return NULL;
@@ -1624,7 +1864,15 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project) {
             cbm_store_close(st);
         }
     }
+    bool enumeration_failed = cbm_dir_had_error(d);
     cbm_closedir(d);
+    if (enumeration_failed && found) {
+        cbm_store_close(found);
+        found = NULL;
+    }
+    if (enumeration_failed) {
+        cbm_log_warn("mcp.cache_scan_failed", "operation", "resolve_store_fallback");
+    }
     return found;
 }
 
@@ -1688,7 +1936,12 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     (void)args;
 
     char dir_path[CBM_SZ_1K];
-    cache_dir(dir_path, sizeof(dir_path));
+    if (!cache_dir(dir_path, sizeof(dir_path))) {
+        return cbm_mcp_text_result(
+            "cache directory unavailable: set CBM_CACHE_DIR or HOME to a trusted per-user "
+            "directory",
+            true);
+    }
 
     cbm_dir_t *d = cbm_opendir(dir_path);
 
@@ -1722,7 +1975,16 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         }
         build_project_json_entry(doc, arr, dir_path, name, len, size_bytes);
     }
+    bool enumeration_failed = cbm_dir_had_error(d);
     cbm_closedir(d);
+
+    if (enumeration_failed) {
+        yyjson_mut_doc_free(doc);
+        return cbm_mcp_text_result(
+            "{\"error\":\"cannot fully enumerate cache directory\",\"hint\":"
+            "\"Retry, then check cache directory permissions and filesystem health.\"}",
+            true);
+    }
 
     yyjson_mut_obj_add_val(doc, root, "projects", arr);
 
@@ -2139,8 +2401,8 @@ static char *handle_get_design_context(cbm_mcp_server_t *srv, const char *args) 
     int relation_count = 0;
     int filtered_relations = 0;
     int relation_skip = relation_offset;
-    static const char *const core_types[] = {"ALIASES_TO", "OVERRIDES", "PROVIDES", "GENERATED_AS",
-                                             "IMPLEMENTED_BY"};
+    static const char *const core_types[] = {"ALIASES_TO",    "OVERRIDES",    "PROVIDES",
+                                             "DEFINES_TOKEN", "GENERATED_AS", "IMPLEMENTED_BY"};
     for (int i = 0; i < (int)(sizeof(core_types) / sizeof(core_types[0])); i++) {
         relation_count += design_add_relations(
             doc, relations, store, project, core_types[i], scope, relation_filter, &relation_skip,
@@ -2477,7 +2739,8 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
             cbm_toon_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_FILE), false);
             cbm_toon_cell_str(&rows, lines, false);
             cbm_toon_cell_real(&rows, sqlite3_column_double(stmt, BM25_COL_RANK), false);
-            cbm_toon_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_SCOPE), false);
+            cbm_toon_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_SCOPE),
+                              false);
             cbm_toon_row_end(&rows);
             emitted++;
         }
@@ -3371,7 +3634,12 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
 
     /* Delete the .db file + WAL/SHM */
     char path[CBM_SZ_1K];
-    project_db_path(name, path, sizeof(path));
+    if (!project_db_path(name, path, sizeof(path))) {
+        cbm_pipeline_unlock();
+        free(name);
+        return cbm_mcp_text_result(
+            "cache directory unavailable: refusing to derive a project DB path", true);
+    }
 
     char wal[CBM_SZ_1K];
     char shm[CBM_SZ_1K];
@@ -4634,73 +4902,72 @@ static void free_node_contents(cbm_node_t *n) {
 
 /* ── Helper: read lines [start, end] from a file ─────────────── */
 
-enum { SNIPPET_SOURCE_MAX_BYTES = 16 * 1024 };
+enum {
+    SNIPPET_SOURCE_MAX_BYTES = 16 * 1024,
+    SNIPPET_HASH_MAX_BYTES = 16 * 1024 * 1024,
+};
 
-static char *read_file_lines_ex(const char *path, int start, int end, bool *truncated,
-                                size_t *bytes_read) {
+bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
+
+/* Extract an inclusive graph line range from bytes that were read and hashed
+ * from one stable file handle. This binds a `current` freshness result to the
+ * source payload actually returned, rather than to a second pathname read. */
+static char *copy_file_lines_from_bytes(const char *data, size_t data_len, int start, int end,
+                                        bool *truncated, size_t *bytes_read) {
     if (truncated) {
         *truncated = false;
     }
     if (bytes_read) {
         *bytes_read = 0;
     }
-    FILE *fp = cbm_fopen(path, "r");
-    if (!fp) {
+    if (!data || data_len == 0 || start < 1 || end < start) {
         return NULL;
     }
-
-    size_t cap = CBM_SZ_4K;
-    char *buf = malloc(cap);
-    size_t len = 0;
-    buf[0] = '\0';
-
-    char line[CBM_SZ_2K];
-    int lineno = 1;
-    while (fgets(line, sizeof(line), fp)) {
-        if (lineno > end) {
-            break;
-        }
-        size_t ll = strlen(line);
-        if (lineno >= start) {
-            size_t remaining = SNIPPET_SOURCE_MAX_BYTES - len;
-            size_t copy_len = ll < remaining ? ll : remaining;
-            while (len + copy_len + SKIP_ONE > cap) {
-                cap *= PAIR_LEN;
-                if (cap > SNIPPET_SOURCE_MAX_BYTES + SKIP_ONE) {
-                    cap = SNIPPET_SOURCE_MAX_BYTES + SKIP_ONE;
+    char *out = (char *)malloc(SNIPPET_SOURCE_MAX_BYTES + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    size_t out_len = 0;
+    size_t offset = 0;
+    int line = 1;
+    while (offset < data_len && line <= end) {
+        const char *newline = (const char *)memchr(data + offset, '\n', data_len - offset);
+        size_t segment_end = newline ? (size_t)(newline - data) + SKIP_ONE : data_len;
+        if (line >= start) {
+            size_t segment_len = segment_end - offset;
+            size_t remaining = SNIPPET_SOURCE_MAX_BYTES - out_len;
+            bool segment_truncated = segment_len > remaining;
+            size_t copy_len = segment_truncated ? remaining : segment_len;
+            if (copy_len > 0) {
+                memcpy(out + out_len, data + offset, copy_len);
+                /* JSON strings cannot carry embedded NUL. Preserve range
+                 * shape and let the UTF-8 sanitizer handle other bad bytes. */
+                for (size_t i = 0; i < copy_len; i++) {
+                    if (out[out_len + i] == '\0') {
+                        out[out_len + i] = '?';
+                    }
                 }
-                buf = safe_realloc(buf, cap);
+                out_len += copy_len;
             }
-            memcpy(buf + len, line, copy_len);
-            len += copy_len;
-            buf[len] = '\0';
-            if (copy_len < ll || len == SNIPPET_SOURCE_MAX_BYTES) {
+            if (segment_truncated) {
                 if (truncated) {
                     *truncated = true;
                 }
                 break;
             }
         }
-        /* fgets may return multiple chunks for one physical line. Advance the
-         * line number only after the newline, not once per buffer chunk. */
-        if (ll > 0 && line[ll - SKIP_ONE] == '\n') {
-            lineno++;
-        }
+        offset = segment_end;
+        line++;
     }
-
-    (void)fclose(fp);
-    if (len == 0) {
-        free(buf);
+    if (out_len == 0) {
+        free(out);
         return NULL;
     }
+    out[out_len] = '\0';
     if (bytes_read) {
-        *bytes_read = len;
+        *bytes_read = out_len;
     }
-    return buf;
-}
-
-static char *read_file_lines(const char *path, int start, int end) {
-    return read_file_lines_ex(path, start, end, NULL, NULL);
+    return out;
 }
 
 /* ── Helper: get project root_path from store ─────────────────── */
@@ -4789,7 +5056,10 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
 /* Bootstrap from artifact if no local DB exists for this project. */
 static void try_artifact_bootstrap(const char *project_name, const char *repo_path) {
     char db_buf[CBM_SZ_1K];
-    project_db_path(project_name, db_buf, sizeof(db_buf));
+    if (!project_db_path(project_name, db_buf, sizeof(db_buf))) {
+        cbm_log_warn("index.artifact_bootstrap", "status", "cache_dir_unavailable");
+        return;
+    }
     if (cbm_file_size(db_buf) < 0 && cbm_artifact_exists(repo_path)) {
         cbm_log_info("index.artifact_bootstrap", "project", project_name);
         cbm_artifact_import(repo_path, db_buf);
@@ -4972,17 +5242,25 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
     char path[CBM_SZ_1K];
     const char *override = getenv("CBM_INDEX_LOG");
     if (override && override[0]) {
-        snprintf(path, sizeof(path), "%s", override);
+        int override_len = snprintf(path, sizeof(path), "%s", override);
+        if (override_len < 0 || (size_t)override_len >= sizeof(path)) {
+            return false;
+        }
     } else {
         const char *cdir = cbm_resolve_cache_dir();
-        if (!cdir) {
+        if (!cdir || !cdir[0]) {
             return false;
         }
         char logdir[CBM_SZ_1K];
-        snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
-        cbm_mkdir_p(logdir, 0755);
-        snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir, project ? project : "index",
-                 (long long)time(NULL));
+        int dir_len = snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
+        if (dir_len < 0 || (size_t)dir_len >= sizeof(logdir) || !cbm_mkdir_p(logdir, 0700)) {
+            return false;
+        }
+        int path_len = snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir,
+                                project ? project : "index", (long long)time(NULL));
+        if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
+            return false;
+        }
     }
     FILE *f = cbm_fopen(path, "wb");
     if (!f) {
@@ -5016,12 +5294,56 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
                                          yyjson_mut_val *root, const char *project_name,
                                          const char *repo_path, bool persistence, cbm_pipeline_t *p,
                                          char **excluded_dirs, int excluded_count,
-                                         const cbm_file_error_t *file_errors, int file_error_count,
-                                         const char *logfile) {
+                                         const cbm_file_error_t *file_errors,
+                                         int file_error_count) {
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
-    add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
-    add_parse_partial_summary(doc, root, file_errors, file_error_count);
     add_not_indexed_files_summary(doc, root, p);
+
+    /* Incremental runs only re-extract changed files, so p->file_errors is a
+     * per-run delta.  Reporting that delta made a no-change reindex claim zero
+     * parse misses even though index_status correctly retained the persisted
+     * coverage for unchanged files.  Build the response and its logfile from
+     * the installed snapshot's authoritative coverage rows when available. */
+    cbm_store_t *store = resolve_store(srv, project_name);
+    cbm_coverage_row_t *coverage_rows = NULL;
+    cbm_file_error_t *persisted_errors = NULL;
+    const cbm_file_error_t *reported_errors = file_errors;
+    int coverage_count = 0;
+    int reported_error_count = file_error_count;
+    if (store && cbm_store_coverage_get(store, project_name, &coverage_rows, &coverage_count) ==
+                     CBM_STORE_OK) {
+        if (coverage_count == 0) {
+            reported_errors = NULL;
+            reported_error_count = 0;
+        } else if ((size_t)coverage_count <= SIZE_MAX / sizeof(*persisted_errors)) {
+            persisted_errors =
+                (cbm_file_error_t *)malloc((size_t)coverage_count * sizeof(*persisted_errors));
+            if (persisted_errors) {
+                int n = 0;
+                for (int i = 0; i < coverage_count; i++) {
+                    const char *kind = coverage_rows[i].kind ? coverage_rows[i].kind : "";
+                    if (strncmp(kind, "not_indexed", 11) == 0) {
+                        continue;
+                    }
+                    persisted_errors[n].path = (char *)coverage_rows[i].rel_path;
+                    persisted_errors[n].reason = (char *)coverage_rows[i].detail;
+                    persisted_errors[n].phase = (char *)coverage_rows[i].kind;
+                    n++;
+                }
+                reported_errors = persisted_errors;
+                reported_error_count = n;
+            }
+        }
+    }
+    char logfile_path[CBM_SZ_1K];
+    logfile_path[0] = '\0';
+    bool has_logfile = write_skip_logfile(project_name, reported_errors, reported_error_count,
+                                          logfile_path, sizeof(logfile_path));
+    add_skipped_summary(doc, root, reported_errors, reported_error_count,
+                        has_logfile ? logfile_path : NULL);
+    add_parse_partial_summary(doc, root, reported_errors, reported_error_count);
+    free(persisted_errors);
+    cbm_store_free_coverage(coverage_rows, coverage_count);
 
     int exp_nodes = -1;
     int exp_edges = -1;
@@ -5030,7 +5352,6 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     const double ratio = cbm_dump_verify_min_ratio();
     const int min_floor = CBM_DUMP_VERIFY_MIN_FLOOR;
 
-    cbm_store_t *store = resolve_store(srv, project_name);
     int nodes = 0;
     int edges = 0;
     bool degraded = false;
@@ -5099,8 +5420,9 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     yyjson_mut_obj_add_bool(doc, root, "artifact_present", has_artifact);
     if (persistence && has_artifact) {
         yyjson_mut_obj_add_str(doc, root, "artifact_hint",
-                               "Persistent artifact written to .codebase-memory/graph.db.zst. "
-                               "Commit this file to share the index with teammates.");
+                               "Persistent artifact written under .codebase-memory/. Commit "
+                               "artifact.json and its referenced graph.db.<sha256>.zst payload "
+                               "to share the index with teammates.");
     }
 
     return degraded;
@@ -5152,26 +5474,37 @@ static void supervisor_invalidate_store(cbm_mcp_server_t *srv) {
     srv->current_project = NULL;
 }
 
-/* Resolve a per-supervisor-run temp path <cache_dir>/logs/.supervisor-<pid><suffix>
- * (falls back to the CWD if the cache dir is unresolvable). Used for the crash-
- * attribution marker and the quarantine list during the recovery re-run. */
-static void supervisor_tmp_path(char *out, size_t out_sz, const char *suffix) {
-    const char *cdir = cbm_resolve_cache_dir();
-    if (cdir && cdir[0]) {
-        char logdir[CBM_SZ_1K];
-        snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
-        cbm_mkdir_p(logdir, 0755);
-        snprintf(out, out_sz, "%s/.supervisor-%d%s", logdir, (int)getpid(), suffix);
-    } else {
-        snprintf(out, out_sz, ".supervisor-%d%s", (int)getpid(), suffix);
+/* Resolve recovery state only inside the persistent per-user cache. */
+static bool supervisor_tmp_path(char *out, size_t out_sz, const char *suffix) {
+    if (!out || out_sz == 0 || !suffix) {
+        return false;
     }
+    out[0] = '\0';
+    const char *cdir = cbm_resolve_cache_dir();
+    if (!cdir || !cdir[0]) {
+        return false;
+    }
+    char logdir[CBM_SZ_1K];
+    int dir_len = snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
+    if (dir_len < 0 || (size_t)dir_len >= sizeof(logdir) || !cbm_mkdir_p(logdir, 0700)) {
+        return false;
+    }
+    static _Atomic uint64_t sequence = 0;
+    uint64_t nonce = cbm_now_ns() ^ atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
+    int path_len = snprintf(out, out_sz, "%s/.supervisor-%d-%" PRIu64 "%s", logdir, (int)getpid(),
+                            nonce, suffix);
+    if (path_len < 0 || (size_t)path_len >= out_sz) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
 }
 
-/* Parse the worker's marker JOURNAL ("S <rel>" / "D <rel>" lines, one event
- * per line — see cbm_index_mark_start/done) into the crash/hang SUSPECT set:
+/* Parse the worker's binary length-prefixed S/D marker JOURNAL (see
+ * cbm_index_mark_start/done) into the crash/hang SUSPECT set:
  * files whose last event is an S with no closing D, i.e. the in-flight set
  * at kill time. Recovery runs are PARALLEL, so there are up to worker_count
- * suspects; a torn final line (no trailing newline) is discarded by design.
+ * suspects; a torn final record is discarded by design.
  * Returns a malloc'd array of malloc'd rel paths, OLDEST OPEN S FIRST (for a
  * hang, the oldest still-open file IS the stuck one). Caller frees via
  * supervisor_free_suspects. */
@@ -5184,38 +5517,40 @@ static char **supervisor_read_suspects(const char *path, int *out_n) {
     char **open_paths = NULL; /* open (S-without-D) files in first-S order */
     int open_n = 0;
     int open_cap = 0;
-    char line[CBM_SZ_1K];
-    while (fgets(line, sizeof(line), f)) {
-        size_t len = strlen(line);
-        if (len == 0 || line[len - 1] != '\n') {
-            break; /* torn final line — discard and stop */
+    enum { RECORD_HEADER = 5, RECORD_MAX = 1024 * 1024 };
+    unsigned char header[RECORD_HEADER];
+    while (fread(header, 1, sizeof(header), f) == sizeof(header)) {
+        size_t len = ((size_t)header[1] << 24U) | ((size_t)header[2] << 16U) |
+                     ((size_t)header[3] << 8U) | (size_t)header[4];
+        if ((header[0] != 'S' && header[0] != 'D') || len == 0 || len > RECORD_MAX) {
+            break;
         }
-        line[--len] = '\0';
-        if (len > 0 && line[len - 1] == '\r') {
-            line[--len] = '\0';
+        char *rel = malloc((size_t)len + 1U);
+        if (!rel || fread(rel, 1, len, f) != len) {
+            free(rel);
+            break;
         }
-        if (len < 3 || (line[0] != 'S' && line[0] != 'D') || line[1] != ' ') {
-            continue;
-        }
-        const char *rel = line + 2;
-        if (line[0] == 'S') {
+        rel[len] = '\0';
+        if (header[0] == 'S') {
             bool already = false;
             for (int i = 0; i < open_n && !already; i++) {
                 already = strcmp(open_paths[i], rel) == 0;
             }
             if (already) {
+                free(rel);
                 continue;
             }
             if (open_n == open_cap) {
                 int ncap = open_cap ? open_cap * 2 : 16;
                 char **np = (char **)realloc(open_paths, (size_t)ncap * sizeof(char *));
                 if (!np) {
+                    free(rel);
                     break;
                 }
                 open_paths = np;
                 open_cap = ncap;
             }
-            open_paths[open_n++] = cbm_strdup(rel);
+            open_paths[open_n++] = rel;
         } else {
             for (int i = 0; i < open_n; i++) {
                 if (strcmp(open_paths[i], rel) == 0) {
@@ -5226,6 +5561,7 @@ static char **supervisor_read_suspects(const char *path, int *out_n) {
                     break;
                 }
             }
+            free(rel);
         }
     }
     (void)fclose(f);
@@ -5256,17 +5592,10 @@ static bool supervisor_suspect_contains(char **s, int n, const char *rel) {
     return false;
 }
 
-/* Append one quarantine entry "rel\tphase\n" (phase = "crash"|"hang") to the
- * quarantine list. The worker's loader parses this back and reports the skip's
- * phase in skipped[]; a bare "rel" line is still tolerated there (defaults crash). */
+/* Append one binary length-prefixed quarantine entry. C/H encode the phase, so
+ * tabs/newlines in a legal path cannot be reinterpreted as record structure. */
 static bool supervisor_append_quarantine(const char *path, const char *rel, const char *phase) {
-    FILE *f = cbm_fopen(path, "ab");
-    if (!f) {
-        return false;
-    }
-    (void)fprintf(f, "%s\t%s\n", rel, phase);
-    (void)fclose(f);
-    return true;
+    return cbm_index_journal_append(path, strcmp(phase, "hang") == 0 ? 'H' : 'C', rel);
 }
 
 /* Run index_repository in a supervised worker subprocess with skip-and-continue
@@ -5280,7 +5609,7 @@ static bool supervisor_append_quarantine(const char *path, const char *rel, cons
  *   - a contained-failure response only if even that cannot produce a clean run.
  * Returns NULL only when the worker could not be spawned at all, so the caller
  * degrades to the in-process path. */
-static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
+static char *index_run_supervised_locked(cbm_mcp_server_t *srv, const char *args) {
     supervisor_invalidate_store(srv);
 
     /* First attempt: normal parallel run. */
@@ -5326,8 +5655,11 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
 
     char marker_path[CBM_SZ_1K];
     char quarantine_path[CBM_SZ_1K];
-    supervisor_tmp_path(marker_path, sizeof(marker_path), ".marker");
-    supervisor_tmp_path(quarantine_path, sizeof(quarantine_path), ".quarantine");
+    if (!supervisor_tmp_path(marker_path, sizeof(marker_path), ".marker") ||
+        !supervisor_tmp_path(quarantine_path, sizeof(quarantine_path), ".quarantine")) {
+        supervisor_invalidate_store(srv);
+        return build_worker_failure_response(args, last_outcome);
+    }
     (void)remove(marker_path);
     /* Start the quarantine list empty (truncate any stale file). */
     FILE *qinit = cbm_fopen(quarantine_path, "wb");
@@ -5452,6 +5784,23 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     return build_worker_failure_response(args, last_outcome);
 }
 
+/* The watcher already owns the common pipeline lock before entering the public
+ * supervised path; explicit MCP and auto-index callers do not. Track ownership
+ * per thread so every route serializes against the same process-wide writer
+ * without recursively deadlocking the watcher. Holding this lock until the
+ * worker is reaped prevents an older overlapping snapshot from publishing last. */
+static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
+    bool acquired = !cbm_pipeline_lock_held_by_current_thread();
+    if (acquired) {
+        cbm_pipeline_lock();
+    }
+    char *response = index_run_supervised_locked(srv, args);
+    if (acquired) {
+        cbm_pipeline_unlock();
+    }
+    return response;
+}
+
 /* Build a minimal {"repo_path": "<root>"} args object (path safely escaped) and
  * run it through index_run_supervised. Shared by the session auto-index (srv
  * present → its cached store is invalidated) and the watcher re-index (srv NULL).
@@ -5480,8 +5829,6 @@ char *cbm_mcp_index_run_supervised_path(const char *root_path) {
     return index_run_supervised_path(NULL, root_path);
 }
 
-bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
-
 /* A successful explicit index has the same Global Memory semantics as a
  * watcher re-index: symbolic resolution is refreshed against the newly
  * written code DB, and validation writes only when the result changed.
@@ -5497,8 +5844,8 @@ static void memory_after_project_index(cbm_mcp_server_t *srv, const char *projec
     }
 
     char path[CBM_SZ_2K];
-    project_db_path(project, path, sizeof(path));
-    cbm_store_t *code_store = path[0] ? cbm_store_open_path_query(path) : NULL;
+    cbm_store_t *code_store =
+        project_db_path(project, path, sizeof(path)) ? cbm_store_open_path_query(path) : NULL;
     if (code_store) {
         (void)cbm_memory_validate_code_refs(memory, code_store, project);
         cbm_store_close(code_store);
@@ -5632,15 +5979,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
 
     if (rc == 0) {
-        /* Write the per-run logfile ONLY when there were skips (no logfile on a
-         * clean run). The FULL list goes to the file; the JSON caps at 50. */
-        char logfile_path[CBM_SZ_1K];
-        logfile_path[0] = '\0';
-        bool has_logfile = write_skip_logfile(project_name, file_errors, file_error_count,
-                                              logfile_path, sizeof(logfile_path));
-        bool degraded = build_index_success_response(
-            srv, doc, root, project_name, repo_path, persistence, p, excluded_dirs, excluded_count,
-            file_errors, file_error_count, has_logfile ? logfile_path : NULL);
+        bool degraded = build_index_success_response(srv, doc, root, project_name, repo_path,
+                                                     persistence, p, excluded_dirs, excluded_count,
+                                                     file_errors, file_error_count);
         yyjson_mut_obj_add_str(doc, root, "status", degraded ? "degraded" : "indexed");
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
@@ -5758,16 +6099,9 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
     return props_doc; /* caller frees after serialization */
 }
 
-/* Resolve an absolute path from root_path + file_path, verify containment,
- * and read source lines. Sets *out_abs_path (caller frees). Returns source
- * string (caller frees) or NULL if path is invalid/unreadable. */
-/* True only when abs_path, after realpath/_fullpath resolution (which collapses
- * `..` and resolves symlinks/junctions), stays within root_path. This is the
- * single containment guard every MCP file-read sink must pass before reading a
- * file into a tool response: both the snippet path (resolve_snippet_source) and
- * the search path (attach_result_source) route through it, so a result whose
- * indexed path escapes the project root — via a `..` segment, or a symlink /
- * Windows junction picked up during discovery — is never read back out. */
+/* Compatibility/administrative containment helper. Source-response reads do
+ * not use this pathname precheck as authority: they use rooted_file so an
+ * opened descriptor/handle, its bytes, and its root containment are bound. */
 /* Canonicalize `path` (resolve symlinks/junctions and `..`) into `out`
  * (>= CBM_SZ_4K bytes); returns true on success. Isolating the per-OS resolver
  * keeps cbm_path_within_root's control flow unconditional: the previous `#ifdef`
@@ -5776,10 +6110,10 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
  * across preprocessor branches, which defeats source-level tooling that parses
  * without the preprocessor (and left this function unindexed in the graph). */
 static bool resolve_canonical_path(const char *path, char *out, size_t out_sz) {
-    /* cbm_canonical_path: realpath on POSIX; wide existence check +
-     * GetFullPathNameW on Windows (the old bare _fullpath was ANSI —
-     * CJK-locale corruption, #973 — and, unlike POSIX realpath, resolved
-     * nonexistent paths too; requiring existence aligns the platforms). */
+    /* cbm_canonical_path: realpath on POSIX; a wide handle plus
+     * GetFinalPathNameByHandleW on Windows. The old bare _fullpath was ANSI
+     * (CJK-locale corruption, #973) and lexical-only, so it neither aligned
+     * with POSIX realpath nor resolved junctions for containment checks. */
     if (!cbm_canonical_path(path, out, out_sz)) {
         return false;
     }
@@ -5798,30 +6132,70 @@ bool cbm_path_within_root(const char *root_path, const char *abs_path) {
     if (resolve_canonical_path(root_path, real_root, sizeof(real_root)) &&
         resolve_canonical_path(abs_path, real_file, sizeof(real_file))) {
         size_t root_len = strlen(real_root);
-        if (strncmp(real_file, real_root, root_len) == 0 &&
-            (real_file[root_len] == '/' || real_file[root_len] == '\0')) {
+        size_t file_len = strlen(real_file);
+        if (root_len == 0 || file_len < root_len) {
+            return false;
+        }
+        bool prefix = false;
+#ifdef _WIN32
+        prefix = _strnicmp(real_file, real_root, root_len) == 0;
+#else
+        prefix = strncmp(real_file, real_root, root_len) == 0;
+#endif
+        bool root_has_separator = real_root[root_len - SKIP_ONE] == '/';
+        bool next_is_separator = real_file[root_len] == '/';
+#ifdef _WIN32
+        root_has_separator = root_has_separator || real_root[root_len - SKIP_ONE] == '\\';
+        next_is_separator = next_is_separator || real_file[root_len] == '\\';
+#endif
+        if (prefix && (root_has_separator || next_is_separator || real_file[root_len] == '\0')) {
             return true;
         }
     }
     return false;
 }
 
-static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,
-                                    int end, char **out_abs_path, bool *truncated,
-                                    size_t *bytes_read) {
-    *out_abs_path = NULL;
-    if (!root_path || !file_path) {
-        return NULL;
-    }
-    size_t apsz = strlen(root_path) + strlen(file_path) + MCP_SEPARATOR;
-    char *abs_path = malloc(apsz);
-    snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
+typedef struct {
+    char *source;
+    char *abs_path; /* display only; never used as read authority */
+    bool truncated;
+    size_t bytes_read;
+    cbm_rooted_file_t file;
+    cbm_rooted_file_status_t status;
+} snippet_source_result_t;
 
-    *out_abs_path = abs_path;
-    if (cbm_path_within_root(root_path, abs_path)) {
-        return read_file_lines_ex(abs_path, start, end, truncated, bytes_read);
+static void resolve_snippet_source(const char *root_path, const char *file_path, int start, int end,
+                                   snippet_source_result_t *result) {
+    memset(result, 0, sizeof(*result));
+    result->file.size = -1;
+    result->status = CBM_ROOTED_FILE_INVALID;
+    if (!root_path || !file_path || !cbm_rooted_relative_path_valid(file_path)) {
+        return;
     }
-    return NULL;
+
+    /* Build a human-readable absolute path independently of authorization.
+     * The source read below receives only root + validated relative path. */
+    size_t root_len = strlen(root_path);
+    size_t file_len = strlen(file_path);
+    if (file_len > SIZE_MAX - MCP_SEPARATOR || root_len > SIZE_MAX - file_len - MCP_SEPARATOR) {
+        return;
+    }
+    size_t apsz = root_len + file_len + MCP_SEPARATOR;
+    char *abs_path = malloc(apsz);
+    if (abs_path) {
+        int written = snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
+        if (written < 0 || (size_t)written >= apsz) {
+            free(abs_path);
+            abs_path = NULL;
+        }
+    }
+    result->abs_path = abs_path;
+    result->status =
+        cbm_rooted_file_read(root_path, file_path, SNIPPET_HASH_MAX_BYTES, &result->file);
+    if (result->status == CBM_ROOTED_FILE_OK) {
+        result->source = copy_file_lines_from_bytes(result->file.data, result->file.len, start, end,
+                                                    &result->truncated, &result->bytes_read);
+    }
 }
 
 static bool utf8_is_cont(unsigned char c) {
@@ -5946,11 +6320,9 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 
     int start = node->start_line > 0 ? node->start_line : SKIP_ONE;
     int end = node->end_line > start ? node->end_line : start + SNIPPET_DEFAULT_LINES;
-    char *abs_path = NULL;
-    bool source_truncated = false;
-    size_t source_bytes = 0;
-    char *source = resolve_snippet_source(root_path, node->file_path, start, end, &abs_path,
-                                          &source_truncated, &source_bytes);
+    snippet_source_result_t resolved;
+    resolve_snippet_source(root_path, node->file_path, start, end, &resolved);
+    char *source = resolved.source;
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
@@ -5962,36 +6334,47 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_mut_obj_add_str(doc, root_obj, "label", node->label ? node->label : "");
 
     const char *display_path = "";
-    if (abs_path) {
-        display_path = abs_path;
+    if (resolved.abs_path) {
+        display_path = resolved.abs_path;
     } else if (node->file_path) {
         display_path = node->file_path;
     }
     yyjson_mut_obj_add_str(doc, root_obj, "file_path", display_path);
     yyjson_mut_obj_add_int(doc, root_obj, "start_line", start);
     yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
-    yyjson_mut_obj_add_bool(doc, root_obj, "source_truncated", source_truncated);
-    yyjson_mut_obj_add_uint(doc, root_obj, "source_bytes", source_bytes);
+    yyjson_mut_obj_add_bool(doc, root_obj, "source_truncated", resolved.truncated);
+    yyjson_mut_obj_add_uint(doc, root_obj, "source_bytes", resolved.bytes_read);
     yyjson_mut_obj_add_str(doc, root_obj, "line_range_source", "indexed_graph");
 
     int64_t indexed_mtime_ns = 0;
     int64_t indexed_size = 0;
-    struct stat live_stat;
+    char *indexed_hash = NULL;
     bool indexed_version =
         node->project && node->file_path &&
         cbm_store_get_file_version(srv->store, node->project, node->file_path, &indexed_mtime_ns,
-                                   &indexed_size, NULL) == CBM_STORE_OK;
-    bool live_version = abs_path && stat(abs_path, &live_stat) == 0;
-    bool stale_source = indexed_version && live_version &&
-                        (indexed_mtime_ns != mcp_stat_mtime_ns(&live_stat) ||
-                         indexed_size != (int64_t)live_stat.st_size);
+                                   &indexed_size, &indexed_hash) == CBM_STORE_OK;
+    int64_t live_mtime_ns = resolved.file.mtime_ns;
+    int64_t live_size = resolved.file.size;
+    bool live_version = resolved.file.metadata_valid;
+    bool live_path_exists = resolved.status != CBM_ROOTED_FILE_NOT_FOUND;
+    bool metadata_changed = indexed_version && live_version &&
+                            (indexed_mtime_ns != live_mtime_ns || indexed_size != live_size);
+    bool hash_available =
+        live_version && resolved.status == CBM_ROOTED_FILE_OK && indexed_hash && indexed_hash[0];
+    bool hash_changed = hash_available && strcmp(indexed_hash, resolved.file.sha256) != 0;
+    bool stale_source = hash_available ? hash_changed : metadata_changed;
     const char *source_state = "unknown";
-    if (indexed_version && (!live_version || !source)) {
+    if (indexed_version && resolved.status == CBM_ROOTED_FILE_NOT_FOUND) {
         source_state = "missing_worktree";
     } else if (stale_source) {
         source_state = "stale_worktree";
-    } else if (indexed_version) {
+    } else if (indexed_version && hash_available && source) {
         source_state = "current";
+    } else if (indexed_version && live_path_exists &&
+               (!live_version || resolved.status != CBM_ROOTED_FILE_OK || !source)) {
+        source_state = "range_unavailable";
+    } else if (indexed_version && live_version) {
+        source_state = "metadata_match";
     }
     yyjson_mut_obj_add_str(doc, root_obj, "source_state", source_state);
     if (stale_source) {
@@ -5999,11 +6382,23 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
             doc, root_obj, "source_warning",
             "The graph line range comes from an older file version. Source is read from the live "
             "worktree and may no longer correspond to this symbol; re-index before relying on it.");
-    } else if (indexed_version && (!live_version || !source)) {
+    } else if (indexed_version && resolved.status == CBM_ROOTED_FILE_NOT_FOUND) {
         yyjson_mut_obj_add_str(
             doc, root_obj, "source_warning",
             "The indexed file is missing or unreadable in the live worktree. Re-index before "
             "relying on this symbol.");
+    } else if (indexed_version && live_path_exists &&
+               (!live_version || resolved.status != CBM_ROOTED_FILE_OK || !source)) {
+        yyjson_mut_obj_add_str(
+            doc, root_obj, "source_warning",
+            "The indexed line range could not be read from one stable regular-file generation "
+            "within the 16 MiB interactive limit. Re-index before relying on this symbol.");
+    } else if (indexed_version && live_version && !hash_available) {
+        yyjson_mut_obj_add_str(
+            doc, root_obj, "source_warning",
+            "Only file metadata could be compared because the indexed or live content hash is "
+            "unavailable. Re-index legacy rows to establish a digest; oversized files remain "
+            "metadata-only so interactive requests stay bounded.");
     }
 
     if (source) {
@@ -6077,8 +6472,11 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     free(nb_callers);
     free(nb_callees);
     free(root_path);
-    free(abs_path);
+    free(resolved.abs_path);
     free(source);
+    resolved.source = NULL;
+    cbm_rooted_file_free(&resolved.file);
+    free(indexed_hash);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -6211,6 +6609,25 @@ typedef struct {
     int match_count;
 } search_result_t;
 
+enum {
+    SEARCH_MAX_MATCHES = 500,
+    SEARCH_MAX_INDEXED_FILES = 100000,
+    SEARCH_MAX_SCAN_BYTES = 256 * 1024 * 1024,
+};
+
+typedef struct {
+    int indexed_files;
+    int scanned_files;
+    int skipped_unavailable;
+    int skipped_oversized;
+    int skipped_unstable;
+    int skipped_binary;
+    size_t scanned_bytes;
+    bool truncated;
+    bool list_failed;
+    bool no_indexed_files;
+} search_scan_stats_t;
+
 /* Score a result for ranking: project source first, vendored last, tests lowest */
 enum { SCORE_FUNC = 10, SCORE_ROUTE = 15, SCORE_VENDORED = -50, SCORE_TEST = -5 };
 enum { MAX_LINE_SPAN = 999999 };
@@ -6238,80 +6655,6 @@ static int search_result_cmp(const void *a, const void *b) {
     const search_result_t *ra = (const search_result_t *)a;
     const search_result_t *rb = (const search_result_t *)b;
     return rb->score - ra->score; /* descending */
-}
-
-/* Build the grep/search command string based on scoped vs recursive mode.
- * On Windows, uses PowerShell Select-String with tab-delimited output.
- * On POSIX, uses grep with colon-delimited output. */
-static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
-                           const char *file_pattern, const char *tmpfile, const char *filelist,
-                           const char *root_path) {
-#ifdef _WIN32
-    const char *sm = use_regex ? "" : " -SimpleMatch";
-    if (scoped) {
-        if (file_pattern) {
-            snprintf(
-                cmd, cmd_sz,
-                "powershell -Command \"$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
-                "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
-                "-LiteralPath $_ -Pattern $pat%s "
-                "-ErrorAction SilentlyContinue }"
-                " | Where-Object { $_.Path -like '*%s' }"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                tmpfile, filelist, sm, file_pattern);
-        } else {
-            snprintf(
-                cmd, cmd_sz,
-                "powershell -Command \"$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
-                "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
-                "-LiteralPath $_ -Pattern $pat%s "
-                "-ErrorAction SilentlyContinue }"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                tmpfile, filelist, sm);
-        }
-    } else {
-        if (file_pattern) {
-            snprintf(
-                cmd, cmd_sz,
-                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' -File "
-                "-ErrorAction SilentlyContinue"
-                " | Select-String -Pattern (Get-Content -Encoding UTF8 -LiteralPath '%s')%s "
-                "-ErrorAction SilentlyContinue"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, file_pattern, tmpfile, sm);
-        } else {
-            snprintf(
-                cmd, cmd_sz,
-                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -File -ErrorAction "
-                "SilentlyContinue"
-                " | Select-String -Pattern (Get-Content -Encoding UTF8 -LiteralPath '%s')%s "
-                "-ErrorAction SilentlyContinue"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, tmpfile, sm);
-        }
-    }
-#else
-    const char *flag = use_regex ? "-E" : "-F";
-    if (scoped) {
-        if (file_pattern) {
-            /* -0: read NUL-separated paths from the filelist so paths containing
-             * spaces stay one argument (issue #687). Pairs with the NUL separator
-             * written by write_scoped_filelist. */
-            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
-                     flag, file_pattern, tmpfile, filelist);
-        } else {
-            snprintf(cmd, cmd_sz, "xargs -0 grep -Hn %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
-                     filelist);
-        }
-    } else {
-        if (file_pattern) {
-            snprintf(cmd, cmd_sz, "grep -rn %s --include='%s' -f '%s' '%s' 2>/dev/null", flag,
-                     file_pattern, tmpfile, root_path);
-        } else {
-            snprintf(cmd, cmd_sz, "grep -rn %s -f '%s' '%s' 2>/dev/null", flag, tmpfile, root_path);
-        }
-    }
-#endif
 }
 
 /* Build deduplicated file list from search results + raw matches. */
@@ -6349,66 +6692,113 @@ static yyjson_mut_val *build_dedup_files_array(yyjson_mut_doc *doc, search_resul
     return files_arr;
 }
 
-/* Attach source or context lines to a search result JSON item. */
-static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, search_result_t *r,
-                                 int mode, int context_lines, const char *root_path) {
+typedef struct {
+    bool prepared;
+    char *text;
+    int start_line;
+    bool truncated;
+} search_source_excerpt_t;
+
+/* Read each distinct result file once, then derive all requested excerpts from
+ * those descriptor-bound bytes. This avoids N×16 MiB reads for N symbols in
+ * one file while retaining result order in the caller. */
+static search_source_excerpt_t *prepare_result_sources(search_result_t *results, int count,
+                                                       int mode, int context_lines,
+                                                       const char *root_path) {
+    enum { MODE_FULL = 1, SC_FULL_MAX_LINES = 60, SC_FULL_LEAD = 5 };
+    search_source_excerpt_t *excerpts = calloc((size_t)count, sizeof(*excerpts));
+    if (!excerpts || !root_path || (mode != MODE_FULL && context_lines <= 0)) {
+        return excerpts;
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (excerpts[i].prepared) {
+            continue;
+        }
+        for (int j = i; j < count; j++) {
+            if (strcmp(results[i].file, results[j].file) == 0) {
+                excerpts[j].prepared = true;
+            }
+        }
+        if (!cbm_rooted_relative_path_valid(results[i].file)) {
+            continue;
+        }
+        cbm_rooted_file_t file = {0};
+        if (cbm_rooted_file_read(root_path, results[i].file, SNIPPET_HASH_MAX_BYTES, &file) !=
+            CBM_ROOTED_FILE_OK) {
+            cbm_rooted_file_free(&file);
+            continue;
+        }
+
+        for (int j = i; j < count; j++) {
+            search_result_t *result = &results[j];
+            if (strcmp(results[i].file, result->file) != 0 || result->start_line <= 0 ||
+                result->end_line <= 0) {
+                continue;
+            }
+            int start = result->start_line;
+            int end = result->end_line;
+            bool range_truncated = false;
+            if (mode == MODE_FULL) {
+                int64_t span = (int64_t)end - start + 1;
+                if (span > SC_FULL_MAX_LINES) {
+                    if (result->match_count > 0 &&
+                        (int64_t)result->match_lines[0] - SC_FULL_LEAD > start) {
+                        start = result->match_lines[0] - SC_FULL_LEAD;
+                    }
+                    int64_t capped_end = (int64_t)start + SC_FULL_MAX_LINES - 1;
+                    end = capped_end < result->end_line ? (int)capped_end : result->end_line;
+                    range_truncated = true;
+                }
+            } else if (result->match_count > 0) {
+                int64_t first = (int64_t)result->match_lines[0] - context_lines;
+                int64_t last =
+                    (int64_t)result->match_lines[result->match_count - SKIP_ONE] + context_lines;
+                start = first < SKIP_ONE ? SKIP_ONE : (first > INT32_MAX ? INT32_MAX : (int)first);
+                end = last > INT32_MAX ? INT32_MAX : (int)last;
+            } else {
+                continue;
+            }
+            bool byte_truncated = false;
+            excerpts[j].text =
+                copy_file_lines_from_bytes(file.data, file.len, start, end, &byte_truncated, NULL);
+            excerpts[j].start_line = start;
+            excerpts[j].truncated = range_truncated || byte_truncated;
+            if (excerpts[j].text) {
+                sanitize_ascii(excerpts[j].text);
+            }
+        }
+        cbm_rooted_file_free(&file);
+    }
+    return excerpts;
+}
+
+static void free_result_sources(search_source_excerpt_t *excerpts, int count) {
+    if (!excerpts) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(excerpts[i].text);
+    }
+    free(excerpts);
+}
+
+/* Attach an already-authorized excerpt to a search result JSON item. */
+static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item,
+                                 const search_source_excerpt_t *excerpt, int mode) {
     enum { MODE_FULL = 1 };
-    if (r->start_line <= 0 || r->end_line <= 0) {
+    if (!excerpt || !excerpt->text) {
         return;
     }
-    char abs_path[CBM_SZ_1K];
-    snprintf(abs_path, sizeof(abs_path), "%s/%s", root_path, r->file);
-
-    /* Containment: a search result whose indexed path resolves outside the
-     * project root (a `..` segment, or a symlink/junction that discovery
-     * followed) must not be read back into the response. Same guard the
-     * snippet path already uses. */
-    if (!cbm_path_within_root(root_path, abs_path)) {
-        return;
-    }
-
     if (mode == MODE_FULL) {
-        /* Cap each hit's source at a match-anchored window: uncapped
-         * whole-symbol dumps ran to 5.7KB × N hits (142KB responses). The
-         * complete symbol stays one get_code_snippet call away;
-         * source_start/source_truncated make the cut explicit. */
-        enum { SC_FULL_MAX_LINES = 60, SC_FULL_LEAD = 5 };
-        int s = r->start_line;
-        int e = r->end_line;
-        bool truncated = false;
-        if (e - s + 1 > SC_FULL_MAX_LINES) {
-            if (r->match_count > 0 && r->match_lines[0] - SC_FULL_LEAD > s) {
-                s = r->match_lines[0] - SC_FULL_LEAD;
-            }
-            e = s + SC_FULL_MAX_LINES - 1;
-            if (e > r->end_line) {
-                e = r->end_line;
-            }
-            truncated = true;
+        yyjson_mut_obj_add_strcpy(doc, item, "source", excerpt->text);
+        if (excerpt->truncated) {
+            yyjson_mut_obj_add_int(doc, item, "source_start", excerpt->start_line);
+            yyjson_mut_obj_add_bool(doc, item, "source_truncated", true);
         }
-        char *source = read_file_lines(abs_path, s, e);
-        if (source) {
-            sanitize_ascii(source);
-            yyjson_mut_obj_add_strcpy(doc, item, "source", source);
-            free(source);
-            if (truncated) {
-                yyjson_mut_obj_add_int(doc, item, "source_start", s);
-                yyjson_mut_obj_add_bool(doc, item, "source_truncated", true);
-            }
-        }
-    } else if (context_lines > 0 && r->match_count > 0) {
-        int ctx_start = r->match_lines[0] - context_lines;
-        int ctx_end = r->match_lines[r->match_count - SKIP_ONE] + context_lines;
-        if (ctx_start < SKIP_ONE) {
-            ctx_start = SKIP_ONE;
-        }
-        char *ctx = read_file_lines(abs_path, ctx_start, ctx_end);
-        if (ctx) {
-            sanitize_ascii(ctx);
-            yyjson_mut_obj_add_strcpy(doc, item, "context", ctx);
-            yyjson_mut_obj_add_int(doc, item, "context_start", ctx_start);
-            free(ctx);
-        }
+    } else {
+        yyjson_mut_obj_add_strcpy(doc, item, "context", excerpt->text);
+        yyjson_mut_obj_add_int(doc, item, "context_start", excerpt->start_line);
     }
 }
 
@@ -6469,7 +6859,8 @@ static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result
  * distribution table, and the summary scalars. */
 static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep_match_t *raw,
                                          int raw_count, int gm_count, int limit,
-                                         bool warn_literal_pipe, uint64_t elapsed_ms) {
+                                         const search_scan_stats_t *scan, bool warn_literal_pipe,
+                                         uint64_t elapsed_ms) {
     enum { MAX_RAW = 20, SEARCH_SLOW_MS = 5000 };
     cbm_sb_t sb;
     cbm_sb_init(&sb);
@@ -6540,6 +6931,27 @@ static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep
     cbm_toon_scalar_int(&sb, "total_results", sr_count);
     cbm_toon_scalar_int(&sb, "raw_match_count", raw_count);
     cbm_toon_scalar_int(&sb, "elapsed_ms", (long long)elapsed_ms);
+    cbm_toon_scalar_int(&sb, "scan_indexed_files", scan->indexed_files);
+    cbm_toon_scalar_int(&sb, "scan_scanned_files", scan->scanned_files);
+    cbm_toon_scalar_int(&sb, "scan_scanned_bytes", (long long)scan->scanned_bytes);
+    cbm_toon_scalar_int(&sb, "scan_skipped_unavailable", scan->skipped_unavailable);
+    cbm_toon_scalar_int(&sb, "scan_skipped_oversized", scan->skipped_oversized);
+    cbm_toon_scalar_int(&sb, "scan_skipped_unstable", scan->skipped_unstable);
+    cbm_toon_scalar_int(&sb, "scan_skipped_binary", scan->skipped_binary);
+    cbm_toon_scalar_bool(&sb, "scan_truncated", scan->truncated);
+    if (scan->no_indexed_files) {
+        cbm_toon_scalar_str(&sb, "warning_coverage",
+                            "project has no indexed files; no recursive filesystem fallback was "
+                            "performed");
+    } else if (scan->truncated || scan->skipped_unavailable > 0 || scan->skipped_oversized > 0 ||
+               scan->skipped_unstable > 0 || scan->skipped_binary > 0) {
+        char partial[CBM_SZ_256];
+        snprintf(partial, sizeof(partial),
+                 "partial scan: truncated=%s unavailable=%d oversized=%d unstable=%d binary=%d",
+                 scan->truncated ? "true" : "false", scan->skipped_unavailable,
+                 scan->skipped_oversized, scan->skipped_unstable, scan->skipped_binary);
+        cbm_toon_scalar_str(&sb, "warning_coverage", partial);
+    }
     if (warn_literal_pipe) {
         cbm_toon_scalar_str(&sb, "warning",
                             "pattern contains '|' but regex=false, so it is matched literally "
@@ -6558,7 +6970,8 @@ static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep
 static char *assemble_search_output(search_result_t *sr, int sr_count, grep_match_t *raw,
                                     int raw_count, int gm_count, int limit, int mode,
                                     int context_lines, const char *root_path,
-                                    bool warn_literal_pipe, uint64_t elapsed_ms) {
+                                    const search_scan_stats_t *scan, bool warn_literal_pipe,
+                                    uint64_t elapsed_ms) {
     enum { MODE_COMPACT = 0, MODE_FULL = 1, MODE_FILES = 2, SEARCH_SLOW_MS = 5000 };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -6566,6 +6979,10 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     yyjson_mut_doc_set_root(doc, root_obj);
 
     int output_count = sr_count < limit ? sr_count : limit;
+    search_source_excerpt_t *excerpts =
+        mode == MODE_FILES
+            ? NULL
+            : prepare_result_sources(sr, output_count, mode, context_lines, root_path);
 
     if (mode == MODE_FILES) {
         yyjson_mut_obj_add_val(doc, root_obj, "files",
@@ -6590,7 +7007,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
                 yyjson_mut_arr_add_int(doc, ml, r->match_lines[j]);
             }
             yyjson_mut_obj_add_val(doc, item, "match_lines", ml);
-            attach_result_source(doc, item, r, mode, context_lines, root_path);
+            attach_result_source(doc, item, excerpts ? &excerpts[ri] : NULL, mode);
             yyjson_mut_arr_add_val(results_arr, item);
         }
         yyjson_mut_obj_add_val(doc, root_obj, "results", results_arr);
@@ -6615,6 +7032,14 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     yyjson_mut_obj_add_int(doc, root_obj, "total_results", sr_count);
     yyjson_mut_obj_add_int(doc, root_obj, "raw_match_count", raw_count);
     yyjson_mut_obj_add_int(doc, root_obj, "elapsed_ms", (int)elapsed_ms);
+    yyjson_mut_obj_add_int(doc, root_obj, "scan_indexed_files", scan->indexed_files);
+    yyjson_mut_obj_add_int(doc, root_obj, "scan_scanned_files", scan->scanned_files);
+    yyjson_mut_obj_add_int(doc, root_obj, "scan_scanned_bytes", (int64_t)scan->scanned_bytes);
+    yyjson_mut_obj_add_int(doc, root_obj, "scan_skipped_unavailable", scan->skipped_unavailable);
+    yyjson_mut_obj_add_int(doc, root_obj, "scan_skipped_oversized", scan->skipped_oversized);
+    yyjson_mut_obj_add_int(doc, root_obj, "scan_skipped_unstable", scan->skipped_unstable);
+    yyjson_mut_obj_add_int(doc, root_obj, "scan_skipped_binary", scan->skipped_binary);
+    yyjson_mut_obj_add_bool(doc, root_obj, "scan_truncated", scan->truncated);
     if (sr_count > 0 && gm_count > 0) {
         char ratio[CBM_SZ_32];
         snprintf(ratio, sizeof(ratio), "%.1fx", (double)gm_count / (double)(sr_count + raw_count));
@@ -6623,6 +7048,19 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
 
     /* Warnings: surface common foot-guns instead of leaving them silent. */
     yyjson_mut_val *warnings = yyjson_mut_arr(doc);
+    if (scan->no_indexed_files) {
+        yyjson_mut_arr_add_strcpy(
+            doc, warnings,
+            "project has no indexed files; no recursive filesystem fallback was performed");
+    } else if (scan->truncated || scan->skipped_unavailable > 0 || scan->skipped_oversized > 0 ||
+               scan->skipped_unstable > 0 || scan->skipped_binary > 0) {
+        char partial[CBM_SZ_256];
+        snprintf(partial, sizeof(partial),
+                 "partial scan: truncated=%s unavailable=%d oversized=%d unstable=%d binary=%d",
+                 scan->truncated ? "true" : "false", scan->skipped_unavailable,
+                 scan->skipped_oversized, scan->skipped_unstable, scan->skipped_binary);
+        yyjson_mut_arr_add_strcpy(doc, warnings, partial);
+    }
     if (warn_literal_pipe) {
         yyjson_mut_arr_add_strcpy(
             doc, warnings,
@@ -6649,81 +7087,309 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
         sanitize_ascii(json);
     }
     yyjson_mut_doc_free(doc);
+    free_result_sources(excerpts, output_count);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
     return result;
 }
 
-/* Read grep output from fp, parse file:line:content format, apply path filter,
- * and return a dynamically-allocated grep_match_t array. */
-/* Strip root path prefix from a file path. */
-static const char *strip_root_prefix(const char *path, const char *root, size_t root_len) {
-    if (strncmp(path, root, root_len) != 0) {
-        return path;
+static int grep_match_path_line_cmp(const void *left, const void *right) {
+    const grep_match_t *a = (const grep_match_t *)left;
+    const grep_match_t *b = (const grep_match_t *)right;
+    int path_order = strcmp(a->file, b->file);
+    if (path_order != 0) {
+        return path_order;
     }
-    const char *p = path + root_len;
-    if (*p == '/') {
-        p++;
-    }
-    return p;
+    return (a->line > b->line) - (a->line < b->line);
 }
 
-static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_t root_len,
-                                          bool has_path_filter, cbm_regex_t *path_regex,
-                                          int grep_limit, int *out_count) {
-    int gm_cap = CBM_SZ_64;
-    int gm_count = 0;
-    grep_match_t *gm = malloc(gm_cap * sizeof(grep_match_t));
-    char line[CBM_SZ_2K];
+static void free_indexed_files(char **files, int count) {
+    if (!files) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(files[i]);
+    }
+    free(files);
+}
 
-    while (fgets(line, sizeof(line), fp) && gm_count < grep_limit) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
+typedef enum {
+    SEARCH_FILE_LIST_OK = 0,
+    SEARCH_FILE_LIST_STORE_ERROR,
+    SEARCH_FILE_LIST_OUT_OF_MEMORY,
+} search_file_list_status_t;
+
+/* Enumerate at most SEARCH_MAX_INDEXED_FILES paths directly from the store.
+ * cbm_store_list_files() materializes the complete distinct set before its
+ * caller can impose a limit, which is inappropriate for an interactive MCP
+ * request. The extra row detects truncation without allocating it. */
+static search_file_list_status_t list_indexed_files_bounded(cbm_store_t *store, const char *project,
+                                                            char ***out_files, int *out_count,
+                                                            search_scan_stats_t *stats) {
+    *out_files = NULL;
+    *out_count = 0;
+    sqlite3 *db = store ? cbm_store_get_db(store) : NULL;
+    if (!db || !project) {
+        return SEARCH_FILE_LIST_STORE_ERROR;
+    }
+    static const char sql[] = "SELECT DISTINCT file_path FROM nodes "
+                              "WHERE project = ?1 AND file_path IS NOT NULL AND file_path != '' "
+                              "ORDER BY file_path LIMIT ?2";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return SEARCH_FILE_LIST_STORE_ERROR;
+    }
+    sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, MCP_COL_2, SEARCH_MAX_INDEXED_FILES + SKIP_ONE);
+
+    char **files = NULL;
+    int count = 0;
+    int capacity = 0;
+    int seen = 0;
+    int step = SQLITE_DONE;
+    search_file_list_status_t status = SEARCH_FILE_LIST_OK;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        seen++;
+        if (seen > SEARCH_MAX_INDEXED_FILES) {
+            stats->truncated = true;
+            break;
         }
-        if (len == 0) {
+        const char *path = (const char *)sqlite3_column_text(stmt, 0);
+        int path_len = sqlite3_column_bytes(stmt, 0);
+        if (!path || path_len <= 0 || path_len >= (int)sizeof(((grep_match_t *)0)->file) ||
+            memchr(path, '\0', (size_t)path_len)) {
+            stats->skipped_unavailable++;
             continue;
         }
-
-        /* PowerShell output uses tab as delimiter (paths may contain colons
-         * on Windows, e.g. C:\dir\file). Unix grep uses colon. */
-#ifdef _WIN32
-        char sep = '\t';
-#else
-        char sep = ':';
-#endif
-        char *sep1 = strchr(line, (unsigned char)sep);
-        if (!sep1) {
-            continue;
+        if (count >= capacity) {
+            int next = capacity == 0 ? CBM_SZ_64 : capacity * PAIR_LEN;
+            if (next > SEARCH_MAX_INDEXED_FILES) {
+                next = SEARCH_MAX_INDEXED_FILES;
+            }
+            char **grown = realloc(files, (size_t)next * sizeof(*grown));
+            if (!grown) {
+                status = SEARCH_FILE_LIST_OUT_OF_MEMORY;
+                break;
+            }
+            files = grown;
+            capacity = next;
         }
-        char *sep2 = strchr(sep1 + SKIP_ONE, (unsigned char)sep);
-        if (!sep2) {
-            continue;
+        files[count] = malloc((size_t)path_len + SKIP_ONE);
+        if (!files[count]) {
+            status = SEARCH_FILE_LIST_OUT_OF_MEMORY;
+            break;
         }
-        *sep1 = '\0';
-        *sep2 = '\0';
+        memcpy(files[count], path, (size_t)path_len);
+        files[count][path_len] = '\0';
+        count++;
+    }
+    if (status == SEARCH_FILE_LIST_OK && step != SQLITE_DONE && step != SQLITE_ROW) {
+        status = SEARCH_FILE_LIST_STORE_ERROR;
+    }
+    sqlite3_finalize(stmt);
+    if (status != SEARCH_FILE_LIST_OK) {
+        free_indexed_files(files, count);
+        return status;
+    }
+    stats->indexed_files = seen > SEARCH_MAX_INDEXED_FILES ? SEARCH_MAX_INDEXED_FILES : seen;
+    stats->no_indexed_files = seen == 0;
+    *out_files = files;
+    *out_count = count;
+    return SEARCH_FILE_LIST_OK;
+}
 
-#ifdef _WIN32
-        cbm_normalize_path_sep(line);
-#endif
-        const char *path = line;
-        const char *file = strip_root_prefix(path, root_path, root_len);
+static bool search_file_pattern_matches(const char *pattern, const char *relative_path) {
+    if (!pattern || !pattern[0]) {
+        return true;
+    }
+    const char *target = relative_path;
+    if (!strchr(pattern, '/')) {
+        const char *slash = strrchr(relative_path, '/');
+        target = slash ? slash + SKIP_ONE : relative_path;
+    }
+    return cbm_design_glob_match(pattern, target);
+}
 
-        if (has_path_filter && cbm_regexec(path_regex, file, 0, NULL, 0) != CBM_REG_OK) {
-            continue;
+static bool append_in_process_match(grep_match_t **matches, int *count, int *capacity,
+                                    const char *relative_path, int line_number, const char *line,
+                                    size_t line_len) {
+    if (*count >= SEARCH_MAX_MATCHES || strlen(relative_path) >= sizeof((*matches)[0].file)) {
+        return true;
+    }
+    if (*count >= *capacity) {
+        int next = *capacity <= 0 ? CBM_SZ_64 : *capacity * PAIR_LEN;
+        if (next > SEARCH_MAX_MATCHES) {
+            next = SEARCH_MAX_MATCHES;
         }
+        grep_match_t *grown = realloc(*matches, (size_t)next * sizeof(**matches));
+        if (!grown) {
+            return false;
+        }
+        *matches = grown;
+        *capacity = next;
+    }
+    grep_match_t *match = &(*matches)[*count];
+    memset(match, 0, sizeof(*match));
+    memcpy(match->file, relative_path, strlen(relative_path) + SKIP_ONE);
+    match->line = line_number;
+    size_t copy_len =
+        line_len < sizeof(match->content) - SKIP_ONE ? line_len : sizeof(match->content) - SKIP_ONE;
+    memcpy(match->content, line, copy_len);
+    match->content[copy_len] = '\0';
+    sanitize_ascii(match->content);
+    (*count)++;
+    return true;
+}
 
-        safe_grow(gm, gm_count, gm_cap, PAIR_LEN);
-        snprintf(gm[gm_count].file, sizeof(gm[0].file), "%s", file);
-        gm[gm_count].line = (int)strtol(sep1 + SKIP_ONE, NULL, CBM_DECIMAL_BASE);
-        snprintf(gm[gm_count].content, sizeof(gm[0].content), "%s", sep2 + SKIP_ONE);
-        sanitize_ascii(gm[gm_count].content);
-        gm_count++;
+/* Scan only graph-indexed repository-relative paths. Every source is opened
+ * through rooted_file, so symlinks/junction escapes and pathname generation
+ * races are rejected before bytes become search results. */
+static grep_match_t *scan_indexed_files(cbm_mcp_server_t *srv, const char *project,
+                                        const char *root_path, const char *pattern, bool use_regex,
+                                        const char *file_pattern, bool has_path_filter,
+                                        cbm_regex_t *path_regex, int *out_count, bool *out_oom,
+                                        search_scan_stats_t *stats) {
+    *out_count = 0;
+    *out_oom = false;
+    memset(stats, 0, sizeof(*stats));
+    cbm_store_t *store = resolve_store(srv, project);
+    char **indexed_files = NULL;
+    int indexed_count = 0;
+    search_file_list_status_t list_status =
+        list_indexed_files_bounded(store, project, &indexed_files, &indexed_count, stats);
+    if (list_status != SEARCH_FILE_LIST_OK) {
+        stats->list_failed = true;
+        *out_oom = list_status == SEARCH_FILE_LIST_OUT_OF_MEMORY;
+        grep_match_t *empty = calloc(CBM_ALLOC_ONE, sizeof(grep_match_t));
+        if (!empty) {
+            *out_oom = true;
+        }
+        return empty;
+    }
+    if (stats->no_indexed_files) {
+        grep_match_t *empty = calloc(CBM_ALLOC_ONE, sizeof(grep_match_t));
+        *out_oom = empty == NULL;
+        return empty;
     }
 
-    *out_count = gm_count;
-    return gm;
+    cbm_regex_t content_regex;
+    bool regex_ready = false;
+    if (use_regex) {
+        regex_ready =
+            cbm_regcomp(&content_regex, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) == CBM_REG_OK;
+        if (!regex_ready) {
+            free_indexed_files(indexed_files, indexed_count);
+            return NULL;
+        }
+    }
+
+    grep_match_t *matches = NULL;
+    int count = 0;
+    int capacity = 0;
+    size_t scanned_bytes = 0;
+    int scan_count = indexed_count;
+    for (int i = 0; i < scan_count && count < SEARCH_MAX_MATCHES; i++) {
+#ifdef _WIN32
+        cbm_normalize_path_sep(indexed_files[i]);
+#endif
+        const char *relative = indexed_files[i];
+        if (!search_file_pattern_matches(file_pattern, relative) ||
+            (has_path_filter && path_regex &&
+             cbm_regexec(path_regex, relative, 0, NULL, 0) != CBM_REG_OK)) {
+            continue;
+        }
+        if (!cbm_rooted_relative_path_valid(relative) ||
+            strlen(relative) >= sizeof(((grep_match_t *)0)->file)) {
+            stats->skipped_unavailable++;
+            continue;
+        }
+        cbm_rooted_file_t file = {0};
+        cbm_rooted_file_status_t read_status =
+            cbm_rooted_file_read(root_path, relative, SNIPPET_HASH_MAX_BYTES, &file);
+        if (read_status != CBM_ROOTED_FILE_OK) {
+            if (read_status == CBM_ROOTED_FILE_OUT_OF_MEMORY) {
+                *out_oom = true;
+                cbm_rooted_file_free(&file);
+                break;
+            } else if (read_status == CBM_ROOTED_FILE_TOO_LARGE) {
+                stats->skipped_oversized++;
+            } else if (read_status == CBM_ROOTED_FILE_CHANGED) {
+                stats->skipped_unstable++;
+            } else {
+                stats->skipped_unavailable++;
+            }
+            cbm_rooted_file_free(&file);
+            continue;
+        }
+        if (file.len > SEARCH_MAX_SCAN_BYTES - scanned_bytes) {
+            stats->truncated = true;
+            cbm_rooted_file_free(&file);
+            break;
+        }
+        scanned_bytes += file.len;
+        stats->scanned_files++;
+        stats->scanned_bytes = scanned_bytes;
+        if (memchr(file.data, '\0', file.len)) {
+            stats->skipped_binary++;
+            cbm_rooted_file_free(&file);
+            continue; /* grep's binary-file result was never a usable source hit */
+        }
+
+        size_t offset = 0;
+        int line_number = 1;
+        while (offset < file.len && count < SEARCH_MAX_MATCHES) {
+            char *line = file.data + offset;
+            char *newline = memchr(line, '\n', file.len - offset);
+            char *line_end = newline ? newline : file.data + file.len;
+            size_t line_len = (size_t)(line_end - line);
+            if (line_len != 0 && line[line_len - SKIP_ONE] == '\r') {
+                line_len--;
+            }
+            size_t end = offset + line_len;
+            char saved = file.data[end];
+            file.data[end] = '\0';
+            bool matched = use_regex ? cbm_regexec(&content_regex, line, 0, NULL, 0) == CBM_REG_OK
+                                     : strstr(line, pattern) != NULL;
+            if (matched && !append_in_process_match(&matches, &count, &capacity, relative,
+                                                    line_number, line, end - offset)) {
+                *out_oom = true;
+                file.data[end] = saved;
+                cbm_rooted_file_free(&file);
+                break;
+            }
+            file.data[end] = saved;
+            if (!newline || *out_oom) {
+                break;
+            }
+            offset = (size_t)(newline - file.data) + SKIP_ONE;
+            line_number++;
+        }
+        cbm_rooted_file_free(&file);
+        if (*out_oom) {
+            break;
+        }
+    }
+    if (count >= SEARCH_MAX_MATCHES) {
+        stats->truncated = true;
+    }
+    if (regex_ready) {
+        cbm_regfree(&content_regex);
+    }
+    free_indexed_files(indexed_files, indexed_count);
+    if (*out_oom) {
+        free(matches);
+        return NULL;
+    }
+    if (!matches) {
+        matches = calloc(CBM_ALLOC_ONE, sizeof(grep_match_t));
+        if (!matches) {
+            *out_oom = true;
+            return NULL;
+        }
+    }
+    *out_count = count;
+    return matches;
 }
 
 /* Find the tightest node containing a line in a file. Returns index or -1. */
@@ -6743,20 +7409,25 @@ static int find_tightest_node(cbm_node_t *nodes, int count, int line) {
 }
 
 /* Add a grep hit to the search result set (merge into existing or create new). */
-static void add_to_search_results(search_result_t **sr, int *sr_count, int *sr_cap, cbm_node_t *n,
+static bool add_to_search_results(search_result_t **sr, int *sr_count, int *sr_cap, cbm_node_t *n,
                                   int line) {
     for (int j = 0; j < *sr_count; j++) {
         if ((*sr)[j].node_id == n->id) {
             if ((*sr)[j].match_count < CBM_SZ_64) {
                 (*sr)[j].match_lines[(*sr)[j].match_count++] = line;
             }
-            return;
+            return true;
         }
     }
     if (*sr_count >= *sr_cap) {
-        *sr_cap *= PAIR_LEN;
-        *sr = safe_realloc(*sr, *sr_cap * sizeof(search_result_t));
-        memset(&(*sr)[*sr_count], 0, (*sr_cap - *sr_count) * sizeof(search_result_t));
+        int next_cap = *sr_cap * PAIR_LEN;
+        search_result_t *grown = realloc(*sr, (size_t)next_cap * sizeof(*grown));
+        if (!grown) {
+            return false;
+        }
+        *sr = grown;
+        *sr_cap = next_cap;
+        memset(&(*sr)[*sr_count], 0, (size_t)(*sr_cap - *sr_count) * sizeof(search_result_t));
     }
     search_result_t *r = &(*sr)[*sr_count];
     r->node_id = n->id;
@@ -6770,23 +7441,28 @@ static void add_to_search_results(search_result_t **sr, int *sr_count, int *sr_c
     r->match_lines[0] = line;
     r->match_count = SKIP_ONE;
     (*sr_count)++;
+    return true;
 }
 
 /* Match a single grep hit to the tightest containing node, then add to sr or raw. */
-static void classify_grep_hit(grep_match_t *hit, cbm_node_t *file_nodes, int file_node_count,
+static bool classify_grep_hit(grep_match_t *hit, cbm_node_t *file_nodes, int file_node_count,
                               search_result_t **sr, int *sr_count, int *sr_cap, grep_match_t **raw,
                               int *raw_count, int *raw_cap) {
     int best = find_tightest_node(file_nodes, file_node_count, hit->line);
     if (best >= 0) {
-        add_to_search_results(sr, sr_count, sr_cap, &file_nodes[best], hit->line);
+        return add_to_search_results(sr, sr_count, sr_cap, &file_nodes[best], hit->line);
     } else {
         if (*raw_count >= *raw_cap) {
-            *raw_cap = (*raw_cap == 0) ? CBM_SZ_32 : *raw_cap * PAIR_LEN;
-            *raw = safe_realloc(*raw, *raw_cap * sizeof(grep_match_t));
+            int next_cap = (*raw_cap == 0) ? CBM_SZ_32 : *raw_cap * PAIR_LEN;
+            grep_match_t *grown = realloc(*raw, (size_t)next_cap * sizeof(*grown));
+            if (!grown) {
+                return false;
+            }
+            *raw = grown;
+            *raw_cap = next_cap;
         }
-        if (*raw) {
-            (*raw)[(*raw_count)++] = *hit;
-        }
+        (*raw)[(*raw_count)++] = *hit;
+        return true;
     }
 }
 
@@ -6804,10 +7480,10 @@ static void free_file_nodes(cbm_node_t *nodes, int count) {
 }
 
 /* Classify all grep matches file-by-file into search results and raw hits. */
-static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *store,
+static bool classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *store,
                                    const char *project, search_result_t **sr, int *sr_count,
                                    int *sr_cap, grep_match_t **raw, int *raw_count, int *raw_cap) {
-    qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
+    qsort(gm, (size_t)gm_count, sizeof(grep_match_t), grep_match_path_line_cmp);
     int i = 0;
     while (i < gm_count) {
         const char *cur_file = gm[i].file;
@@ -6821,84 +7497,15 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
             cbm_store_find_nodes_by_file(store, project, cur_file, &file_nodes, &file_node_count);
         }
         for (int mi = file_start; mi < i; mi++) {
-            classify_grep_hit(&gm[mi], file_nodes, file_node_count, sr, sr_count, sr_cap, raw,
-                              raw_count, raw_cap);
+            if (!classify_grep_hit(&gm[mi], file_nodes, file_node_count, sr, sr_count, sr_cap, raw,
+                                   raw_count, raw_cap)) {
+                free_file_nodes(file_nodes, file_node_count);
+                return false;
+            }
         }
         free_file_nodes(file_nodes, file_node_count);
     }
-}
-
-/* Write indexed file list for scoped grep. Returns true if scoped.
- * When a path_filter is provided, apply it here — before grep — so large
- * indexed projects do not scan files only for collect_grep_matches to discard
- * them later. The predicate is IDENTICAL to the post-grep filter: the same
- * compiled regex run against the same root-relative path (separators
- * normalized on Windows first), so prefiltering can only skip files whose
- * hits would be dropped anyway — results-preserving by construction.
- * *out_written receives the number of records written (0 = the filter
- * excluded every indexed file). */
-static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
-                                  const char *filelist, bool has_path_filter,
-                                  cbm_regex_t *path_regex, int *out_written) {
-    *out_written = 0;
-    cbm_store_t *pre_store = resolve_store(srv, project);
-    if (!pre_store) {
-        return false;
-    }
-    char **indexed_files = NULL;
-    int indexed_count = 0;
-    if (cbm_store_list_files(pre_store, project, &indexed_files, &indexed_count) != CBM_STORE_OK ||
-        indexed_count == 0) {
-        return false;
-    }
-    FILE *fl = fopen(filelist, "wb");
-    bool ok = false;
-    int written = 0;
-    if (fl) {
-        for (int fi = 0; fi < indexed_count; fi++) {
-            /* A source path never legitimately contains a newline or carriage
-             * return. Those bytes are exactly the record separator on the
-             * Windows filelist (and would split naive line readers elsewhere),
-             * so a crafted indexed path with an embedded newline could inject
-             * an extra entry into the scan set. Skip such paths entirely. */
-            if (strpbrk(indexed_files[fi], "\r\n") != NULL) {
-                continue;
-            }
-            if (has_path_filter && path_regex) {
-#ifdef _WIN32
-                cbm_normalize_path_sep(indexed_files[fi]);
-#endif
-                if (cbm_regexec(path_regex, indexed_files[fi], 0, NULL, 0) != CBM_REG_OK) {
-                    continue;
-                }
-            }
-            /* Write "<root>/<file>" piece-by-piece (no fixed-size buffer, so an
-             * arbitrarily long absolute path cannot overflow). Forward slash join
-             * so xargs doesn't treat Windows backslashes as escapes; binary mode
-             * (wb) prevents CRLF translation. Record separator differs by platform:
-             *   - Unix: NUL, consumed by `xargs -0` — handles spaces in paths (a
-             *     newline separator would split plain xargs on the space).
-             *   - Windows: newline, consumed by PowerShell `Get-Content |
-             *     Select-String -LiteralPath` (NUL bytes break Get-Content). */
-            (void)fwrite(root_path, 1, strlen(root_path), fl);
-            (void)fputc('/', fl);
-            (void)fwrite(indexed_files[fi], 1, strlen(indexed_files[fi]), fl);
-#ifdef _WIN32
-            (void)fputc('\n', fl);
-#else
-            (void)fputc('\0', fl);
-#endif
-            written++;
-        }
-        (void)fclose(fl);
-        ok = true;
-    }
-    for (int fi = 0; fi < indexed_count; fi++) {
-        free(indexed_files[fi]);
-    }
-    free(indexed_files);
-    *out_written = written;
-    return ok;
+    return true;
 }
 
 /* Parse search mode string (0=compact, 1=full, 2=files). */
@@ -6913,61 +7520,6 @@ static int parse_search_mode(const char *mode_str) {
         return MCP_RETURN_2;
     }
     return 0;
-}
-
-/* Validate shell-safe arguments for search. */
-/* Search/grep paths and globs are ALWAYS single-quoted (POSIX sh) or
- * double-/single-quoted (Windows cmd/PowerShell) on the command line, which
- * neutralises '&' — a very common character in real paths (R&D, "Foo & Bar",
- * OneDrive). Accept '&' here while still rejecting every metacharacter that
- * could break out of the quoting (#272). */
-static bool validate_search_path_arg(const char *s) {
-    if (!s) {
-        return false;
-    }
-    for (const char *p = s; *p; p++) {
-        switch (*p) {
-        case '\'':
-        case '"':
-        case ';':
-        case '|':
-        case '$':
-        case '`':
-        case '<':
-        case '>':
-        case '\n':
-        case '\r':
-#ifndef _WIN32
-        case '\\':
-#endif
-            return false;
-        default:
-            break;
-        }
-    }
-    return true;
-}
-
-static bool validate_search_args(const char *root_path, const char *file_pattern) {
-    if (!validate_search_path_arg(root_path)) {
-        return false;
-    }
-    if (file_pattern && !validate_search_path_arg(file_pattern)) {
-        return false;
-    }
-    return true;
-}
-
-/* Write pattern to a temp file for grep -f. Returns true on success. */
-static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *pattern) {
-    snprintf(tmpfile, tmpfile_sz, "%s/cbm_search_%d.pat", cbm_tmpdir(), (int)getpid());
-    FILE *tf = fopen(tmpfile, "w");
-    if (!tf) {
-        return false;
-    }
-    (void)fprintf(tf, "%s\n", pattern);
-    (void)fclose(tf);
-    return true;
 }
 
 /* Compile a path filter regex. Returns true if compiled successfully. */
@@ -6986,6 +7538,16 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     int limit = cbm_mcp_get_int_arg(args, "limit", MCP_DEFAULT_LIMIT);
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
+    if (limit < 1) {
+        limit = 1;
+    } else if (limit > MCP_MAX_ROWS) {
+        limit = MCP_MAX_ROWS;
+    }
+    if (context_lines < 0) {
+        context_lines = 0;
+    } else if (context_lines > SNIPPET_DEFAULT_LINES) {
+        context_lines = SNIPPET_DEFAULT_LINES;
+    }
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
     uint64_t search_t0 = cbm_now_ms();
     /* In literal (non-regex) mode a '|' is matched as a byte, not alternation —
@@ -6995,19 +7557,50 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     int mode = parse_search_mode(mode_str);
     free(mode_str);
 
+    if (path_filter && strlen(path_filter) > 4096U) {
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        free(path_filter);
+        return cbm_mcp_text_result("path_filter exceeds the 4096-byte limit", true);
+    }
     cbm_regex_t path_regex;
+    bool path_filter_requested = path_filter && path_filter[0];
     bool has_path_filter = compile_path_filter(path_filter, &path_regex);
+    if (path_filter_requested && !has_path_filter) {
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        free(path_filter);
+        return cbm_mcp_text_result("invalid path_filter regex", true);
+    }
     free(path_filter);
     path_filter = NULL;
 
     if (!pattern) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(project);
         free(file_pattern);
         return cbm_mcp_text_result("pattern is required", true);
     }
 
+    if (strlen(pattern) > 4096U) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        return cbm_mcp_text_result("pattern exceeds the 4096-byte limit", true);
+    }
+
     /* Project is required */
     if (!project) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(pattern);
         free(file_pattern);
         char *_err = build_project_list_error("project is required");
@@ -7018,6 +7611,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(pattern);
         free(project);
         free(file_pattern);
@@ -7027,7 +7623,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return _res;
     }
 
-    if (!validate_search_args(root_path, file_pattern)) {
+    if (file_pattern && strlen(file_pattern) > 4096U) {
         if (has_path_filter) {
             cbm_regfree(&path_regex);
         }
@@ -7035,7 +7631,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(pattern);
         free(project);
         free(file_pattern);
-        return cbm_mcp_text_result("path or file_pattern contains invalid characters", true);
+        return cbm_mcp_text_result("file_pattern exceeds the 4096-byte limit", true);
     }
 
     /* issue #283: when regex=true, a syntactically invalid pattern (e.g. an
@@ -7066,7 +7662,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     if (!use_regex && strchr(pattern, ' ')) {
         size_t plen = strlen(pattern);
         /* Worst case: every char is a space → ".*" between each char */
-        char *regex_pat = malloc(plen * 3 + 1);
+        char *regex_pat = plen <= (SIZE_MAX - SKIP_ONE) / 3 ? malloc(plen * 3 + SKIP_ONE) : NULL;
         if (regex_pat) {
             char *dst = regex_pat;
             const char *src = pattern;
@@ -7095,73 +7691,27 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
-    /* ── Phase 1: Grep scan ──────────────────────────────────── */
-    char tmpfile[CBM_SZ_256];
-    if (!write_pattern_file(tmpfile, sizeof(tmpfile), pattern)) {
-        char errmsg[CBM_SZ_256];
-        snprintf(errmsg, sizeof(errmsg), "search failed: cannot create temp file (%s)",
-                 strerror(errno));
+    /* ── Phase 1: bounded, rooted in-process scan ─────────────── */
+    int gm_count = 0;
+    bool scan_oom = false;
+    search_scan_stats_t scan_stats;
+    grep_match_t *gm = scan_indexed_files(srv, project, root_path, pattern, use_regex, file_pattern,
+                                          has_path_filter, has_path_filter ? &path_regex : NULL,
+                                          &gm_count, &scan_oom, &scan_stats);
+    if (!gm || scan_stats.list_failed) {
+        free(gm);
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(root_path);
         free(pattern);
         free(project);
         free(file_pattern);
-        return cbm_mcp_text_result(errmsg, true);
-    }
-
-    /* No grep-level match limit — let grep find all matches, then dedup and
-     * cap in our code. The -m flag caused results from large vendored files
-     * to exhaust the quota before reaching project source files. */
-    enum { GREP_MAX_MATCHES = 500 };
-    int grep_limit = GREP_MAX_MATCHES;
-
-    /* Scope grep to indexed files only — avoids scanning vendored/generated code.
-     * Query the graph for distinct file paths, write them to a temp file,
-     * then use xargs to pass them to grep. Falls back to recursive grep if
-     * no indexed files found (project not fully indexed). */
-    char filelist[CBM_SZ_256];
-    snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
-    bool scoped = false;
-    int scoped_written = 0;
-
-    scoped = write_scoped_filelist(srv, project, root_path, filelist, has_path_filter,
-                                   has_path_filter ? &path_regex : NULL, &scoped_written);
-
-    /* Collect grep matches into array */
-    int gm_count = 0;
-    grep_match_t *gm = NULL;
-    if (scoped && scoped_written == 0) {
-        /* The path_filter excluded every indexed file — nothing to scan.
-         * Skip the grep subprocess: xargs on an empty filelist is
-         * platform-dependent (GNU execs grep once with no operands, BSD
-         * skips), and the post-grep filter would drop every hit anyway. */
-        gm = malloc(sizeof(grep_match_t)); /* empty set; freed below */
-        cbm_unlink(tmpfile);
-        cbm_unlink(filelist);
-    } else {
-        char cmd[CBM_SZ_4K];
-        build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist,
-                       root_path);
-
-        FILE *fp = cbm_popen(cmd, "r");
-        if (!fp) {
-            cbm_unlink(tmpfile);
-            if (scoped) {
-                cbm_unlink(filelist);
-            }
-            free(root_path);
-            free(pattern);
-            free(project);
-            free(file_pattern);
-            return cbm_mcp_text_result("search failed", true);
-        }
-
-        gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter, &path_regex,
-                                  grep_limit, &gm_count);
-        cbm_pclose(fp);
-        cbm_unlink(tmpfile);
-        if (scoped) {
-            cbm_unlink(filelist);
-        }
+        const char *message = scan_oom ? "search failed: out of memory"
+                              : scan_stats.list_failed
+                                  ? "search failed: could not enumerate indexed files"
+                                  : "invalid regex pattern";
+        return cbm_mcp_text_result(message, true);
     }
 
     /* ── Phase 2+3: Block expansion + graph ranking ──────────── */
@@ -7178,17 +7728,29 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     int raw_count = 0;
     grep_match_t *raw = malloc(raw_cap * sizeof(grep_match_t));
 
-    /* Sort matches by file path for contiguous per-file processing */
-    qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
+    if (!sr || !raw) {
+        goto search_oom;
+    }
 
-    classify_all_grep_hits(gm, gm_count, store, project, &sr, &sr_count, &sr_cap, &raw, &raw_count,
-                           &raw_cap);
+    /* Sort matches by file path for contiguous per-file processing */
+    qsort(gm, (size_t)gm_count, sizeof(grep_match_t), grep_match_path_line_cmp);
+
+    if (!classify_all_grep_hits(gm, gm_count, store, project, &sr, &sr_count, &sr_cap, &raw,
+                                &raw_count, &raw_cap)) {
+        goto search_oom;
+    }
 
     /* Phase 3: batch degree query — ONE query for all results instead of 2×N */
     if (store && sr_count > 0) {
         int64_t *ids = malloc(sr_count * sizeof(int64_t));
         int *in_degs = malloc(sr_count * sizeof(int));
         int *out_degs = malloc(sr_count * sizeof(int));
+        if (!ids || !in_degs || !out_degs) {
+            free(ids);
+            free(in_degs);
+            free(out_degs);
+            goto search_oom;
+        }
         for (int j = 0; j < sr_count; j++) {
             ids[j] = sr[j].node_id;
         }
@@ -7224,14 +7786,14 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *result = NULL;
     if (mode == 0 && !sc_legacy_json) {
         char *toon_text =
-            assemble_search_output_toon(sr, sr_count, raw, raw_count, gm_count, limit,
+            assemble_search_output_toon(sr, sr_count, raw, raw_count, gm_count, limit, &scan_stats,
                                         pat_has_pipe && !use_regex, cbm_now_ms() - search_t0);
         result = cbm_mcp_text_result(toon_text ? toon_text : "out of memory", toon_text == NULL);
         free(toon_text);
     } else {
         result = assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode,
-                                        context_lines, root_path, pat_has_pipe && !use_regex,
-                                        cbm_now_ms() - search_t0);
+                                        context_lines, root_path, &scan_stats,
+                                        pat_has_pipe && !use_regex, cbm_now_ms() - search_t0);
     }
     free(gm);
     free(sr);
@@ -7244,6 +7806,19 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         cbm_regfree(&path_regex);
     }
     return result;
+
+search_oom:
+    free(gm);
+    free(sr);
+    free(raw);
+    free(root_path);
+    free(pattern);
+    free(project);
+    free(file_pattern);
+    if (has_path_filter) {
+        cbm_regfree(&path_regex);
+    }
+    return cbm_mcp_text_result("search failed: out of memory", true);
 }
 
 /* ── detect_changes ───────────────────────────────────────────── */
@@ -7267,6 +7842,152 @@ static void detect_add_impacted_symbols(cbm_store_t *store, const char *project,
     cbm_store_free_nodes(nodes, ncount);
 }
 
+enum { MCP_CHANGED_MAX_FILES = 100000, MCP_CHANGED_MAX_PATH = 4096 };
+
+typedef struct {
+    char **items;
+    int count;
+    int capacity;
+} mcp_changed_paths_t;
+
+static void mcp_changed_paths_free(mcp_changed_paths_t *paths) {
+    if (!paths) {
+        return;
+    }
+    for (int i = 0; i < paths->count; i++) {
+        free(paths->items[i]);
+    }
+    free(paths->items);
+    memset(paths, 0, sizeof(*paths));
+}
+
+static int mcp_changed_path_compare(const void *left, const void *right) {
+    const char *const *a = left;
+    const char *const *b = right;
+    return strcmp(*a, *b);
+}
+
+/* Git -z records may legally contain newlines and other shell metacharacters.
+ * Preserve those bytes while rejecting only paths that are not repository-
+ * relative. Git itself never emits redundant or dot path components here, but
+ * fail closed if a malicious executable override does. */
+static bool mcp_changed_path_is_relative(const char *path) {
+    if (!path || !path[0] || path[0] == '/') {
+        return false;
+    }
+#ifdef _WIN32
+    if (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+        path[1] == ':') {
+        return false;
+    }
+#endif
+    const char *component = path;
+    for (const char *p = path;; p++) {
+        if (*p != '/' && *p != '\0') {
+            continue;
+        }
+        size_t length = (size_t)(p - component);
+        if (length == 0 || (length == 1 && component[0] == '.') ||
+            (length == 2 && component[0] == '.' && component[1] == '.')) {
+            return false;
+        }
+        if (*p == '\0') {
+            return true;
+        }
+        component = p + SKIP_ONE;
+    }
+}
+
+static bool mcp_changed_paths_append(mcp_changed_paths_t *paths, const char *path,
+                                     size_t path_len) {
+    if (!paths || !path || path_len == 0 || path_len >= MCP_CHANGED_MAX_PATH ||
+        paths->count >= MCP_CHANGED_MAX_FILES) {
+        return false;
+    }
+    if (paths->count >= paths->capacity) {
+        int next = paths->capacity == 0 ? CBM_SZ_64 : paths->capacity * PAIR_LEN;
+        if (next > MCP_CHANGED_MAX_FILES) {
+            next = MCP_CHANGED_MAX_FILES;
+        }
+        char **grown = realloc(paths->items, (size_t)next * sizeof(*grown));
+        if (!grown) {
+            return false;
+        }
+        paths->items = grown;
+        paths->capacity = next;
+    }
+    char *copy = malloc(path_len + SKIP_ONE);
+    if (!copy) {
+        return false;
+    }
+    memcpy(copy, path, path_len);
+    copy[path_len] = '\0';
+#ifdef _WIN32
+    cbm_normalize_path_sep(copy);
+#endif
+    if (!mcp_changed_path_is_relative(copy)) {
+        free(copy);
+        return true; /* ignore an impossible/out-of-root git record */
+    }
+    paths->items[paths->count++] = copy;
+    return true;
+}
+
+static bool mcp_changed_paths_parse_z(mcp_changed_paths_t *paths, const char *data, size_t len) {
+    size_t offset = 0;
+    while (offset < len) {
+        const char *end = memchr(data + offset, '\0', len - offset);
+        if (!end) {
+            return false;
+        }
+        size_t path_len = (size_t)(end - (data + offset));
+        if (path_len > 0 && !mcp_changed_paths_append(paths, data + offset, path_len)) {
+            return false;
+        }
+        offset = (size_t)(end - data) + SKIP_ONE;
+    }
+    return true;
+}
+
+static void mcp_changed_paths_sort_unique(mcp_changed_paths_t *paths) {
+    if (!paths || paths->count <= 1) {
+        return;
+    }
+    qsort(paths->items, (size_t)paths->count, sizeof(*paths->items), mcp_changed_path_compare);
+    int kept = 1;
+    for (int i = 1; i < paths->count; i++) {
+        if (strcmp(paths->items[kept - SKIP_ONE], paths->items[i]) == 0) {
+            free(paths->items[i]);
+        } else {
+            paths->items[kept++] = paths->items[i];
+        }
+    }
+    paths->count = kept;
+}
+
+static bool mcp_capture_changed_source(const char *git_path, const char *const *argv,
+                                       mcp_changed_paths_t *paths, cbm_proc_result_t *result) {
+    char *data = NULL;
+    size_t len = 0;
+    int rc = mcp_capture_argv(git_path, argv, MCP_GIT_CAPTURE_MAX_BYTES, &data, &len, result);
+    bool ok = rc == 0 && result->outcome == CBM_PROC_CLEAN && result->exit_code == 0 &&
+              mcp_changed_paths_parse_z(paths, data, len);
+    free(data);
+    return ok;
+}
+
+static bool mcp_revision_arg_valid(const char *revision) {
+    if (!revision || !revision[0] || revision[0] == '-' || strlen(revision) > CBM_SZ_1K) {
+        return false;
+    }
+    for (const unsigned char *p = (const unsigned char *)revision; *p; p++) {
+        if (*p < 0x20U || *p == 0x7FU) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     char *base_branch = cbm_mcp_get_string_arg(args, "base_branch");
@@ -7280,9 +8001,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
     /* `since` (e.g. "HEAD~10", "v0.5.0") is the documented diff base but was
      * previously parsed and never used: it takes precedence over base_branch.
-     * Route it through base_branch so the shared shell-arg validation and the
-     * existing `<base>...HEAD` (three-dot) diff apply unchanged — `since` thus
-     * adopts the same merge-base semantics base_branch already uses. */
+     * Both inputs become one argv element in the existing `<base>...HEAD`
+     * (three-dot) diff, so `since` adopts the same merge-base semantics. */
     if (since && since[0]) {
         free(base_branch);
         base_branch = since; /* transfer ownership */
@@ -7294,12 +8014,10 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         base_branch = heap_strdup("main");
     }
 
-    /* Reject shell metacharacters, and a leading '-', in the user-supplied
-     * branch name. base_branch is spliced into `git diff --name-only
-     * "<base>"...HEAD`; a value starting with '-' would be read by git as an
-     * option rather than a ref (e.g. `--output=<path>` writes the diff to an
-     * arbitrary file). A real git ref never begins with '-'. */
-    if (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-') {
+    /* Reject malformed/control-bearing revision text and a leading '-'. The
+     * value is passed without a shell, as one `<base>...HEAD` argv element, but
+     * a leading '-' could still be interpreted by Git as an option. */
+    if (!mcp_revision_arg_valid(base_branch)) {
         free(project);
         free(base_branch);
         free(scope);
@@ -7317,52 +8035,70 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         return res;
     }
 
-    if (!validate_search_path_arg(root_path)) {
+    char git_path[CBM_SZ_4K];
+    if (!mcp_resolve_git_binary(git_path, sizeof(git_path))) {
         free(root_path);
         free(project);
         free(base_branch);
         free(scope);
-        return cbm_mcp_text_result("project path contains invalid characters", true);
+        return cbm_mcp_text_result("git diff failed: no trusted absolute git executable was found",
+                                   true);
     }
 
-    /* Get changed files via git (-C avoids cd + quoting issues on Windows).
-     * Three sources are merged:
-     *   1. committed changes vs base   (diff <base>...HEAD)
-     *   2. unstaged tracked changes    (diff)
-     *   3. untracked + staged-new files (status --porcelain) — these are
-     *      invisible to `git diff` and were silently missed before, so a
-     *      brand-new file never appeared until a manual re-index (#520).
-     * status --porcelain prefixes each path with a 2-char code + space
-     * ("?? path", "A  path"); the prefix is stripped when parsing below. */
-    char cmd[CBM_SZ_2K];
-#ifdef _WIN32
-    snprintf(cmd, sizeof(cmd),
-             "git -C \"%s\" diff --name-only \"%s\"...HEAD 2>NUL & "
-             "git -C \"%s\" diff --name-only 2>NUL & "
-             "git --no-optional-locks -C \"%s\" status --porcelain "
-             "--untracked-files=normal 2>NUL",
-             root_path, base_branch, root_path, root_path);
-#else
-    snprintf(cmd, sizeof(cmd),
-             "{ git -C '%s' diff --name-only '%s'...HEAD 2>/dev/null; "
-             "git -C '%s' diff --name-only 2>/dev/null; "
-             "git --no-optional-locks -C '%s' status --porcelain "
-             "--untracked-files=normal 2>/dev/null; } | sort -u",
-             root_path, base_branch, root_path, root_path);
-#endif
-
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        char errmsg[CBM_SZ_256];
-        snprintf(errmsg, sizeof(errmsg),
-                 "git diff failed: cannot execute command (%s). Check that git is installed.",
-                 strerror(errno));
+    size_t base_len = strlen(base_branch);
+    if (base_len > SIZE_MAX - sizeof("...HEAD")) {
         free(root_path);
         free(project);
         free(base_branch);
         free(scope);
-        return cbm_mcp_text_result(errmsg, true);
+        return cbm_mcp_text_result("base_branch is too long", true);
     }
+    char *revision_range = malloc(base_len + sizeof("...HEAD"));
+    if (!revision_range) {
+        free(root_path);
+        free(project);
+        free(base_branch);
+        free(scope);
+        return cbm_mcp_text_result("out of memory", true);
+    }
+    memcpy(revision_range, base_branch, base_len);
+    memcpy(revision_range + base_len, "...HEAD", sizeof("...HEAD"));
+
+    /* Four NUL-delimited argv-only sources form the changed-file union:
+     * committed range, unstaged, staged, and untracked. Newlines and shell
+     * punctuation remain ordinary filename/ref bytes throughout. */
+    const char *range_argv[] = {git_path, "-C",           root_path, "diff", "--name-only",
+                                "-z",     revision_range, "--",      NULL};
+    const char *unstaged_argv[] = {git_path,      "-C", root_path, "diff",
+                                   "--name-only", "-z", "--",      NULL};
+    const char *staged_argv[] = {git_path,      "-C", root_path, "diff", "--cached",
+                                 "--name-only", "-z", "--",      NULL};
+    const char *untracked_argv[] = {
+        git_path,   "--no-optional-locks", "-C", root_path, "ls-files", "-z",
+        "--others", "--exclude-standard",  "--", NULL};
+    mcp_changed_paths_t changed_paths = {0};
+    cbm_proc_result_t git_result;
+    bool git_ok =
+        mcp_capture_changed_source(git_path, range_argv, &changed_paths, &git_result) &&
+        mcp_capture_changed_source(git_path, unstaged_argv, &changed_paths, &git_result) &&
+        mcp_capture_changed_source(git_path, staged_argv, &changed_paths, &git_result) &&
+        mcp_capture_changed_source(git_path, untracked_argv, &changed_paths, &git_result);
+    free(revision_range);
+    if (!git_ok) {
+        mcp_changed_paths_free(&changed_paths);
+        char message[CBM_SZ_512];
+        snprintf(message, sizeof(message),
+                 "git changed-file capture failed (%s). Check that branch '%s' exists and output "
+                 "is below the %d MiB limit.",
+                 cbm_proc_outcome_str(git_result.outcome), base_branch,
+                 MCP_GIT_CAPTURE_MAX_BYTES / (1024 * 1024));
+        free(root_path);
+        free(project);
+        free(base_branch);
+        free(scope);
+        return cbm_mcp_text_result(message, true);
+    }
+    mcp_changed_paths_sort_unique(&changed_paths);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
@@ -7374,54 +8110,16 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     /* resolve_store already called via get_project_root above */
     cbm_store_t *store = srv->store;
 
-    char line[CBM_SZ_1K];
-    int file_count = 0;
-
-    while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len == 0) {
-            continue;
-        }
-
-        /* `git status --porcelain` prefixes each path with a two-character
-         * status code and a space ("?? path", "A  path", " M path"). The two
-         * `git diff --name-only` sources emit bare paths. Strip the porcelain
-         * prefix when present so all three sources yield clean paths; for a
-         * rename ("R  old -> new") keep the post-arrow destination path. */
-        char *path_line = line;
-        if (len > PAIR_LEN && line[PAIR_LEN] == ' ' && strchr(" MADRCU?!", line[0]) &&
-            strchr(" MADRCU?!", line[1])) {
-            path_line = line + PAIR_LEN + SKIP_ONE;
-            char *arrow = strstr(path_line, " -> ");
-            if (arrow) {
-                enum { ARROW_LEN = 4 }; /* length of " -> " */
-                path_line = arrow + ARROW_LEN;
-            }
-        }
-        if (path_line[0] == '\0') {
-            continue;
-        }
-
-        yyjson_mut_arr_add_strcpy(doc, changed, path_line);
-        file_count++;
+    int file_count = changed_paths.count;
+    for (int i = 0; i < changed_paths.count; i++) {
+        const char *path = changed_paths.items[i];
+        yyjson_mut_arr_add_strcpy(doc, changed, path);
         if (want_symbols) {
-            detect_add_impacted_symbols(store, project, path_line, doc, impacted);
+            detect_add_impacted_symbols(store, project, path, doc, impacted);
         }
     }
-    int git_status = cbm_pclose(fp);
-
     bool is_error = false;
-    if (git_status != 0 && file_count == 0) {
-        char hint_buf[CBM_SZ_256];
-        snprintf(hint_buf, sizeof(hint_buf),
-                 "git diff exited with status %d. Check that branch '%s' exists.", git_status,
-                 base_branch);
-        yyjson_mut_obj_add_strcpy(doc, root_obj, "hint", hint_buf);
-        is_error = true;
-    }
+    mcp_changed_paths_free(&changed_paths);
 
     yyjson_mut_obj_add_val(doc, root_obj, "changed_files", changed);
     yyjson_mut_obj_add_int(doc, root_obj, "changed_count", file_count);
@@ -7482,32 +8180,18 @@ static char *adr_read_legacy_file(const char *root_path) {
     if (!root_path) {
         return NULL;
     }
-    char adr_path[CBM_SZ_4K];
-    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", root_path);
-    FILE *fp = cbm_fopen(adr_path, "r");
-    if (!fp) {
+    cbm_rooted_file_t file = {0};
+    cbm_rooted_file_status_t status =
+        cbm_rooted_file_read(root_path, ".codebase-memory/adr.md", CBM_ADR_MAX_LENGTH, &file);
+    if (status != CBM_ROOTED_FILE_OK || file.len == 0) {
+        cbm_rooted_file_free(&file);
         return NULL;
     }
-    (void)fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    if (sz <= 0) {
-        (void)fclose(fp);
-        return NULL;
-    }
-    (void)fseek(fp, 0, SEEK_SET);
-    char *buf = malloc((size_t)sz + SKIP_ONE);
-    if (!buf) {
-        (void)fclose(fp);
-        return NULL;
-    }
-    size_t n = fread(buf, SKIP_ONE, (size_t)sz, fp);
-    buf[n] = '\0';
-    (void)fclose(fp);
-    if (buf[0] == '\0') {
-        free(buf);
-        return NULL;
-    }
-    return buf;
+    /* Transfer the rooted reader's stable, NUL-terminated buffer. */
+    char *content = file.data;
+    file.data = NULL;
+    cbm_rooted_file_free(&file);
+    return content;
 }
 
 #define ADR_EMPTY_HINT                                                             \
@@ -7906,19 +8590,26 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         return; /* no session root detected */
     }
 
-    /* Check if project already has a DB */
-    const char *home = cbm_get_home_dir();
-    if (home) {
-        char db_check[CBM_SZ_1K];
-        snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
-                 srv->session_project);
-        if (cbm_file_size(db_check) >= 0) {
-            /* Already indexed → register watcher for change detection */
-            cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
-                         srv->session_project);
-            register_watcher_if_enabled(srv);
-            return;
-        }
+    /* Check if project already has a DB. Auto-index never invents a shared
+     * temporary destination when the user's persistent cache is unavailable. */
+    const char *resolved_cache = cbm_resolve_cache_dir();
+    if (!resolved_cache || !resolved_cache[0]) {
+        cbm_log_warn("autoindex.skip", "reason", "cache_dir_unavailable");
+        return;
+    }
+    char db_check[CBM_SZ_1K];
+    int db_len =
+        snprintf(db_check, sizeof(db_check), "%s/%s.db", resolved_cache, srv->session_project);
+    if (db_len < 0 || (size_t)db_len >= sizeof(db_check)) {
+        cbm_log_warn("autoindex.skip", "reason", "cache_path_too_long");
+        return;
+    }
+    if (cbm_file_size(db_check) >= 0) {
+        /* Already indexed → register watcher for change detection */
+        cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
+                     srv->session_project);
+        register_watcher_if_enabled(srv);
+        return;
     }
 
 /* Default file limit for auto-indexing new projects */
@@ -7939,26 +8630,41 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         return;
     }
 
-    /* Quick file count check to avoid OOM on massive repos */
-    if (!cbm_validate_shell_arg(srv->session_root)) {
-        cbm_log_warn("autoindex.skip", "reason", "path contains shell metacharacters");
+    /* Quick NUL-delimited tracked-file count, with no shell and a hard output
+     * ceiling, to avoid OOM on massive repositories. */
+    char git_path[CBM_SZ_4K];
+    if (!mcp_resolve_git_binary(git_path, sizeof(git_path))) {
+        cbm_log_warn("autoindex.skip", "reason", "trusted_git_not_found");
         return;
     }
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' ls-files 2>/dev/null | wc -l", srv->session_root);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (fp) {
-        char line[CBM_SZ_64];
-        if (fgets(line, sizeof(line), fp)) {
-            int count = (int)strtol(line, NULL, CBM_DECIMAL_BASE);
-            if (count > file_limit) {
-                cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", line, "limit",
-                             CBM_CONFIG_AUTO_INDEX_LIMIT);
-                cbm_pclose(fp);
-                return;
-            }
+    const char *argv[] = {git_path, "-C", srv->session_root, "ls-files", "-z", "--", NULL};
+    char *files = NULL;
+    size_t files_len = 0;
+    cbm_proc_result_t result;
+    if (mcp_capture_argv(git_path, argv, MCP_AUTO_INDEX_CAPTURE_MAX_BYTES, &files, &files_len,
+                         &result) != 0) {
+        cbm_log_warn("autoindex.skip", "reason", cbm_proc_outcome_str(result.outcome));
+        free(files);
+        return;
+    }
+    size_t file_count = 0;
+    for (size_t i = 0; i < files_len; i++) {
+        if (files[i] == '\0') {
+            file_count++;
         }
-        cbm_pclose(fp);
+    }
+    bool valid_records = files_len == 0 || files[files_len - SKIP_ONE] == '\0';
+    free(files);
+    if (!valid_records) {
+        cbm_log_warn("autoindex.skip", "reason", "malformed_git_output");
+        return;
+    }
+    if (file_count > (size_t)(file_limit < 0 ? 0 : file_limit)) {
+        char count_buf[CBM_SZ_64];
+        snprintf(count_buf, sizeof(count_buf), "%zu", file_count);
+        cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", count_buf, "limit",
+                     CBM_CONFIG_AUTO_INDEX_LIMIT);
+        return;
     }
 
     /* Launch auto-index in background */
@@ -7971,34 +8677,45 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 
 #define UPDATE_CHECK_URL CBM_GITHUB_API_LATEST_RELEASE_URL
 
+static int mcp_fetch_update_response(char **out_response, size_t *out_len) {
+    if (out_response) {
+        *out_response = NULL;
+    }
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (!out_response || !out_len) {
+        return CBM_NOT_FOUND;
+    }
+    char curl_path[CBM_SZ_4K];
+    if (!mcp_resolve_curl_binary(curl_path, sizeof(curl_path))) {
+        return CBM_NOT_FOUND;
+    }
+    const char *argv[] = {
+        curl_path,        "-sf", "--max-time", "5", "-H", "Accept: application/vnd.github+json",
+        UPDATE_CHECK_URL, NULL};
+    cbm_proc_result_t result;
+    return mcp_capture_argv(curl_path, argv, MCP_UPDATE_CAPTURE_MAX_BYTES, out_response, out_len,
+                            &result);
+}
+
+int cbm_mcp_fetch_update_for_test(char **out_response, size_t *out_len) {
+    return mcp_fetch_update_response(out_response, out_len);
+}
+
 static void *update_check_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
-
-    /* Use curl with 5s timeout to fetch latest release tag */
-    FILE *fp = cbm_popen("curl -sf --max-time 5 -H 'Accept: application/vnd.github+json' "
-                         "'" UPDATE_CHECK_URL "' 2>/dev/null",
-                         "r");
-    if (!fp) {
-        srv->update_checked = true;
+    char *response = NULL;
+    size_t response_len = 0;
+    if (mcp_fetch_update_response(&response, &response_len) != 0) {
+        free(response);
         return NULL;
     }
 
-    char buf[CBM_SZ_4K];
-    size_t total = 0;
-    while (total < sizeof(buf) - SKIP_ONE) {
-        size_t n = fread(buf + total, SKIP_ONE, sizeof(buf) - SKIP_ONE - total, fp);
-        if (n == 0) {
-            break;
-        }
-        total += n;
-    }
-    buf[total] = '\0';
-    cbm_pclose(fp);
-
     /* Parse tag_name from JSON response */
-    yyjson_doc *doc = yyjson_read(buf, total, 0);
+    yyjson_doc *doc = yyjson_read(response, response_len, 0);
+    free(response);
     if (!doc) {
-        srv->update_checked = true;
         return NULL;
     }
 
@@ -8009,24 +8726,31 @@ static void *update_check_thread(void *arg) {
     if (tag_str) {
         const char *current = cbm_cli_get_version();
         if (cbm_compare_versions(tag_str, current) > 0) {
+            cbm_mutex_lock(&srv->update_mutex);
             snprintf(srv->update_notice, sizeof(srv->update_notice),
                      "Update available: %s -> %s -- run: codebase-memory-mcp update  |  "
                      "Enjoying codebase-memory-mcp? Please leave a star: " CBM_GITHUB_URL,
                      current, tag_str);
+            cbm_mutex_unlock(&srv->update_mutex);
             cbm_log_info("update.available", "current", current, "latest", tag_str);
         }
     }
 
     yyjson_doc_free(doc);
-    srv->update_checked = true;
     return NULL;
 }
 
 static void start_update_check(cbm_mcp_server_t *srv) {
-    if (srv->update_checked) {
+    if (atomic_load_explicit(&srv->update_checked, memory_order_acquire)) {
         return;
     }
-    srv->update_checked = true; /* prevent double-launch */
+    const char *disabled = getenv("CBM_DISABLE_UPDATE_CHECK");
+    if (disabled && (strcmp(disabled, "1") == 0 || strcmp(disabled, "true") == 0)) {
+        atomic_store_explicit(&srv->update_checked, true, memory_order_release);
+        return; /* explicit opt-out: no resolver and no network thread */
+    }
+    atomic_store_explicit(&srv->update_checked, true,
+                          memory_order_release); /* prevent double-launch */
     if (cbm_thread_create(&srv->update_tid, 0, update_check_thread, srv) == 0) {
         srv->update_thread_active = true;
     }
@@ -8034,13 +8758,16 @@ static void start_update_check(cbm_mcp_server_t *srv) {
 
 /* Prepend update notice to a tool result, then clear it (one-shot). */
 static char *inject_update_notice(cbm_mcp_server_t *srv, char *result_json) {
+    cbm_mutex_lock(&srv->update_mutex);
     if (srv->update_notice[0] == '\0') {
+        cbm_mutex_unlock(&srv->update_mutex);
         return result_json;
     }
 
     /* Parse existing result, prepend notice text, rebuild */
     yyjson_doc *doc = yyjson_read(result_json, strlen(result_json), 0);
     if (!doc) {
+        cbm_mutex_unlock(&srv->update_mutex);
         return result_json;
     }
 
@@ -8049,6 +8776,7 @@ static char *inject_update_notice(cbm_mcp_server_t *srv, char *result_json) {
     yyjson_doc_free(doc);
     if (!root) {
         yyjson_mut_doc_free(mdoc);
+        cbm_mutex_unlock(&srv->update_mutex);
         return result_json;
     }
     yyjson_mut_doc_set_root(mdoc, root);
@@ -8070,8 +8798,10 @@ static char *inject_update_notice(cbm_mcp_server_t *srv, char *result_json) {
     if (new_json) {
         free(result_json);
         srv->update_notice[0] = '\0'; /* clear — one-shot */
+        cbm_mutex_unlock(&srv->update_mutex);
         return new_json;
     }
+    cbm_mutex_unlock(&srv->update_mutex);
     return result_json;
 }
 

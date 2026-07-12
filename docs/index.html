@@ -40,7 +40,7 @@
       "applicationCategory": "DeveloperApplication",
       "applicationSubCategory": "Model Context Protocol (MCP) server",
       "operatingSystem": "macOS, Linux, Windows",
-      "softwareVersion": "0.8.1",
+      "softwareVersion": "0.9.0",
       "description": "A local MCP server that indexes code into a persistent graph and maintains Global Memory as immutable raw sources plus a revisioned cross-project wiki. Retrieval reports applicability, freshness, evidence lineage, conflicts, and a safe reuse route; multi-agent updates use revision compare-and-swap.",
       "url": "https://bogyie.github.io/codebase-memory-mcp/",
       "downloadUrl": "https://github.com/bogyie/codebase-memory-mcp/releases/latest",
@@ -55,8 +55,8 @@
       },
       "featureList": [
         "Indexes 158 programming languages via vendored tree-sitter grammars",
-        "Hybrid LSP semantic type resolution for Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, and Rust",
-        "23 MCP tools for structural search, call-path tracing, Design Context, Cypher graph queries, and Global Memory",
+        "Hybrid LSP semantic type resolution for Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, Rust, and Perl",
+        "24 MCP tools for structural search, call-path tracing, Design Context, Cypher graph queries, and Global Memory",
         "Read-only semantic indexing for DESIGN.md, DTCG tokens and resolver modes, CSS variables, and implementation usages",
         "Global Memory with immutable raw sources and a revisioned cross-project wiki",
         "Applicability-first retrieval with freshness, evidence, conflict, and route signals",
@@ -72,7 +72,7 @@
         "Infrastructure-as-code indexing for Dockerfiles, Kubernetes, and Kustomize",
         "Built-in 3D graph visualization UI",
         "Auto-sync background watcher for incremental re-indexing",
-        "One-command install for 11 AI coding agents"
+        "One-command install for 13 AI coding agents"
       ],
       "author": {
         "@type": "Organization",
@@ -129,7 +129,7 @@
           "name": "What is codebase-memory-mcp?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "codebase-memory-mcp is an open-source Model Context Protocol (MCP) server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. AI coding agents query that graph instead of reading files one by one, answering structural questions with roughly 120x fewer tokens. It parses 158 languages and ships as a single static C binary with no runtime dependencies."
+            "text": "codebase-memory-mcp is an open-source Model Context Protocol (MCP) server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. AI coding agents query that graph instead of reading files one by one, answering structural questions with roughly 120x fewer tokens. It parses 158 languages and ships as a self-contained native executable, with fully static portable builds available for Linux."
           }
         },
         {
@@ -153,7 +153,7 @@
           "name": "Which programming languages does codebase-memory-mcp support?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "It supports 158 languages through vendored tree-sitter grammars compiled into the binary, including Python, Go, JavaScript, TypeScript, Rust, Java, C, C++, C#, PHP, Ruby, Kotlin, Swift, and many more. Nine language families — Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, and Rust — additionally get Hybrid LSP semantic type resolution."
+            "text": "It supports 158 languages through vendored tree-sitter grammars compiled into the binary, including Python, Go, JavaScript, TypeScript, Rust, Java, C, C++, C#, PHP, Ruby, Kotlin, Swift, Perl, and many more. Ten language families — Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, Rust, and Perl — additionally get Hybrid LSP semantic type resolution."
           }
         },
         {
@@ -169,7 +169,7 @@
           "name": "Which AI coding agents work with codebase-memory-mcp?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "A single install command configures 11 agents: Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro. Any MCP-compatible client can use the server."
+            "text": "A single install command configures 13 agents: Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, OpenClaw, Kiro, and Junie. Any MCP-compatible client can use the server."
           }
         },
         {
@@ -177,7 +177,7 @@
           "name": "Does codebase-memory-mcp send my code anywhere?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "No. All indexing and querying happen 100% locally on your machine. There is no embedded LLM and no API key — your MCP client acts as the intelligence layer. Release binaries are signed, checksummed, and scanned by 70+ antivirus engines."
+            "text": "Indexing, querying, and Global Memory storage happen locally and the server collects no telemetry. After MCP initialization, a bounded request checks this fork's public GitHub release metadata and can be disabled with CBM_DISABLE_UPDATE_CHECK=1. Explicitly approved memory_export operations can write bundles containing raw sources outside the Memory home, and memory_sync can send them to a configured Git remote. There is no embedded LLM or API key."
           }
         },
         {
@@ -503,13 +503,13 @@
             repository into a persistent knowledge graph — full-indexing an average repo in seconds and the
             Linux kernel in 3 minutes — so your agent answers structural questions with ~120x fewer tokens.
             Global Memory carries evidence-backed knowledge safely across repositories and agent sessions.
-            Tree-sitter parsing across 158 languages, Hybrid LSP type resolution, single static C binary.
+            Tree-sitter parsing across 158 languages, Hybrid LSP type resolution, one self-contained executable.
         </p>
         <div>
             <div class="stat"><div class="number">~120x</div><div class="label">fewer tokens</div></div>
             <div class="stat"><div class="number">158</div><div class="label">languages</div></div>
             <div class="stat"><div class="number">3 min</div><div class="label">Linux kernel index</div></div>
-            <div class="stat"><div class="number">11</div><div class="label">agents supported</div></div>
+            <div class="stat"><div class="number">13</div><div class="label">agents supported</div></div>
         </div>
         <div class="cta-buttons">
             <a href="https://github.com/bogyie/codebase-memory-mcp" class="cta-primary">View on GitHub</a>
@@ -542,12 +542,15 @@
             Protocol (MCP)</a> server that indexes a codebase into a persistent knowledge graph of functions,
             classes, call chains, HTTP routes, cross-service links, and repository design context. Instead of reading files one at a time,
             an AI coding agent queries the graph — answering structural questions with roughly 120x fewer
-            tokens. It parses 158 languages and ships as a single static C binary with zero runtime dependencies.
+            tokens. It parses 158 languages and ships as a self-contained native executable; fully static
+            <code>-portable</code> builds are available for Linux.
         </p>
         <p class="muted">
             It is a structural-analysis backend, not a chatbot: there is no embedded LLM and no API key. Your
             MCP client (Claude Code, or any MCP-compatible agent) is the intelligence layer; codebase-memory-mcp
-            builds and serves the graph. All processing happens locally — your code never leaves your machine.
+            builds and serves the graph. Indexing, querying, and storage stay local and collect no telemetry.
+            Explicitly approved Global Memory export or Git sync is the only built-in sharing path, and its
+            bundle includes retained raw sources.
         </p>
     </section>
 
@@ -571,7 +574,7 @@
         <div class="memory-guardrails">
             <div class="memory-guardrail"><strong>Bias-aware, not contrarian by default</strong><p>Relevance never becomes truth weight. Verification effort follows applicability, evidence quality, impact, reversibility, and detected conflict—not a static demand to find an opposing view.</p></div>
             <div class="memory-guardrail"><strong>Time-aware facts</strong><p>Bitemporal revisions, volatility, review deadlines, source supersession, and dirty CodeRefs route questionable facts to verification rather than silent reuse.</p></div>
-            <div class="memory-guardrail"><strong>Safe multi-agent writes</strong><p>Agents reason outside transactions, then use revision-aware proposals and idempotent compare-and-swap commits. Same-entity conflicts are rejected; last-write-wins is forbidden.</p></div>
+            <div class="memory-guardrail"><strong>Safe multi-agent writes</strong><p>Agents reason outside transactions, then use revision-aware proposals and idempotent compare-and-swap commits. <code>memory_commit</code> requires explicit <code>user_approved: true</code>; same-entity conflicts are rejected and last-write-wins is forbidden.</p></div>
         </div>
 
         <div class="install-block">
@@ -583,6 +586,9 @@
         <p class="muted">
             The UI build includes a read-only Memory workspace for retrieval routes and lint results. Durable
             changes remain an explicit <code>memory_propose</code> → <code>memory_commit</code> workflow.
+            External export/import paths require <code>allow_external_path: true</code> plus
+            <code>user_approved: true</code>; replacing an export also requires <code>overwrite: true</code>.
+            Export and sync bundles include raw sources, so review their destination before sharing.
             See the <a href="https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/GLOBAL_MEMORY_GUIDE.md">usage guide</a>
             and <a href="https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/GLOBAL_MEMORY.md">architecture contract</a>.
         </p>
@@ -611,8 +617,8 @@
     <section id="install">
         <h2>How do I install codebase-memory-mcp?</h2>
         <p class="lead">
-            Install with a single command, then tell your agent to index the project. It is a single static C binary for
-            macOS, Linux, and Windows — no Docker, no runtime dependencies, no API key.
+            Install with a single command, then tell your agent to index the project. It is a self-contained native
+            executable for macOS, Linux, and Windows — no Docker, separate language runtime, database service, or API key.
         </p>
         <div class="install-block">
             <span class="comment"># 1. One-line install (macOS / Linux). Add --ui for the 3D graph UI.</span><br>
@@ -622,10 +628,11 @@
             <span class="cmd">"Index this project"</span>
         </div>
         <p class="muted">
-            One command configures all 11 supported agents: Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,
-            Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro — with MCP entries, instruction files, and
-            pre-tool hooks for each. Windows users run <code>install.ps1</code>. Also available via
-            <code>npm</code>, <code>pip</code>, Homebrew, Scoop, Winget, Chocolatey, AUR, and <code>go install</code>.
+            One command configures all 13 supported agents: Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,
+            Antigravity, Aider, KiloCode, VS Code, Cursor, OpenClaw, Kiro, and Junie — installing each supported
+            MCP, instruction, and hook integration. Windows users run <code>install.ps1</code>. Package-manager
+            entries such as <code>npm</code>, <code>pip</code>, Homebrew, Scoop, Winget, Chocolatey, AUR, and
+            <code>go install</code> currently target upstream DeusData releases, not this fork.
         </p>
     </section>
 
@@ -641,7 +648,7 @@
             codebase-memory-mcp ships a <strong>lightweight C implementation of language type-resolution
             algorithms, structurally inspired by and compatible with major language servers</strong> —
             tsserver/typescript-go, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer —
-            embedded directly into the single static C binary. There is no language-server process, no
+            embedded directly into the native executable. There is no language-server process, no
             per-project setup, and no API key. This layer runs alongside tree-sitter on every parse and refines
             <code>CALLS</code>, <code>USAGE</code>, and <code>RESOLVED_CALLS</code> edges with type information,
             so the graph mirrors what an IDE "Go to Definition" would resolve.
@@ -659,6 +666,7 @@
                 <tr><td>Java <em>(new in v0.8.0)</em></td><td>Imports (single-type, on-demand, static), class hierarchies with <code>this</code>/<code>super</code> dispatch, generics, annotations, overload matching by arity and parameter types, lambdas and method references bound to functional interfaces, and common JDK stdlib.</td></tr>
                 <tr><td>Kotlin <em>(new in v0.8.0)</em></td><td>Imports and same-package resolution, classes / objects / companion objects, extension functions, data classes, nullable-type unwrapping, scope functions (<code>let</code>/<code>apply</code>/<code>run</code>/<code>also</code>/<code>with</code>), infix calls, and common stdlib.</td></tr>
                 <tr><td>Rust <em>(new in v0.8.0)</em></td><td><code>use</code> declarations and module paths, <code>impl</code> blocks and trait methods, struct fields, generics with trait bounds, operator-trait desugaring, derive-macro method synthesis, UFCS static paths, and common std prelude.</td></tr>
+                <tr><td>Perl</td><td>Packages, <code>@ISA</code>/<code>use parent</code>/<code>use base</code> inheritance, method-resolution-order and <code>SUPER::</code> dispatch, Exporter import maps, <code>bless</code>-based self-type inference, qualified calls, and curated perlfunc/CPAN types.</td></tr>
             </tbody>
         </table>
         <p class="muted">
@@ -763,7 +771,8 @@
             artifacts committed to the repository, connects them as <code>DesignSystem</code>,
             <code>DesignToken</code>, <code>DesignComponent</code>, and <code>DesignMode</code> nodes, and exposes
             them through the paginated <code>get_design_context</code> API and the UI's Design tab. Mode-specific
-            values stay attached to <code>OVERRIDES</code> relationships, while DTCG <code>$ref</code> and
+            values stay attached to <code>OVERRIDES</code> relationships, and source files connect to their token
+            definitions through <code>DEFINES_TOKEN</code>. DTCG <code>$ref</code> and
             <code>$extends</code> remain structural metadata rather than triggering a token build. It never fetches
             remote resolver sources and never copies project design data into Global Memory automatically.
         </p>
@@ -781,11 +790,11 @@
             </div>
             <div class="feature">
                 <h3>Hybrid LSP type resolution</h3>
-                <p>Language-server-grade type inference for Python, TS/JS, PHP, C#, Go, C/C++, Java, Kotlin, and Rust — embedded in the binary, no server process or per-project setup.</p>
+                <p>Language-server-grade type inference for Python, TS/JS, PHP, C#, Go, C/C++, Java, Kotlin, Rust, and Perl — embedded in the binary, no server process or per-project setup.</p>
             </div>
             <div class="feature">
-                <h3>Pure C, zero dependencies</h3>
-                <p>A single static C binary for macOS, Linux, and Windows. No Docker, no runtime, no API keys. Download, run <code>install</code>, done.</p>
+                <h3>Self-contained native runtime</h3>
+                <p>One executable for macOS, Linux, and Windows, plus fully static portable Linux builds. No Docker, separate language runtime, database service, or API key.</p>
             </div>
             <div class="feature">
                 <h3>Call-graph tracing</h3>
@@ -821,15 +830,15 @@
             </div>
             <div class="feature">
                 <h3>Team-shared graph artifact</h3>
-                <p>Commit one zstd-compressed snapshot (<code>.codebase-memory/graph.db.zst</code>); teammates bootstrap from it and skip the full reindex.</p>
+                <p>Commit <code>.codebase-memory/artifact.json</code> and its hash-addressed zstd snapshot; teammates verify and bootstrap from that generation instead of running a full reindex.</p>
             </div>
             <div class="feature">
                 <h3>3D graph visualization</h3>
                 <p>An optional UI binary serves an interactive 3D graph at <code>localhost:9749</code> to explore nodes, edges, and clusters visually.</p>
             </div>
             <div class="feature">
-                <h3>23 MCP tools</h3>
-                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>memory_status</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_design_context</code>, <code>get_code_snippet</code>, <code>manage_adr</code>, and 14 more.</p>
+                <h3>24 MCP tools</h3>
+                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>memory_status</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_design_context</code>, <code>get_code_snippet</code>, <code>manage_adr</code>, and 15 more.</p>
             </div>
             <div class="feature">
                 <h3>Global Memory</h3>
@@ -883,11 +892,11 @@
             </div>
             <div class="feature">
                 <h3>Published graph generations</h3>
-                <p>Hashes, coverage, and FTS finish before a generation is published. Active readers switch only to a completed snapshot; the Projects UI shows its status and generation.</p>
+                <p>Hashes, coverage, and FTS finish before publication. A SQLite backup transaction installs the completed staging generation into the live destination, so existing readers retain a consistent snapshot and later reads observe the new generation without a pathname replacement. The Projects UI shows its status and generation.</p>
             </div>
             <div class="feature">
                 <h3>Stale-source warnings</h3>
-                <p><code>get_code_snippet</code> identifies its line range as graph-derived, compares the indexed file version with the live worktree, and warns when they differ. Source payloads are capped at 16 KiB and report truncation explicitly.</p>
+                <p><code>get_code_snippet</code> identifies its line range as graph-derived and reports <code>source_state</code> as <code>current</code>, <code>stale_worktree</code>, <code>missing_worktree</code>, <code>range_unavailable</code>, <code>metadata_match</code>, or <code>unknown</code>. Only <code>current</code> proves that the live content hash matches the index. Source payloads are capped at 16 KiB and stable reads at 16 MiB; oversized, non-regular, or unstable sources fail closed as <code>range_unavailable</code>.</p>
             </div>
         </div>
         <p style="margin-top: 16px;">
@@ -915,8 +924,18 @@
         <h2>Frequently asked questions</h2>
 
         <h3>Does codebase-memory-mcp send my code anywhere?</h3>
-        <p>No. All indexing and querying happen 100% locally. There is no embedded LLM and no API key. Release
-           binaries are signed, checksummed, and scanned by 70+ antivirus engines.</p>
+        <p>Indexing, querying, and Global Memory storage happen locally, and the server collects no telemetry.
+           After MCP initialization, a bounded background request checks this fork's public GitHub release
+           metadata; it contains no project data and can be disabled with
+           <code>CBM_DISABLE_UPDATE_CHECK=1</code>.
+           Explicitly approved <code>memory_export</code> calls can write a bundle containing raw sources outside
+           the Memory home, and <code>memory_sync</code> can send it to a configured Git remote. There is no
+           embedded LLM or API key.</p>
+
+        <h3>Can a website call the local graph UI?</h3>
+        <p>The UI binds to loopback and validates the HTTP Host and Origin before routing requests. State-changing
+           endpoints require same-origin JSON requests, so a page opened from another origin cannot use the local
+           server as a cross-site request target.</p>
 
         <h3>How does Global Memory avoid reusing stale or biased knowledge?</h3>
         <p>It keeps immutable source provenance and revisioned knowledge with applicability, validity periods,
@@ -933,8 +952,8 @@
            edges between similar functions and <code>SIMILAR_TO</code> edges for near-clone detection.</p>
 
         <h3>Do I need Docker or a runtime?</h3>
-        <p>No. It is a single static C binary with zero runtime dependencies for macOS (arm64/amd64), Linux
-           (arm64/amd64), and Windows (amd64).</p>
+        <p>No separate language runtime, database service, or container is required. The project ships one
+           self-contained executable for macOS, Linux, and Windows, with fully static portable variants for Linux.</p>
 
         <h3>How does it stay up to date as I edit code?</h3>
         <p>A background watcher detects file changes and re-indexes incrementally — typically a sub-millisecond
@@ -952,7 +971,7 @@
            codebase-memory-mcp just builds and serves the graph.</p>
 
         <h3>Is it free and open source?</h3>
-        <p>Yes. It is MIT licensed. The full source, signed release binaries, and checksums are on
+        <p>Yes. It is MIT licensed. The full source, release binaries, and checksums are on
            <a href="https://github.com/bogyie/codebase-memory-mcp">GitHub</a>.</p>
     </section>
 </main>

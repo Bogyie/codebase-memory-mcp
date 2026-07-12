@@ -39,6 +39,7 @@ int cbm_http_server_port(const cbm_http_server_t *srv);
 
 /* Override the per-connection receive deadline (tests use short values). */
 void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms);
+void cbm_http_server_set_send_deadline_ms(cbm_http_server_t *srv, int ms);
 
 /* Set external watcher reference for UI project lifecycle actions. Not owned. */
 void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher);
@@ -52,8 +53,13 @@ void cbm_ui_log_append(const char *line);
 /* Set the binary path for subprocess spawning (call from main). */
 void cbm_http_server_set_binary_path(const char *path);
 
-/* Resolve argv[0] into an executable path suitable for subprocess spawning. */
+/* Resolve an explicit absolute argv[0], or fall back to the current process
+ * image. Returns a canonical path and never re-searches mutable PATH/CWD. */
 bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t outsz);
+
+/* Build the per-user cache path for a project database. Fails closed instead
+ * of falling back to a predictable shared-temporary filename. */
+bool cbm_http_server_project_db_path(const char *project, char *out, size_t outsz);
 
 /* Pure git-remote URL helpers used by GET /api/repo-info. Exposed for tests. */
 
