@@ -249,6 +249,7 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "get_code_snippet"));
     ASSERT_NOT_NULL(strstr(json, "get_graph_schema"));
     ASSERT_NOT_NULL(strstr(json, "get_architecture"));
+    ASSERT_NOT_NULL(strstr(json, "get_design_context"));
     ASSERT_NOT_NULL(strstr(json, "search_code"));
     ASSERT_NOT_NULL(strstr(json, "list_projects"));
     ASSERT_NOT_NULL(strstr(json, "delete_project"));
@@ -265,6 +266,73 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "memory_import"));
     ASSERT_NOT_NULL(strstr(json, "memory_sync"));
     free(json);
+    PASS();
+}
+
+TEST(tool_get_design_context_returns_curated_graph) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "design-tool-test";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/design-tool-test"), 0);
+    cbm_mcp_server_set_project(srv, project);
+
+    cbm_node_t system = {.project = project,
+                         .label = "DesignSystem",
+                         .name = "Aurora",
+                         .qualified_name = "design-tool-test.design.system.root",
+                         .file_path = "DESIGN.md",
+                         .start_line = 1,
+                         .end_line = 1,
+                         .properties_json = "{\"scope\":\"root\"}"};
+    int64_t system_id = cbm_store_upsert_node(store, &system);
+    ASSERT_GT(system_id, 0);
+    cbm_node_t token = {.project = project,
+                        .label = "DesignToken",
+                        .name = "action",
+                        .qualified_name = "design-tool-test.design.token.root.color.action",
+                        .file_path = "design/tokens/core.tokens.json",
+                        .start_line = 1,
+                        .end_line = 1,
+                        .properties_json =
+                            "{\"scope\":\"root\",\"token_path\":\"color.action\","
+                            "\"value\":\"#123456\",\"provenance\":\"authoritative\"}"};
+    int64_t token_id = cbm_store_upsert_node(store, &token);
+    ASSERT_GT(token_id, 0);
+    cbm_node_t file = {.project = project,
+                       .label = "File",
+                       .name = "app.css",
+                       .qualified_name = "design-tool-test.src.styles.app.__file__",
+                       .file_path = "src/styles/app.css",
+                       .start_line = 1,
+                       .end_line = 1,
+                       .properties_json = "{}"};
+    int64_t file_id = cbm_store_upsert_node(store, &file);
+    ASSERT_GT(file_id, 0);
+    cbm_edge_t provides = {.project = project,
+                           .source_id = system_id,
+                           .target_id = token_id,
+                           .type = "PROVIDES",
+                           .properties_json = "{}"};
+    ASSERT_GT(cbm_store_insert_edge(store, &provides), 0);
+    cbm_edge_t usage = {.project = project,
+                        .source_id = file_id,
+                        .target_id = token_id,
+                        .type = "USES_TOKEN",
+                        .properties_json = "{\"line\":3}"};
+    ASSERT_GT(cbm_store_insert_edge(store, &usage), 0);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "get_design_context", "{\"project\":\"design-tool-test\",\"token\":\"color.action\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NULL(strstr(response, "unknown tool"));
+    ASSERT_TRUE(response_contains_json_fragment(response, "\"status\":\"ready\""));
+    ASSERT_TRUE(response_contains_json_fragment(response, "color.action"));
+    ASSERT_TRUE(response_contains_json_fragment(response, "USES_TOKEN"));
+    ASSERT_TRUE(response_contains_json_fragment(response, "project-local"));
+    free(response);
+    cbm_mcp_server_free(srv);
     PASS();
 }
 
@@ -624,7 +692,7 @@ TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor) {
     ASSERT_NOT_NULL(strstr(resp, "\"id\":201"));
     ASSERT_NOT_NULL(strstr(resp, "\"nextCursor\":\"16\""));
     ASSERT_NOT_NULL(strstr(resp, "manage_adr"));
-    ASSERT_NOT_NULL(strstr(resp, "memory_query"));
+    ASSERT_NOT_NULL(strstr(resp, "memory_ingest"));
     free(resp);
 
     resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":203,\"method\":\"tools/"
@@ -632,6 +700,7 @@ TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor) {
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":203"));
     ASSERT_NULL(strstr(resp, "\"nextCursor\""));
+    ASSERT_NOT_NULL(strstr(resp, "memory_query"));
     ASSERT_NOT_NULL(strstr(resp, "memory_commit"));
     ASSERT_NOT_NULL(strstr(resp, "memory_sync"));
     free(resp);
@@ -5775,6 +5844,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
+    RUN_TEST(tool_get_design_context_returns_curated_graph);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
     RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);
     RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);
