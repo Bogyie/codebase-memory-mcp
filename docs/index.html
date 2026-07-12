@@ -4,18 +4,18 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>codebase-memory-mcp — Code Intelligence Knowledge Graph for AI Coding Agents</title>
-    <meta name="description" content="codebase-memory-mcp is an open-source MCP server that indexes any codebase into a persistent knowledge graph so AI coding agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP type resolution, local semantic vector search, code-clone detection, sub-1ms queries, Linux kernel indexed in 3 minutes. Single static C binary, zero dependencies. Works with 11 agents including Claude Code, Codex CLI, Gemini CLI, Cursor, and Zed.">
-    <meta name="keywords" content="MCP server, code intelligence, knowledge graph, tree-sitter, Hybrid LSP, semantic code search, code embeddings, code clone detection, cross-repo analysis, data-flow analysis, Claude Code, Codex CLI, Gemini CLI, Cursor, Zed, code exploration, token reduction, call graph, dead code detection">
-    <meta name="author" content="DeusData">
+    <meta name="description" content="codebase-memory-mcp indexes repositories into local knowledge graphs and adds Global Memory: immutable raw sources, a revisioned cross-project wiki, applicability-first retrieval, stale-knowledge checks, and conflict-safe multi-agent updates.">
+    <meta name="keywords" content="MCP server, code intelligence, knowledge graph, Global Memory, agent memory, cross-project memory, provenance, bitemporal knowledge, multi-agent concurrency, tree-sitter, Hybrid LSP, semantic code search, code exploration, call graph">
+    <meta name="author" content="Bogyie">
     <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
     <meta name="theme-color" content="#0d1117">
 
     <!-- Open Graph -->
     <meta property="og:title" content="codebase-memory-mcp — Code Intelligence Knowledge Graph for AI Coding Agents">
-    <meta property="og:description" content="Index any codebase into a persistent knowledge graph. AI agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP, sub-1ms queries, single static C binary.">
+    <meta property="og:description" content="Local code intelligence plus Global Memory: raw sources, a revisioned wiki, evidence-aware retrieval, stale-knowledge checks, and safe multi-agent updates.">
     <meta property="og:type" content="website">
-    <meta property="og:url" content="https://deusdata.github.io/codebase-memory-mcp/">
-    <meta property="og:image" content="https://deusdata.github.io/codebase-memory-mcp/graph-ui-screenshot.png">
+    <meta property="og:url" content="https://bogyie.github.io/codebase-memory-mcp/">
+    <meta property="og:image" content="https://bogyie.github.io/codebase-memory-mcp/graph-ui-screenshot.png">
     <meta property="og:image:width" content="1538">
     <meta property="og:image:height" content="932">
     <meta property="og:image:alt" content="3D knowledge-graph visualization of a codebase with thousands of nodes and edges">
@@ -24,10 +24,10 @@
     <!-- Twitter Card -->
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="codebase-memory-mcp — Code Intelligence for AI Coding Agents">
-    <meta name="twitter:description" content="Index any codebase into a knowledge graph. ~120x fewer tokens for AI code exploration. 158 languages, Hybrid LSP, sub-1ms queries, single static C binary.">
-    <meta name="twitter:image" content="https://deusdata.github.io/codebase-memory-mcp/graph-ui-screenshot.png">
+    <meta name="twitter:description" content="Local code graphs plus evidence-aware Global Memory shared across projects and agent sessions.">
+    <meta name="twitter:image" content="https://bogyie.github.io/codebase-memory-mcp/graph-ui-screenshot.png">
 
-    <link rel="canonical" href="https://deusdata.github.io/codebase-memory-mcp/">
+    <link rel="canonical" href="https://bogyie.github.io/codebase-memory-mcp/">
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d1117'/%3E%3Cg stroke='%2358a6ff' stroke-width='2'%3E%3Cline x1='9' y1='9' x2='23' y2='16'/%3E%3Cline x1='23' y1='16' x2='10' y2='24'/%3E%3Cline x1='9' y1='9' x2='10' y2='24'/%3E%3C/g%3E%3Cg fill='%2358a6ff'%3E%3Ccircle cx='9' cy='9' r='3.5'/%3E%3Ccircle cx='23' cy='16' r='3.5'/%3E%3Ccircle cx='10' cy='24' r='3.5'/%3E%3C/g%3E%3C/svg%3E">
 
     <!-- Structured data: SoftwareApplication (the tool) -->
@@ -41,10 +41,10 @@
       "applicationSubCategory": "Model Context Protocol (MCP) server",
       "operatingSystem": "macOS, Linux, Windows",
       "softwareVersion": "0.8.1",
-      "description": "An open-source MCP server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links, so AI coding agents answer structural questions with roughly 120x fewer tokens than file-by-file search. Parses 158 languages via tree-sitter with Hybrid LSP semantic type resolution for 9 language families. Ships as a single static C binary with zero runtime dependencies.",
-      "url": "https://deusdata.github.io/codebase-memory-mcp/",
-      "downloadUrl": "https://github.com/DeusData/codebase-memory-mcp/releases/latest",
-      "codeRepository": "https://github.com/DeusData/codebase-memory-mcp",
+      "description": "A local MCP server that indexes code into a persistent graph and maintains Global Memory as immutable raw sources plus a revisioned cross-project wiki. Retrieval reports applicability, freshness, evidence lineage, conflicts, and a safe reuse route; multi-agent updates use revision compare-and-swap.",
+      "url": "https://bogyie.github.io/codebase-memory-mcp/",
+      "downloadUrl": "https://github.com/bogyie/codebase-memory-mcp/releases/latest",
+      "codeRepository": "https://github.com/bogyie/codebase-memory-mcp",
       "programmingLanguage": "C",
       "license": "https://opensource.org/licenses/MIT",
       "isAccessibleForFree": true,
@@ -57,6 +57,9 @@
         "Indexes 158 programming languages via vendored tree-sitter grammars",
         "Hybrid LSP semantic type resolution for Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, and Rust",
         "22 MCP tools for structural search, call-path tracing, Cypher graph queries, and Global Memory",
+        "Global Memory with immutable raw sources and a revisioned cross-project wiki",
+        "Applicability-first retrieval with freshness, evidence, conflict, and route signals",
+        "Conflict-safe multi-agent proposals and revision compare-and-swap commits",
         "Semantic vector code search via bundled nomic-embed-code embeddings (no API key, fully local)",
         "Semantic graph edges (SEMANTICALLY_RELATED) and near-clone detection (SIMILAR_TO, MinHash + LSH)",
         "Cross-service linking for HTTP, gRPC, GraphQL, tRPC, and pub/sub channels with confidence scoring",
@@ -72,8 +75,8 @@
       ],
       "author": {
         "@type": "Organization",
-        "name": "DeusData",
-        "url": "https://github.com/DeusData"
+        "name": "Bogyie",
+        "url": "https://github.com/bogyie"
       },
       "citation": {
         "@type": "ScholarlyArticle",
@@ -91,23 +94,23 @@
       "@graph": [
         {
           "@type": "Organization",
-          "@id": "https://deusdata.github.io/codebase-memory-mcp/#org",
-          "name": "DeusData",
-          "url": "https://github.com/DeusData",
-          "sameAs": ["https://github.com/DeusData/codebase-memory-mcp"]
+          "@id": "https://bogyie.github.io/codebase-memory-mcp/#org",
+          "name": "Bogyie",
+          "url": "https://github.com/bogyie",
+          "sameAs": ["https://github.com/bogyie/codebase-memory-mcp"]
         },
         {
           "@type": "WebSite",
-          "@id": "https://deusdata.github.io/codebase-memory-mcp/#website",
-          "url": "https://deusdata.github.io/codebase-memory-mcp/",
+          "@id": "https://bogyie.github.io/codebase-memory-mcp/#website",
+          "url": "https://bogyie.github.io/codebase-memory-mcp/",
           "name": "codebase-memory-mcp",
-          "publisher": { "@id": "https://deusdata.github.io/codebase-memory-mcp/#org" }
+          "publisher": { "@id": "https://bogyie.github.io/codebase-memory-mcp/#org" }
         },
         {
           "@type": "BreadcrumbList",
           "itemListElement": [
-            { "@type": "ListItem", "position": 1, "name": "Home", "item": "https://deusdata.github.io/codebase-memory-mcp/" },
-            { "@type": "ListItem", "position": 2, "name": "GitHub", "item": "https://github.com/DeusData/codebase-memory-mcp" }
+            { "@type": "ListItem", "position": 1, "name": "Home", "item": "https://bogyie.github.io/codebase-memory-mcp/" },
+            { "@type": "ListItem", "position": 2, "name": "GitHub", "item": "https://github.com/bogyie/codebase-memory-mcp" }
           ]
         }
       ]
@@ -134,6 +137,14 @@
           "acceptedAnswer": {
             "@type": "Answer",
             "text": "AI agents normally explore code through repeated grep-then-read cycles, which burn large numbers of tokens. codebase-memory-mcp answers the same structural questions from a precomputed graph. In a five-query benchmark it used about 3,400 tokens versus about 412,000 tokens for file-by-file search — a roughly 120x reduction."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How does Global Memory avoid reusing stale or biased knowledge?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Global Memory keeps immutable source provenance and revisioned claims with applicability, validity periods, volatility, review deadlines, and source supersession. Retrieval reports evidence and conflicts and chooses a route such as reuse, verify, experiment, deliberate, or abstain. It does not blindly trust frequently retrieved memory or require an opposing view for every query."
           }
         },
         {
@@ -377,6 +388,46 @@
         .feature h3 { font-size: 1rem; margin: 0 0 8px; }
         .feature p { font-size: 0.875rem; color: var(--text-secondary); }
 
+        /* Global Memory lifecycle */
+        .memory-flow {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 12px;
+            margin: 24px 0;
+        }
+        .memory-step {
+            position: relative;
+            background: linear-gradient(145deg, rgba(88,166,255,0.08), var(--surface));
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px;
+            min-height: 132px;
+        }
+        .memory-step .step-number {
+            display: block;
+            color: var(--accent);
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 0.72rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+        .memory-step strong { display: block; font-size: 0.92rem; margin-bottom: 6px; }
+        .memory-step p { color: var(--text-secondary); font-size: 0.78rem; line-height: 1.45; }
+        .memory-guardrails {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 16px;
+            margin: 20px 0;
+        }
+        .memory-guardrail {
+            border-left: 3px solid var(--green);
+            background: var(--surface);
+            border-radius: 8px;
+            padding: 16px 18px;
+        }
+        .memory-guardrail strong { display: block; font-size: 0.9rem; margin-bottom: 5px; }
+        .memory-guardrail p { color: var(--text-secondary); font-size: 0.82rem; }
+
         /* Hybrid LSP table */
         .lsp-table td:first-child { font-weight: 600; white-space: nowrap; }
         .lsp-table td { vertical-align: top; }
@@ -417,6 +468,9 @@
         @media (max-width: 640px) {
             .hero h1 { font-size: 1.75rem; }
             .hero .stat { display: block; margin: 8px 0; }
+            .memory-flow, .memory-guardrails { grid-template-columns: 1fr; }
+            table { display: block; max-width: 100%; overflow-x: auto; }
+            .lsp-table td:first-child { white-space: normal; }
         }
     </style>
 </head>
@@ -426,12 +480,13 @@
     <div class="container">
         <span class="links">
             <a href="#what-is-it">What is it</a>
+            <a href="#global-memory">Global Memory</a>
             <a href="#install">Install</a>
             <a href="#hybrid-lsp">Hybrid LSP</a>
             <a href="#semantic-search">Semantic search</a>
             <a href="#releases">Releases</a>
             <a href="#faq">FAQ</a>
-            <a class="nav-cta nav-star" href="https://github.com/DeusData/codebase-memory-mcp" title="Star codebase-memory-mcp on GitHub" aria-label="Star this project on GitHub">★ Star on GitHub</a>
+            <a class="nav-cta nav-star" href="https://github.com/bogyie/codebase-memory-mcp" title="Star codebase-memory-mcp on GitHub" aria-label="Star this project on GitHub">★ Star on GitHub</a>
         </span>
     </div>
 </nav>
@@ -439,11 +494,12 @@
 <main class="container">
     <header class="hero">
         <h1>codebase-memory-mcp</h1>
-        <p class="by-line">by DeusData</p>
+        <p class="by-line">Bogyie fork · based on the DeusData project</p>
         <p class="tagline">
             The fastest, most efficient code intelligence engine for AI coding agents. It indexes any
             repository into a persistent knowledge graph — full-indexing an average repo in seconds and the
             Linux kernel in 3 minutes — so your agent answers structural questions with ~120x fewer tokens.
+            Global Memory carries evidence-backed knowledge safely across repositories and agent sessions.
             Tree-sitter parsing across 158 languages, Hybrid LSP type resolution, single static C binary.
         </p>
         <div>
@@ -453,8 +509,8 @@
             <div class="stat"><div class="number">11</div><div class="label">agents supported</div></div>
         </div>
         <div class="cta-buttons">
-            <a href="https://github.com/DeusData/codebase-memory-mcp" class="cta-primary">View on GitHub</a>
-            <a href="https://github.com/DeusData/codebase-memory-mcp/releases/latest" class="cta-secondary">Download latest release</a>
+            <a href="https://github.com/bogyie/codebase-memory-mcp" class="cta-primary">View on GitHub</a>
+            <a href="https://github.com/bogyie/codebase-memory-mcp/releases/latest" class="cta-secondary">Download latest release</a>
         </div>
     </header>
 
@@ -492,6 +548,43 @@
         </p>
     </section>
 
+    <section id="global-memory">
+        <h2>What is Global Memory?</h2>
+        <p class="lead">
+            Repository graphs explain the code in front of an agent. Global Memory preserves knowledge that
+            should survive repository boundaries: immutable raw sources, curated wiki pages, facts, decisions,
+            experiences, preferences, and symbolic code references. It stays local to the user unless an
+            explicit export or Git synchronization is requested.
+        </p>
+
+        <div class="memory-flow" aria-label="Global Memory lifecycle">
+            <div class="memory-step"><span class="step-number">01</span><strong>Ingest source</strong><p>Content-addressed raw bytes retain origin, publisher, time, and revision lineage.</p></div>
+            <div class="memory-step"><span class="step-number">02</span><strong>Curate wiki</strong><p>Claims and pages are proposed with scope, evidence, volatility, and review dates.</p></div>
+            <div class="memory-step"><span class="step-number">03</span><strong>Retrieve in context</strong><p>The current project, task impact, and freshness requirement are compared with recorded applicability.</p></div>
+            <div class="memory-step"><span class="step-number">04</span><strong>Choose a route</strong><p>Results recommend reuse, verify, experiment, deliberate, or abstain instead of forcing a match.</p></div>
+            <div class="memory-step"><span class="step-number">05</span><strong>Review and revise</strong><p>Lint, source revisions, changed code references, and review deadlines surface knowledge that may be stale.</p></div>
+        </div>
+
+        <div class="memory-guardrails">
+            <div class="memory-guardrail"><strong>Bias-aware, not contrarian by default</strong><p>Relevance never becomes truth weight. Verification effort follows applicability, evidence quality, impact, reversibility, and detected conflict—not a static demand to find an opposing view.</p></div>
+            <div class="memory-guardrail"><strong>Time-aware facts</strong><p>Bitemporal revisions, volatility, review deadlines, source supersession, and dirty CodeRefs route questionable facts to verification rather than silent reuse.</p></div>
+            <div class="memory-guardrail"><strong>Safe multi-agent writes</strong><p>Agents reason outside transactions, then use revision-aware proposals and idempotent compare-and-swap commits. Same-entity conflicts are rejected; last-write-wins is forbidden.</p></div>
+        </div>
+
+        <div class="install-block">
+            <span class="comment"># Query only when prior cross-project knowledge is materially relevant.</span><br>
+            <span class="cmd">memory_query(query="SQLite write concurrency", current_context={"project":"my-project"}, impact="high", freshness="require_current")</span><br><br>
+            <span class="comment"># Inspect graph relationships without selecting a repository.</span><br>
+            <span class="cmd">query_graph(graph="memory", query="MATCH (c:Claim) RETURN c.name LIMIT 5")</span>
+        </div>
+        <p class="muted">
+            The UI build includes a read-only Memory workspace for retrieval routes and lint results. Durable
+            changes remain an explicit <code>memory_propose</code> → <code>memory_commit</code> workflow.
+            See the <a href="https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/GLOBAL_MEMORY_GUIDE.md">usage guide</a>
+            and <a href="https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/GLOBAL_MEMORY.md">architecture contract</a>.
+        </p>
+    </section>
+
     <section id="problem">
         <h2>Why do AI agents waste tokens exploring code?</h2>
         <p class="lead">
@@ -509,7 +602,7 @@
             (less noise means better answers and no "lost in the middle" problem).
         </p>
         <p><cite>Source: project benchmark, 5 structural queries — see the
-            <a href="https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md">full benchmark report</a>.</cite></p>
+            <a href="https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/BENCHMARK.md">full benchmark report</a>.</cite></p>
     </section>
 
     <section id="install">
@@ -520,7 +613,7 @@
         </p>
         <div class="install-block">
             <span class="comment"># 1. One-line install (macOS / Linux). Add --ui for the 3D graph UI.</span><br>
-            <span class="cmd">curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash</span><br><br>
+            <span class="cmd">curl -fsSL https://raw.githubusercontent.com/bogyie/codebase-memory-mcp/main/install.sh | bash</span><br><br>
             <span class="comment"># 2. The installer auto-detects and configures every installed agent.</span><br><br>
             <span class="comment"># 3. Restart your agent, then say:</span><br>
             <span class="cmd">"Index this project"</span>
@@ -633,7 +726,7 @@
         </p>
         <p><cite>Source: <a href="https://arxiv.org/abs/2603.27277">“Codebase-Memory: Tree-Sitter-Based Knowledge
             Graphs for LLM Code Exploration via MCP”</a>, arXiv:2603.27277 — and the
-            <a href="https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md">project benchmark report</a>.</cite></p>
+            <a href="https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/BENCHMARK.md">project benchmark report</a>.</cite></p>
     </section>
 
     <section id="performance">
@@ -746,7 +839,7 @@
             <p class="skeleton">Loading recent releases from GitHub…</p>
         </div>
         <p style="margin-top: 16px;">
-            <a href="https://github.com/DeusData/codebase-memory-mcp/releases">View all releases on GitHub →</a>
+            <a href="https://github.com/bogyie/codebase-memory-mcp/releases">View all releases on GitHub →</a>
         </p>
     </section>
 
@@ -756,6 +849,13 @@
         <h3>Does codebase-memory-mcp send my code anywhere?</h3>
         <p>No. All indexing and querying happen 100% locally. There is no embedded LLM and no API key. Release
            binaries are signed, checksummed, and scanned by 70+ antivirus engines.</p>
+
+        <h3>How does Global Memory avoid reusing stale or biased knowledge?</h3>
+        <p>It keeps immutable source provenance and revisioned knowledge with applicability, validity periods,
+           volatility, review deadlines, and source supersession. Retrieval exposes evidence and conflicts and returns a
+           route such as <code>reuse</code>, <code>verify</code>, <code>experiment</code>, <code>deliberate</code>,
+           or <code>abstain</code>. Retrieval frequency is never treated as truth weight, and an opposing view is
+           not required when the current evidence is already strong and applicable.</p>
 
         <h3>Does it support semantic or natural-language code search?</h3>
         <p>Yes. Alongside structural and full-text search, <code>search_graph</code>'s <code>semantic_query</code>
@@ -780,7 +880,7 @@
 
         <h3>Is it free and open source?</h3>
         <p>Yes. It is MIT licensed. The full source, signed release binaries, and checksums are on
-           <a href="https://github.com/DeusData/codebase-memory-mcp">GitHub</a>.</p>
+           <a href="https://github.com/bogyie/codebase-memory-mcp">GitHub</a>.</p>
     </section>
 </main>
 
@@ -788,9 +888,9 @@
     <div class="container">
         <p>
             Open source, MIT licensed.
-            <a href="https://github.com/DeusData/codebase-memory-mcp">GitHub</a> &middot;
-            <a href="https://github.com/DeusData/codebase-memory-mcp/releases/latest">Releases</a> &middot;
-            <a href="https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md">Benchmarks</a> &middot;
+            <a href="https://github.com/bogyie/codebase-memory-mcp">GitHub</a> &middot;
+            <a href="https://github.com/bogyie/codebase-memory-mcp/releases/latest">Releases</a> &middot;
+            <a href="https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/BENCHMARK.md">Benchmarks</a> &middot;
             <a href="https://arxiv.org/abs/2603.27277">Paper</a>
         </p>
     </div>
@@ -798,7 +898,7 @@
 
 <script>
     (function () {
-        var REPO = 'DeusData/codebase-memory-mcp';
+        var REPO = 'bogyie/codebase-memory-mcp';
         var listEl = document.getElementById('releases-list');
         if (!listEl) return;
 

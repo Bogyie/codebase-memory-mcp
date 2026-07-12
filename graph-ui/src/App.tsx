@@ -2,10 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import { GraphTab } from "./components/GraphTab";
 import { StatsTab } from "./components/StatsTab";
 import { ControlTab } from "./components/ControlTab";
+import { MemoryTab } from "./components/MemoryTab";
 import type { TabId } from "./lib/types";
 import { useUiMessages } from "./lib/i18n";
 
-const TAB_IDS: TabId[] = ["graph", "stats", "control"];
+const TAB_IDS: TabId[] = ["graph", "stats", "memory", "control"];
 
 interface RouteState {
   tab: TabId;
@@ -60,6 +61,7 @@ export function App() {
   const tabs: { id: TabId; label: string }[] = [
     { id: "graph", label: t.tabs.graph },
     { id: "stats", label: t.tabs.projects },
+    { id: "memory", label: t.tabs.memory },
     { id: "control", label: t.tabs.control },
   ];
 
@@ -103,7 +105,7 @@ export function App() {
         {selectedProject && (
           <div className="flex items-center gap-2 px-3 py-1 rounded-lg bg-white/[0.04] border border-border/30">
             <span className="text-[10px] text-foreground/30 uppercase tracking-wider">
-              {t.graph.selectedLabel}
+              {activeTab === "memory" ? t.memory.contextLabel : t.graph.selectedLabel}
             </span>
             <span className="text-[11px] text-primary font-mono truncate max-w-[300px]">
               {selectedProject}
@@ -122,6 +124,8 @@ export function App() {
       <main className="flex-1 min-h-0">
         {activeTab === "graph" ? (
           <GraphTab project={selectedProject} />
+        ) : activeTab === "memory" ? (
+          <MemoryTab projectContext={selectedProject} />
         ) : activeTab === "control" ? (
           <ControlTab />
         ) : (
