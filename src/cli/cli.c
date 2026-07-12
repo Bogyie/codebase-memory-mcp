@@ -69,8 +69,13 @@ enum {
 // the correct standard headers are included below but clang-tidy doesn't map them.
 #include <ctype.h>
 #ifndef _WIN32
+#include <dirent.h>
 #include <signal.h>
 #include <unistd.h>
+#else
+#include "foundation/win_utf8.h"
+#include <io.h>
+#include <windows.h>
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -665,55 +670,258 @@ static int mkdirp(const char *path, int mode) {
 
 /* ── Recursive rmdir ──────────────────────────────────────────── */
 
-enum { RMDIR_STACK_CAP = CBM_SZ_256 };
+/* Skill removal is destructive, so it must never follow a symlink/junction.
+ * The old breadth-first walker used stat() (which follows links), silently
+ * stopped after 256 directories, and truncated every path to 1 KiB. A skill
+ * directory replaced with a link could therefore erase an unrelated tree.
+ *
+ * POSIX walks relative to already-open directory descriptors. O_NOFOLLOW and
+ * AT_SYMLINK_NOFOLLOW keep each lookup anchored even if another process swaps
+ * a name while removal is in progress. Windows directory enumeration exposes
+ * reparse attributes; those entries are removed as links and never entered. */
+enum { RMDIR_MAX_DEPTH = 128 };
 
-/* Scan one directory: push subdirs onto stack, unlink files. */
-static void rmdir_scan_dir(const char *cur, char stack[][CLI_BUF_1K], int *top) {
-    cbm_dir_t *d = cbm_opendir(cur);
-    if (!d) {
-        return;
+typedef enum {
+    CLI_PATH_MISSING = 0,
+    CLI_PATH_FILE,
+    CLI_PATH_DIRECTORY,
+    CLI_PATH_REPARSE,
+    CLI_PATH_ERROR,
+} cli_path_kind_t;
+
+static cli_path_kind_t cli_path_kind_nofollow(const char *path) {
+    if (!path || !path[0]) {
+        return CLI_PATH_ERROR;
     }
-    cbm_dirent_t *ent;
-    while ((ent = cbm_readdir(d)) != NULL) {
-        char child[CLI_BUF_1K];
-        snprintf(child, sizeof(child), "%s/%s", cur, ent->name);
-        struct stat st;
-        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
-            if (*top < RMDIR_STACK_CAP) {
-                snprintf(stack[(*top)++], CLI_BUF_1K, "%s", child);
-            }
-        } else {
-            cbm_unlink(child);
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return CLI_PATH_ERROR;
+    }
+    DWORD attrs = GetFileAttributesW(wide);
+    DWORD saved = GetLastError();
+    free(wide);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return saved == ERROR_FILE_NOT_FOUND || saved == ERROR_PATH_NOT_FOUND
+                   ? CLI_PATH_MISSING
+                   : CLI_PATH_ERROR;
+    }
+    if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        return CLI_PATH_REPARSE;
+    }
+    return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 ? CLI_PATH_DIRECTORY : CLI_PATH_FILE;
+#else
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        return errno == ENOENT ? CLI_PATH_MISSING : CLI_PATH_ERROR;
+    }
+    if (S_ISLNK(st.st_mode)) {
+        return CLI_PATH_REPARSE;
+    }
+    return S_ISDIR(st.st_mode) ? CLI_PATH_DIRECTORY : CLI_PATH_FILE;
+#endif
+}
+
+static int write_skill_file(const char *skill_path, const char *content) {
+    if (!skill_path || !content) {
+        return CLI_ERR;
+    }
+#ifndef _WIN32
+    int dir_fd = open(skill_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir_fd < 0) {
+        return CLI_ERR;
+    }
+    int fd = openat(dir_fd, "SKILL.md",
+                    O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0640);
+    close(dir_fd);
+    if (fd < 0) {
+        return CLI_ERR;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return CLI_ERR;
+    }
+    FILE *file = fdopen(fd, "wb");
+    if (!file) {
+        close(fd);
+        return CLI_ERR;
+    }
+#else
+    size_t base_len = strlen(skill_path);
+    static const char suffix[] = "/SKILL.md";
+    if (base_len > SIZE_MAX - sizeof(suffix)) {
+        return CLI_ERR;
+    }
+    char *file_path = malloc(base_len + sizeof(suffix));
+    if (!file_path) {
+        return CLI_ERR;
+    }
+    memcpy(file_path, skill_path, base_len);
+    memcpy(file_path + base_len, suffix, sizeof(suffix));
+    wchar_t *wide = cbm_utf8_to_wide(file_path);
+    free(file_path);
+    if (!wide) {
+        return CLI_ERR;
+    }
+    HANDLE handle = CreateFileW(wide, GENERIC_WRITE, 0, NULL, OPEN_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    free(wide);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return CLI_ERR;
+    }
+    FILE_ATTRIBUTE_TAG_INFO tag = {0};
+    if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag)) ||
+        (tag.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
+        CloseHandle(handle);
+        return CLI_ERR;
+    }
+    LARGE_INTEGER zero = {0};
+    if (!SetFilePointerEx(handle, zero, NULL, FILE_BEGIN) || !SetEndOfFile(handle)) {
+        CloseHandle(handle);
+        return CLI_ERR;
+    }
+    int fd = _open_osfhandle((intptr_t)handle, _O_WRONLY | _O_BINARY);
+    if (fd < 0) {
+        CloseHandle(handle);
+        return CLI_ERR;
+    }
+    FILE *file = _fdopen(fd, "wb");
+    if (!file) {
+        _close(fd);
+        return CLI_ERR;
+    }
+#endif
+    size_t length = strlen(content);
+    bool ok = fwrite(content, CLI_ELEM_SIZE, length, file) == length;
+    if (fclose(file) != 0) {
+        ok = false;
+    }
+    return ok ? CLI_OK : CLI_ERR;
+}
+
+#ifndef _WIN32
+static int rmdir_fd_contents(int dir_fd, int depth) {
+    if (dir_fd < 0 || depth > RMDIR_MAX_DEPTH) {
+        return CLI_ERR;
+    }
+    int scan_fd = dup(dir_fd);
+    if (scan_fd < 0) {
+        return CLI_ERR;
+    }
+    DIR *dir = fdopendir(scan_fd);
+    if (!dir) {
+        close(scan_fd);
+        return CLI_ERR;
+    }
+
+    int rc = CLI_OK;
+    errno = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        if (name[0] == '.' &&
+            (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) {
+            continue;
         }
+        struct stat st;
+        if (fstatat(dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            rc = CLI_ERR;
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            int child_fd = openat(dir_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (child_fd < 0) {
+                rc = CLI_ERR;
+                continue;
+            }
+            int child_rc = rmdir_fd_contents(child_fd, depth + CLI_SKIP_ONE);
+            close(child_fd);
+            if (child_rc != CLI_OK || unlinkat(dir_fd, name, AT_REMOVEDIR) != 0) {
+                rc = CLI_ERR;
+            }
+        } else if (unlinkat(dir_fd, name, 0) != 0) {
+            rc = CLI_ERR;
+        }
+        errno = 0;
     }
-    cbm_closedir(d);
+    if (errno != 0) {
+        rc = CLI_ERR;
+    }
+    closedir(dir);
+    return rc;
 }
 
 static int rmdir_recursive(const char *path) {
-    char stack[RMDIR_STACK_CAP][CLI_BUF_1K];
-    int top = 0;
-    snprintf(stack[top++], CLI_BUF_1K, "%s", path);
-
-    /* Post-order: collect all dirs depth-first, then rmdir in reverse. */
-    char dirs[RMDIR_STACK_CAP][CLI_BUF_1K];
-    int dir_count = 0;
-
-    while (top > 0) {
-        char *cur = stack[--top];
-        if (dir_count < RMDIR_STACK_CAP) {
-            snprintf(dirs[dir_count++], CLI_BUF_1K, "%s", cur);
-        }
-        rmdir_scan_dir(cur, stack, &top);
+    if (!path || !path[0]) {
+        return CLI_ERR;
     }
-    /* Remove dirs in reverse (deepest first). */
-    int rc = 0;
-    for (int i = dir_count - CLI_SKIP_ONE; i >= 0; i--) {
-        if (cbm_rmdir(dirs[i]) != 0) {
-            rc = CBM_NOT_FOUND;
-        }
+    int root_fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (root_fd < 0) {
+        return CLI_ERR;
     }
+    int rc = rmdir_fd_contents(root_fd, 0);
+    close(root_fd);
+    if (rc != CLI_OK || cbm_rmdir(path) != 0) {
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+#else
+static int rmdir_windows_contents(const char *path, int depth) {
+    if (!path || !path[0] || depth > RMDIR_MAX_DEPTH || cbm_path_is_reparse_point(path)) {
+        return CLI_ERR;
+    }
+    cbm_dir_t *dir = cbm_opendir(path);
+    if (!dir) {
+        return CLI_ERR;
+    }
+    int rc = CLI_OK;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        size_t path_len = strlen(path);
+        size_t name_len = strlen(entry->name);
+        if (path_len > SIZE_MAX - name_len - CLI_PAIR_LEN) {
+            rc = CLI_ERR;
+            continue;
+        }
+        char *child = malloc(path_len + name_len + CLI_PAIR_LEN);
+        if (!child) {
+            rc = CLI_ERR;
+            continue;
+        }
+        memcpy(child, path, path_len);
+        child[path_len] = '/';
+        memcpy(child + path_len + CLI_SKIP_ONE, entry->name, name_len + CLI_SKIP_ONE);
+        if (entry->is_reparse || cbm_path_is_reparse_point(child)) {
+            int unlink_rc = entry->is_dir ? cbm_rmdir(child) : cbm_unlink(child);
+            if (unlink_rc != 0) {
+                rc = CLI_ERR;
+            }
+        } else if (entry->is_dir) {
+            if (rmdir_windows_contents(child, depth + CLI_SKIP_ONE) != CLI_OK ||
+                cbm_rmdir(child) != 0) {
+                rc = CLI_ERR;
+            }
+        } else if (cbm_unlink(child) != 0) {
+            rc = CLI_ERR;
+        }
+        free(child);
+    }
+    if (cbm_dir_had_error(dir)) {
+        rc = CLI_ERR;
+    }
+    cbm_closedir(dir);
     return rc;
 }
+
+static int rmdir_recursive(const char *path) {
+    if (rmdir_windows_contents(path, 0) != CLI_OK || cbm_rmdir(path) != 0) {
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+#endif
 
 /* ── Skill management ─────────────────────────────────────────── */
 
@@ -726,23 +934,35 @@ int cbm_install_skills(const char *skills_dir, bool force, bool dry_run) {
     /* Clean up old 4-skill directories (consolidated into 1). */
     for (int i = 0; i < OLD_SKILL_COUNT; i++) {
         char old_path[CLI_BUF_1K];
-        snprintf(old_path, sizeof(old_path), "%s/%s", skills_dir, old_skill_names[i]);
-        struct stat st;
-        if (stat(old_path, &st) == 0 && S_ISDIR(st.st_mode) && !dry_run) {
-            rmdir_recursive(old_path);
+        int old_n = snprintf(old_path, sizeof(old_path), "%s/%s", skills_dir, old_skill_names[i]);
+        if (old_n > 0 && old_n < (int)sizeof(old_path) &&
+            cli_path_kind_nofollow(old_path) == CLI_PATH_DIRECTORY && !dry_run) {
+            (void)rmdir_recursive(old_path);
         }
     }
 
     for (int i = 0; i < CBM_SKILL_COUNT; i++) {
         char skill_path[CLI_BUF_1K];
-        snprintf(skill_path, sizeof(skill_path), "%s/%s", skills_dir, skills[i].name);
+        int skill_n = snprintf(skill_path, sizeof(skill_path), "%s/%s", skills_dir, skills[i].name);
+        if (skill_n <= 0 || skill_n >= (int)sizeof(skill_path)) {
+            continue;
+        }
         char file_path[CLI_BUF_1K];
-        snprintf(file_path, sizeof(file_path), "%s/SKILL.md", skill_path);
+        int file_n = snprintf(file_path, sizeof(file_path), "%s/SKILL.md", skill_path);
+        if (file_n <= 0 || file_n >= (int)sizeof(file_path)) {
+            continue;
+        }
+
+        cli_path_kind_t skill_kind = cli_path_kind_nofollow(skill_path);
+        if (skill_kind == CLI_PATH_REPARSE || skill_kind == CLI_PATH_FILE ||
+            skill_kind == CLI_PATH_ERROR) {
+            continue;
+        }
 
         /* Check if already exists */
         if (!force) {
-            struct stat st;
-            if (stat(file_path, &st) == 0) {
+            cli_path_kind_t file_kind = cli_path_kind_nofollow(file_path);
+            if (file_kind != CLI_PATH_MISSING) {
                 continue;
             }
         }
@@ -755,13 +975,10 @@ int cbm_install_skills(const char *skills_dir, bool force, bool dry_run) {
         if (mkdirp(skill_path, DIR_PERMS) != 0) {
             continue;
         }
-
-        FILE *f = fopen(file_path, "w");
-        if (!f) {
+        if (cli_path_kind_nofollow(skill_path) != CLI_PATH_DIRECTORY ||
+            write_skill_file(skill_path, skills[i].content) != CLI_OK) {
             continue;
         }
-        (void)fwrite(skills[i].content, CLI_ELEM_SIZE, strlen(skills[i].content), f);
-        (void)fclose(f);
         count++;
     }
     return count;
@@ -775,9 +992,13 @@ int cbm_remove_skills(const char *skills_dir, bool dry_run) {
 
     for (int i = 0; i < CBM_SKILL_COUNT; i++) {
         char skill_path[CLI_BUF_1K];
-        snprintf(skill_path, sizeof(skill_path), "%s/%s", skills_dir, skills[i].name);
-        struct stat st;
-        if (stat(skill_path, &st) != 0) {
+        int n = snprintf(skill_path, sizeof(skill_path), "%s/%s", skills_dir, skills[i].name);
+        if (n <= 0 || n >= (int)sizeof(skill_path)) {
+            continue;
+        }
+        cli_path_kind_t kind = cli_path_kind_nofollow(skill_path);
+        if (kind == CLI_PATH_MISSING || kind == CLI_PATH_ERROR || kind == CLI_PATH_REPARSE ||
+            kind == CLI_PATH_FILE) {
             continue;
         }
 
@@ -799,9 +1020,9 @@ bool cbm_remove_old_monolithic_skill(const char *skills_dir, bool dry_run) {
     }
 
     char old_path[CLI_BUF_1K];
-    snprintf(old_path, sizeof(old_path), "%s/codebase-memory-mcp", skills_dir);
-    struct stat st;
-    if (stat(old_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    int n = snprintf(old_path, sizeof(old_path), "%s/codebase-memory-mcp", skills_dir);
+    if (n <= 0 || n >= (int)sizeof(old_path) ||
+        cli_path_kind_nofollow(old_path) != CLI_PATH_DIRECTORY) {
         return false;
     }
 
@@ -2739,14 +2960,57 @@ unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_l
 
 static const char *get_cache_dir(const char *home_dir) {
     static char buf[CLI_BUF_1K];
-    if (!home_dir) {
-        home_dir = cbm_get_home_dir();
+    char override[CLI_BUF_1K] = "";
+    (void)cbm_safe_getenv("CBM_CACHE_DIR", override, sizeof(override), NULL);
+    const char *resolved = NULL;
+    if (override[0]) {
+        resolved = override;
+    } else if (home_dir && home_dir[0]) {
+        int n = snprintf(buf, sizeof(buf), "%s/.cache/codebase-memory-mcp", home_dir);
+        if (n <= 0 || n >= (int)sizeof(buf)) {
+            return NULL;
+        }
+        cbm_normalize_path_sep(buf);
+        return buf;
+    } else {
+        resolved = cbm_resolve_cache_dir();
     }
-    if (!home_dir) {
+    if (!resolved) {
         return NULL;
     }
-    snprintf(buf, sizeof(buf), "%s", cbm_resolve_cache_dir());
+    int n = snprintf(buf, sizeof(buf), "%s", resolved);
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        return NULL;
+    }
+    cbm_normalize_path_sep(buf);
     return buf;
+}
+
+static bool cli_is_project_db_file(const cbm_dirent_t *entry) {
+    if (!entry || entry->is_dir || !entry->name[0] || entry->name[0] == '_') {
+        return false;
+    }
+    size_t len = strlen(entry->name);
+    return len > DB_EXT_LEN && strcmp(entry->name + len - DB_EXT_LEN, ".db") == 0;
+}
+
+static char *cli_cache_entry_path(const char *cache_dir, const char *name) {
+    if (!cache_dir || !name) {
+        return NULL;
+    }
+    size_t dir_len = strlen(cache_dir);
+    size_t name_len = strlen(name);
+    if (dir_len > SIZE_MAX - name_len - CLI_PAIR_LEN) {
+        return NULL;
+    }
+    char *path = malloc(dir_len + name_len + CLI_PAIR_LEN);
+    if (!path) {
+        return NULL;
+    }
+    memcpy(path, cache_dir, dir_len);
+    path[dir_len] = '/';
+    memcpy(path + dir_len + CLI_SKIP_ONE, name, name_len + CLI_SKIP_ONE);
+    return path;
 }
 
 int cbm_list_indexes(const char *home_dir) {
@@ -2763,14 +3027,14 @@ int cbm_list_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (cli_is_project_db_file(ent)) {
             printf("  %s/%s\n", cache_dir, ent->name);
             count++;
         }
     }
+    bool failed = cbm_dir_had_error(d);
     cbm_closedir(d);
-    return count;
+    return failed ? CLI_ERR : count;
 }
 
 int cbm_remove_indexes(const char *home_dir) {
@@ -2787,21 +3051,32 @@ int cbm_remove_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
-            char path[CLI_BUF_1K];
-            snprintf(path, sizeof(path), "%s/%s", cache_dir, ent->name);
-            /* Also remove .db.tmp if present */
-            char tmp_path[CLI_FIELD_1040];
-            snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
-            cbm_unlink(tmp_path);
-            if (cbm_unlink(path) == 0) {
-                count++;
-            }
+        if (!cli_is_project_db_file(ent)) {
+            continue;
         }
+        char *path = cli_cache_entry_path(cache_dir, ent->name);
+        if (!path) {
+            cbm_closedir(d);
+            return CLI_ERR;
+        }
+        size_t path_len = strlen(path);
+        char *tmp_path = path_len <= SIZE_MAX - sizeof(".tmp") ? malloc(path_len + sizeof(".tmp"))
+                                                                : NULL;
+        if (tmp_path) {
+            memcpy(tmp_path, path, path_len);
+            memcpy(tmp_path + path_len, ".tmp", sizeof(".tmp"));
+            (void)cbm_unlink(tmp_path);
+            free(tmp_path);
+        }
+        if (cbm_unlink(path) == 0) {
+            cbm_remove_db_sidecars(path);
+            count++;
+        }
+        free(path);
     }
+    bool failed = cbm_dir_had_error(d);
     cbm_closedir(d);
-    return count;
+    return failed ? CLI_ERR : count;
 }
 
 /* ── Config store (persistent key-value in _config.db) ─────────── */
@@ -3799,13 +4074,13 @@ static int count_db_indexes(const char *home) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (cli_is_project_db_file(ent)) {
             count++;
         }
     }
+    bool failed = cbm_dir_had_error(d);
     cbm_closedir(d);
-    return count;
+    return failed ? CLI_ERR : count;
 }
 
 /* Handle pre-existing indexes during (re)install (#607).
@@ -3832,7 +4107,11 @@ static int count_db_indexes(const char *home) {
 int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_run);
 int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_run) {
     int index_count = count_db_indexes(home);
-    if (index_count <= 0) {
+    if (index_count < 0) {
+        (void)fprintf(stderr, "error: could not enumerate existing indexes; install cancelled\n");
+        return 0;
+    }
+    if (index_count == 0) {
         return 1; /* nothing to handle, proceed */
     }
 
@@ -3856,6 +4135,10 @@ int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_r
     }
     if (!dry_run) {
         int removed = cbm_remove_indexes(home);
+        if (removed < 0) {
+            (void)fprintf(stderr, "error: index removal was incomplete; install cancelled\n");
+            return 0;
+        }
         printf("Removed %d index(es).\n\n", removed);
     }
     return 1; /* proceed */
@@ -4447,12 +4730,18 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 
     /* Step 2: Remove indexes */
     int index_count = count_db_indexes(home);
-    if (index_count > 0) {
+    if (index_count < 0) {
+        (void)fprintf(stderr, "warning: could not enumerate indexes; indexes kept\n");
+    } else if (index_count > 0) {
         printf("\nFound %d index(es):\n", index_count);
         cbm_list_indexes(home);
         if (prompt_yn("Delete these indexes?")) {
             int idx_removed = cbm_remove_indexes(home);
-            printf("Removed %d index(es).\n", idx_removed);
+            if (idx_removed < 0) {
+                (void)fprintf(stderr, "error: index removal was incomplete\n");
+            } else {
+                printf("Removed %d index(es).\n", idx_removed);
+            }
         } else {
             printf("Indexes kept.\n");
         }
@@ -4558,6 +4847,10 @@ static void build_update_url(char *url, int url_sz, const char *os, const char *
 /* Prompt to delete existing indexes. Returns 0 to continue, 1 to abort. */
 static int update_clear_indexes(const char *home, bool dry_run) {
     int index_count = count_db_indexes(home);
+    if (index_count < 0) {
+        (void)fprintf(stderr, "error: could not enumerate existing indexes\n");
+        return CLI_TRUE;
+    }
     if (index_count == 0) {
         return 0;
     }
@@ -4573,6 +4866,10 @@ static int update_clear_indexes(const char *home, bool dry_run) {
         return CLI_TRUE;
     }
     int removed = cbm_remove_indexes(home);
+    if (removed < 0) {
+        (void)fprintf(stderr, "error: index removal was incomplete; update cancelled\n");
+        return CLI_TRUE;
+    }
     printf("Removed %d index(es).\n\n", removed);
     return 0;
 }

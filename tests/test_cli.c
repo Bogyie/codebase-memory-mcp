@@ -572,6 +572,93 @@ TEST(cli_uninstall_removes_skills) {
     PASS();
 }
 
+TEST(cli_skill_removal_does_not_follow_symlink) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink fixture; Windows reparse handling is covered statically");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-skill-link-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char skills_dir[512];
+    char outside_dir[512];
+    char outside_file[768];
+    char skill_link[768];
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", tmpdir);
+    snprintf(outside_dir, sizeof(outside_dir), "%s/outside", tmpdir);
+    snprintf(outside_file, sizeof(outside_file), "%s/must-survive.txt", outside_dir);
+    snprintf(skill_link, sizeof(skill_link), "%s/codebase-memory", skills_dir);
+    ASSERT_EQ(test_mkdirp(skills_dir), 0);
+    ASSERT_EQ(test_mkdirp(outside_dir), 0);
+    write_test_file(outside_file, "must survive");
+    ASSERT_EQ(symlink(outside_dir, skill_link), 0);
+
+    ASSERT_EQ(cbm_remove_skills(skills_dir, false), 0);
+    ASSERT_STR_EQ(read_test_file(outside_file), "must survive");
+    struct stat link_st;
+    ASSERT_EQ(lstat(skill_link, &link_st), 0);
+    ASSERT_TRUE(S_ISLNK(link_st.st_mode));
+
+    test_rmdir_r(tmpdir);
+    PASS();
+#endif
+}
+
+TEST(cli_skill_force_refuses_symlink_destination) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink fixture; Windows reparse handling is covered statically");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-skill-file-link-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char skills_dir[512];
+    char skill_dir[768];
+    char skill_file[896];
+    char outside_file[768];
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", tmpdir);
+    snprintf(skill_dir, sizeof(skill_dir), "%s/codebase-memory", skills_dir);
+    snprintf(skill_file, sizeof(skill_file), "%s/SKILL.md", skill_dir);
+    snprintf(outside_file, sizeof(outside_file), "%s/must-survive.md", tmpdir);
+    ASSERT_EQ(test_mkdirp(skill_dir), 0);
+    write_test_file(outside_file, "user-owned content");
+    ASSERT_EQ(symlink(outside_file, skill_file), 0);
+
+    ASSERT_EQ(cbm_install_skills(skills_dir, true, false), 0);
+    ASSERT_STR_EQ(read_test_file(outside_file), "user-owned content");
+
+    test_rmdir_r(tmpdir);
+    PASS();
+#endif
+}
+
+TEST(cli_skill_removal_handles_more_than_256_directories) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-skill-wide-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char skills_dir[512];
+    char skill_dir[768];
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", tmpdir);
+    snprintf(skill_dir, sizeof(skill_dir), "%s/codebase-memory", skills_dir);
+    ASSERT_EQ(test_mkdirp(skill_dir), 0);
+    for (int i = 0; i < 300; i++) {
+        char child[896];
+        char file[1024];
+        snprintf(child, sizeof(child), "%s/d-%03d", skill_dir, i);
+        ASSERT_EQ(test_mkdirp(child), 0);
+        snprintf(file, sizeof(file), "%s/value", child);
+        write_test_file(file, "x");
+    }
+
+    ASSERT_EQ(cbm_remove_skills(skills_dir, false), CBM_SKILL_COUNT);
+    struct stat st;
+    ASSERT_NEQ(stat(skill_dir, &st), 0);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_remove_old_monolithic_skill) {
     /* Port of TestRemoveOldMonolithicSkill */
     char tmpdir[256];
@@ -1723,6 +1810,65 @@ TEST(cli_install_and_uninstall) {
     }
 
     test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_index_management_uses_explicit_home_and_preserves_internal_dbs) {
+    const char *prior_env = getenv("CBM_CACHE_DIR");
+    char *saved_env = prior_env ? strdup(prior_env) : NULL;
+    (void)cbm_unsetenv("CBM_CACHE_DIR");
+
+    char home[256];
+    snprintf(home, sizeof(home), "/tmp/cli-index-home-XXXXXX");
+    bool setup_ok = cbm_mkdtemp(home) != NULL;
+    char cache[512];
+    char project[640];
+    char wal[648];
+    char shm[648];
+    char config[640];
+    char memory[640];
+    snprintf(cache, sizeof(cache), "%s/.cache/codebase-memory-mcp", home);
+    snprintf(project, sizeof(project), "%s/project.db", cache);
+    snprintf(wal, sizeof(wal), "%s-wal", project);
+    snprintf(shm, sizeof(shm), "%s-shm", project);
+    snprintf(config, sizeof(config), "%s/_config.db", cache);
+    snprintf(memory, sizeof(memory), "%s/_global_memory.db", cache);
+    if (setup_ok) {
+        setup_ok = test_mkdirp(cache) == 0;
+    }
+    if (setup_ok) {
+        write_test_file(project, "project");
+        write_test_file(wal, "wal");
+        write_test_file(shm, "shm");
+        write_test_file(config, "settings");
+        write_test_file(memory, "memory");
+    }
+
+    int listed = setup_ok ? cbm_list_indexes(home) : -99;
+    int removed = setup_ok ? cbm_remove_indexes(home) : -99;
+    struct stat st;
+    bool project_removed = stat(project, &st) != 0;
+    bool wal_removed = stat(wal, &st) != 0;
+    bool shm_removed = stat(shm, &st) != 0;
+    bool config_preserved = stat(config, &st) == 0;
+    bool memory_preserved = stat(memory, &st) == 0;
+
+    if (saved_env) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_env, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_env);
+    test_rmdir_r(home);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_EQ(listed, 1);
+    ASSERT_EQ(removed, 1);
+    ASSERT_TRUE(project_removed);
+    ASSERT_TRUE(wal_removed);
+    ASSERT_TRUE(shm_removed);
+    ASSERT_TRUE(config_preserved);
+    ASSERT_TRUE(memory_preserved);
     PASS();
 }
 
@@ -3385,11 +3531,14 @@ SUITE(cli) {
     /* Dry-run flag parsing (1 test — install_test.go) */
     RUN_TEST(cli_dry_run_flags);
 
-    /* Skill management (7 tests — install_test.go) */
+    /* Skill management */
     RUN_TEST(cli_skill_creation);
     RUN_TEST(cli_skill_idempotent);
     RUN_TEST(cli_skill_force_overwrite);
     RUN_TEST(cli_uninstall_removes_skills);
+    RUN_TEST(cli_skill_removal_does_not_follow_symlink);
+    RUN_TEST(cli_skill_force_refuses_symlink_destination);
+    RUN_TEST(cli_skill_removal_handles_more_than_256_directories);
     RUN_TEST(cli_remove_old_monolithic_skill);
     RUN_TEST(cli_skill_files_content);
     RUN_TEST(cli_codex_instructions);
@@ -3441,6 +3590,7 @@ SUITE(cli) {
 
     /* Full lifecycle (1 test — cli_test.go) */
     RUN_TEST(cli_install_and_uninstall);
+    RUN_TEST(cli_index_management_uses_explicit_home_and_preserves_internal_dbs);
 
     /* Binary swap on install --force (#472) */
     RUN_TEST(cli_install_copies_binary_to_target_issue472);
