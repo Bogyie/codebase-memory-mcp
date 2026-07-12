@@ -173,7 +173,7 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 - **Code search** (`search_code`): graph-augmented grep over indexed files only
 
 ### Cross-service linking
-- **HTTP** route ↔ call-site matching with confidence scoring
+- **HTTP** route ↔ call-site matching with confidence scoring. Call-site occurrences are retained as caller → Route edges, and call-literal Routes are removed only after their last source occurrence disappears.
 - **gRPC, GraphQL, tRPC** service detection with protobuf Route extraction
 - **Channel detection** (`EMITS` / `LISTENS_ON`) for Socket.IO, EventEmitter, and generic pub-sub patterns across 8 languages with constant resolution
 
@@ -200,7 +200,7 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 ### Distribution & operation
 - **Single static binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
 - **Auto-sync**: Background watcher detects file changes and re-indexes automatically
-- **Route nodes**: REST endpoints are first-class graph entities
+- **Route nodes**: REST endpoints are first-class graph entities. Source-backed handler Routes take precedence over synthetic call-literal Routes with the same identity.
 - **CLI mode**: `codebase-memory-mcp cli search_graph '{"project": "my-project", "name_pattern": ".*Handler.*"}'`
 - **Available on**: npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, `go install`
 

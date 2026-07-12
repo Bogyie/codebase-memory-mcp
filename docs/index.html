@@ -797,7 +797,7 @@
             </div>
             <div class="feature">
                 <h3>Cross-service linking</h3>
-                <p>Matches REST routes to HTTP call sites across services with confidence scoring — and detects gRPC, GraphQL, and tRPC services plus pub/sub channels (<code>EMITS</code>/<code>LISTENS_ON</code> for Socket.IO, EventEmitter, and message buses) and async queue dispatch.</p>
+                <p>Matches REST routes to HTTP call sites across services with confidence scoring. Each caller → Route occurrence is retained, and a synthetic call-literal Route is removed only after its last source occurrence disappears. Source-backed handler Routes take precedence when identities match. Also detects gRPC, GraphQL, and tRPC services plus pub/sub channels (<code>EMITS</code>/<code>LISTENS_ON</code> for Socket.IO, EventEmitter, and message buses) and async queue dispatch.</p>
             </div>
             <div class="feature">
                 <h3>Infrastructure-as-code indexing</h3>
