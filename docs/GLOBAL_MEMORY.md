@@ -121,6 +121,7 @@ recover pending outbox entries after a crash.
 
 - `memory_ingest`: add/deduplicate immutable raw sources and return related memory candidates.
 - `memory_query`: search/get/overview/neighbors/path/timeline/as-of and applicability routing.
+- `memory_status`: read-only epoch, entity, maintenance, CodeRef, and projection counters.
 - `memory_propose`: create revision-safe graph/wiki operations.
 - `memory_commit`: commit or reject a proposal with epoch/revision/idempotency checks.
 - `memory_lint`: epistemic, temporal, bias, graph, materialization, and code-reference health.

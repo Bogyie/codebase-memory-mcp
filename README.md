@@ -39,7 +39,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
 - **Design Context** — read-only indexing for `DESIGN.md`, DTCG tokens/resolvers, CSS custom properties, modes, aliases, generated assets, and implementation usage. See the [Design Context guide](docs/DESIGN_CONTEXT.md).
-- **23 MCP tools** — search, trace, architecture, design context, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, Global Memory, and more.
+- **23 MCP tools** — search, trace, architecture, design context, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, Global Memory status and management, and more.
 
 ## Quick Start
 
@@ -509,6 +509,7 @@ and `index_status` exposes `snapshot_complete` plus the opaque `index_generation
 |------|-------------|
 | `memory_ingest` | Deduplicate and retain an immutable raw source with provenance. |
 | `memory_query` | Applicability-first search, lookup, timeline, and as-of retrieval. |
+| `memory_status` | Read-only epoch, entity, maintenance, CodeRef, and projection counters. |
 | `memory_propose` | Stage revision-aware page, claim, decision, experience, preference, relation, or CodeRef operations. |
 | `memory_commit` | Atomically commit a proposal using entity revisions and an idempotent operation ID. |
 | `memory_lint` | Check epistemic, temporal, graph, materialization, bias, and CodeRef health. |
