@@ -877,6 +877,10 @@
                 <h3>Published graph generations</h3>
                 <p>Hashes, coverage, and FTS finish before a generation is published. Active readers switch only to a completed snapshot; the Projects UI shows its status and generation.</p>
             </div>
+            <div class="feature">
+                <h3>Stale-source warnings</h3>
+                <p><code>get_code_snippet</code> identifies its line range as graph-derived, compares the indexed file version with the live worktree, and warns when they differ. Source payloads are capped at 16 KiB and report truncation explicitly.</p>
+            </div>
         </div>
         <p style="margin-top: 16px;">
             <a href="GLOBAL_MEMORY.md">Read the full Global Memory contract →</a>

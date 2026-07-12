@@ -483,7 +483,7 @@ concurrency, and sharing contracts.
 | `detect_changes` | Read-only mapping from git diff to affected symbols + blast radius. Never writes Global Memory. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
-| `get_code_snippet` | Read source code for a function by qualified name. |
+| `get_code_snippet` | Read bounded live source by qualified name, with indexed-range provenance and stale-worktree warnings. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `get_design_context` | Paginated project-local design systems, tokens, components, mode-specific values, aliases, guidance, and usages. |
 | `search_code` | Grep-like text search within indexed project files. |
