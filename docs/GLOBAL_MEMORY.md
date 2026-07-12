@@ -145,6 +145,21 @@ auditable. Repository-specific details and ADRs stay local unless explicitly pro
 import, and synchronization are explicit operations because bundles include raw source bytes and
 may contain sensitive data.
 
+`memory_commit` enforces that authorization at the API boundary: every initial commit and
+idempotent retry must include `user_approved: true`. A missing or false value does not consume the
+operation ID or change proposal state.
+
+Inline `content` ingest remains available everywhere. Reading a local `path` is disabled by
+default because an MCP caller must not gain ambient access to arbitrary user files. Configure a
+platform path-list in `CBM_MEMORY_INGEST_ROOTS` to admit regular, non-symlink files under specific
+roots. `CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST=1` is an explicit operator opt-in that removes only the
+root boundary; regular-file and symlink checks still apply.
+
+Ingested bytes are durably written to private staging first. After the canonical database
+transaction begins, the staged inode is exposed through a no-replace hard link for projection
+verification and remains linked to staging until commit. On rollback, cleanup removes the target
+only when it is still the same inode, so a concurrent writer's immutable object is never deleted.
+
 ## Code graph integration
 
 Memory stores symbolic `CodeRef` values (project, qualified name, file, and optional commit/tree
@@ -174,6 +189,10 @@ context-free experiences, decisions without alternatives or review criteria, cir
 support, retrieval concentration, single-agent dominance, dirty code references, pending
 materialization, and conflicting proposals.
 
+Wiki materialization failures are retried with bounded exponential backoff. `memory_status`
+separates failed and exhausted outbox work, and its `entities.total` counts entities only;
+relations remain available as a separate counter.
+
 Frequently reused or high-impact memory receives higher audit priority, never higher truth
 weight.
 
@@ -194,8 +213,15 @@ Phase 5 implements only:
 Bundles contain the raw source bytes by design. Before configuring a remote, users must treat the
 bundle as potentially sensitive and choose a repository with suitable visibility. Credentials are
 left to Git credential helpers or SSH agents and are never embedded in Memory metadata or logs.
+Omitting `path` keeps export/import inside managed `CBM_MEMORY_HOME` defaults. An external path
+requires `allow_external_path: true` together with `user_approved: true`. Replacing an existing
+export also requires `overwrite: true` and `user_approved: true`; races that create the destination
+are rejected rather than overwritten implicitly.
 Imports validate raw hashes, canonical relation/revision integrity, merge logical rows in a short
 transaction, rebuild the graph/FTS projection, and materialize current wiki revisions through the
-local outbox. The live database file is never replaced.
+local outbox. Raw objects are decoded into a private staging directory first and promoted with
+no-replace semantics only after the database transaction begins. A rejected or failed import
+rolls back canonical rows and removes only objects newly installed by that attempt; pre-existing
+content-addressed objects remain untouched. The live database file is never replaced.
 
 Remote ACLs, multi-user authorization, and a hosted database service are out of scope.

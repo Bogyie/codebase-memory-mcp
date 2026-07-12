@@ -76,7 +76,11 @@ capture from curation, and separates agent reasoning from the short commit trans
 ### 1. Ingest an immutable source
 
 Supply either `content` or `path`. Repeated bytes are deduplicated and do not gain truth weight by
-being ingested more than once.
+being ingested more than once. Inline `content` is always available. Local `path` reads are
+disabled by default; set `CBM_MEMORY_INGEST_ROOTS` to a platform path-list of explicitly allowed
+directories. Files must resolve beneath one of those roots and must be regular, non-symlink files.
+`CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST=1` is available only as an explicit operator opt-in when an
+unbounded local-file authority is genuinely required.
 
 ```bash
 codebase-memory-mcp cli memory_ingest '{
@@ -159,7 +163,8 @@ codebase-memory-mcp cli memory_commit '{
 If another agent changed the same entity, the commit returns a revision conflict. Re-read the
 latest entity, decide whether the changes commute or conflict semantically, and create a new
 proposal. Last-write-wins is intentionally unavailable. Retrying the same successful operation ID
-is idempotent; reusing it for a different proposal is rejected.
+with `user_approved: true` is idempotent; reusing it for a different proposal is rejected. Missing
+or false approval is rejected before an operation ID is consumed.
 
 ## Keep facts current
 
@@ -209,8 +214,17 @@ Bundles contain logical rows **and the raw source bytes**. Treat every export as
 sensitive and inspect the destination repository's visibility before configuring a remote.
 
 ```bash
-codebase-memory-mcp cli memory_export '{"path":"/secure/path/memory-bundle"}'
-codebase-memory-mcp cli memory_import '{"path":"/secure/path/memory-bundle","policy":"reject"}'
+codebase-memory-mcp cli memory_export '{
+  "path":"/secure/path/memory-bundle",
+  "allow_external_path":true,
+  "user_approved":true
+}'
+codebase-memory-mcp cli memory_import '{
+  "path":"/secure/path/memory-bundle",
+  "policy":"reject",
+  "allow_external_path":true,
+  "user_approved":true
+}'
 
 codebase-memory-mcp cli memory_sync '{"action":"init"}'
 codebase-memory-mcp cli memory_sync '{
@@ -221,9 +235,17 @@ codebase-memory-mcp cli memory_sync '{
 codebase-memory-mcp cli memory_sync '{"action":"pull","policy":"reject"}'
 ```
 
+Omit `path` to use the managed defaults under `CBM_MEMORY_HOME`. Any external export or import
+path requires both `allow_external_path: true` and `user_approved: true`. Replacing an existing
+export additionally requires `overwrite: true` together with `user_approved: true`; a destination
+that appears during export is treated the same way rather than being overwritten implicitly.
+
 Available import policies are `reject`, `keep_local`, `keep_remote`, and `newest`. `newest` only
 resolves disjoint or unchanged-base revisions; semantic conflicts remain proposals. Git is only
 transport—the live database is never replaced and Git text merge is not the conflict resolver.
+Raw objects are decoded into private staging, verified, and promoted without replacing existing
+objects only after the database transaction begins. If import fails, canonical rows roll back and
+only objects newly installed by that import are removed.
 
 ## Storage and privacy
 

@@ -29,7 +29,14 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#define MEM_STRINGIFY_INNER(value) #value
+#define MEM_STRINGIFY(value) MEM_STRINGIFY_INNER(value)
+#define MEM_OUTBOX_MAX_ATTEMPTS 5
+#define MEM_PROJECT_RANKING_BOOST 1.0
+
 #ifdef _WIN32
+#include "foundation/win_utf8.h"
+
 #include <io.h>
 #include <process.h>
 #define getpid _getpid
@@ -46,6 +53,9 @@ enum {
     MEM_MAX_LIMIT = 100,
     MEM_MAX_SOURCE_BYTES = 16 * 1024 * 1024,
     MEM_OUTBOX_LEASE_SECONDS = 30,
+    MEM_OUTBOX_RETRY_BASE_SECONDS = 2,
+    MEM_OUTBOX_RETRY_MAX_SECONDS = 300,
+    MEM_INGEST_ROOTS_MAX = MEM_PATH_MAX * 4,
 };
 
 struct cbm_memory {
@@ -644,7 +654,11 @@ static int64_t memory_scalar_int64(cbm_memory_t *m, const char *sql) {
     if (!m || memory_prepare(m, sql, &stmt) != 0) {
         return -1;
     }
-    int64_t value = sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
+    int step_rc = sqlite3_step(stmt);
+    int64_t value = step_rc == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
+    if (step_rc != SQLITE_ROW) {
+        memory_set_sqlite_error(m, "read status metric");
+    }
     sqlite3_finalize(stmt);
     return value;
 }
@@ -657,6 +671,7 @@ char *cbm_memory_status_json(cbm_memory_t *m, const char *args_json) {
     if (sqlite3_exec(m->db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK) {
         return json_error("database_busy", sqlite3_errmsg(m->db));
     }
+    m->error[0] = '\0';
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
@@ -670,67 +685,85 @@ char *cbm_memory_status_json(cbm_memory_t *m, const char *args_json) {
     }
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_bool(doc, root, "ok", true);
-    yyjson_mut_obj_add_int(doc, root, "snapshot_epoch", cbm_memory_snapshot_epoch(m));
+    int64_t snapshot_epoch = cbm_memory_snapshot_epoch(m);
+    if (snapshot_epoch < 0) {
+        goto status_failed;
+    }
+    yyjson_mut_obj_add_int(doc, root, "snapshot_epoch", snapshot_epoch);
 
     struct {
         const char *name;
         const char *sql;
+        bool counts_as_entity;
     } entity_metrics[] = {
-        {"sources", "SELECT count(*) FROM memory_sources;"},
-        {"pages", "SELECT count(*) FROM memory_pages;"},
-        {"claims", "SELECT count(*) FROM memory_claims WHERE recorded_to IS NULL;"},
-        {"decisions", "SELECT count(*) FROM memory_decisions;"},
-        {"experiences", "SELECT count(*) FROM memory_experiences;"},
-        {"preferences", "SELECT count(*) FROM memory_preferences;"},
-        {"code_refs", "SELECT count(*) FROM memory_code_refs;"},
-        {"relations", "SELECT count(*) FROM memory_relations WHERE recorded_to IS NULL;"},
+        {"sources", "SELECT count(*) FROM memory_sources;", true},
+        {"pages", "SELECT count(*) FROM memory_pages;", true},
+        {"claims", "SELECT count(*) FROM memory_claims WHERE recorded_to IS NULL;", true},
+        {"decisions", "SELECT count(*) FROM memory_decisions;", true},
+        {"experiences", "SELECT count(*) FROM memory_experiences;", true},
+        {"preferences", "SELECT count(*) FROM memory_preferences;", true},
+        {"code_refs", "SELECT count(*) FROM memory_code_refs;", true},
+        {"relations", "SELECT count(*) FROM memory_relations WHERE recorded_to IS NULL;", false},
     };
     int64_t entity_total = 0;
     for (size_t i = 0; i < sizeof(entity_metrics) / sizeof(entity_metrics[0]); i++) {
         int64_t value = memory_scalar_int64(m, entity_metrics[i].sql);
+        if (value < 0) {
+            goto status_failed;
+        }
         yyjson_mut_obj_add_int(doc, entities, entity_metrics[i].name, value);
-        if (value > 0) {
+        if (entity_metrics[i].counts_as_entity) {
             entity_total += value;
         }
     }
     yyjson_mut_obj_add_int(doc, entities, "total", entity_total);
     yyjson_mut_obj_add_val(doc, root, "entities", entities);
 
-    yyjson_mut_obj_add_int(doc, maintenance, "open_dirty",
-                           memory_scalar_int64(m,
-                                               "SELECT count(*) FROM memory_dirty WHERE "
-                                               "status='open';"));
-    yyjson_mut_obj_add_int(doc, maintenance, "unresolved_code_refs",
-                           memory_scalar_int64(m,
-                                               "SELECT count(*) FROM memory_code_refs WHERE "
-                                               "resolution_status!='resolved';"));
-    yyjson_mut_obj_add_int(doc, maintenance, "missing_code_refs",
-                           memory_scalar_int64(m,
-                                               "SELECT count(*) FROM memory_code_refs WHERE "
-                                               "resolution_status='missing';"));
-    yyjson_mut_obj_add_int(doc, maintenance, "pending_outbox",
-                           memory_scalar_int64(m,
-                                               "SELECT count(*) FROM memory_outbox WHERE "
-                                               "state IN ('pending','leased','failed');"));
-    yyjson_mut_obj_add_int(doc, maintenance, "pending_proposals",
-                           memory_scalar_int64(m,
-                                               "SELECT count(*) FROM memory_proposals WHERE "
-                                               "status='pending';"));
+    struct {
+        const char *name;
+        const char *sql;
+    } maintenance_metrics[] = {
+        {"open_dirty", "SELECT count(*) FROM memory_dirty WHERE status='open';"},
+        {"unresolved_code_refs",
+         "SELECT count(*) FROM memory_code_refs WHERE resolution_status!='resolved';"},
+        {"missing_code_refs",
+         "SELECT count(*) FROM memory_code_refs WHERE resolution_status='missing';"},
+        {"pending_outbox",
+         "SELECT count(*) FROM memory_outbox WHERE state IN ('pending','leased','failed');"},
+        {"failed_outbox", "SELECT count(*) FROM memory_outbox WHERE state='failed';"},
+        {"exhausted_outbox",
+         "SELECT count(*) FROM memory_outbox WHERE state='failed' AND attempts>=" MEM_STRINGIFY(
+             MEM_OUTBOX_MAX_ATTEMPTS) ";"},
+        {"pending_proposals", "SELECT count(*) FROM memory_proposals WHERE status='pending';"},
+    };
+    for (size_t i = 0; i < sizeof(maintenance_metrics) / sizeof(maintenance_metrics[0]); i++) {
+        int64_t value = memory_scalar_int64(m, maintenance_metrics[i].sql);
+        if (value < 0) {
+            goto status_failed;
+        }
+        yyjson_mut_obj_add_int(doc, maintenance, maintenance_metrics[i].name, value);
+    }
     yyjson_mut_obj_add_val(doc, root, "maintenance", maintenance);
 
     yyjson_mut_obj_add_str(doc, projection, "strategy", "full_rebuild");
     yyjson_mut_obj_add_uint(doc, projection, "runs_in_process", m->projection_runs);
     yyjson_mut_obj_add_int(doc, projection, "last_rebuild_ms", m->projection_last_ms);
-    yyjson_mut_obj_add_int(doc, projection, "last_rebuild_documents",
-                           m->projection_last_documents);
-    yyjson_mut_obj_add_int(doc, projection, "documents",
-                           memory_scalar_int64(m, "SELECT count(*) FROM memory_documents;"));
-    yyjson_mut_obj_add_int(doc, projection, "nodes",
-                           memory_scalar_int64(
-                               m, "SELECT count(*) FROM nodes WHERE project='global-memory';"));
-    yyjson_mut_obj_add_int(doc, projection, "edges",
-                           memory_scalar_int64(
-                               m, "SELECT count(*) FROM edges WHERE project='global-memory';"));
+    yyjson_mut_obj_add_int(doc, projection, "last_rebuild_documents", m->projection_last_documents);
+    struct {
+        const char *name;
+        const char *sql;
+    } projection_metrics[] = {
+        {"documents", "SELECT count(*) FROM memory_documents;"},
+        {"nodes", "SELECT count(*) FROM nodes WHERE project='global-memory';"},
+        {"edges", "SELECT count(*) FROM edges WHERE project='global-memory';"},
+    };
+    for (size_t i = 0; i < sizeof(projection_metrics) / sizeof(projection_metrics[0]); i++) {
+        int64_t value = memory_scalar_int64(m, projection_metrics[i].sql);
+        if (value < 0) {
+            goto status_failed;
+        }
+        yyjson_mut_obj_add_int(doc, projection, projection_metrics[i].name, value);
+    }
     yyjson_mut_obj_add_val(doc, root, "projection", projection);
     if (sqlite3_exec(m->db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
         yyjson_mut_doc_free(doc);
@@ -740,6 +773,14 @@ char *cbm_memory_status_json(cbm_memory_t *m, const char *args_json) {
     char *out = json_write_mut(doc);
     yyjson_mut_doc_free(doc);
     return out;
+
+status_failed: {
+    char detail[CBM_SZ_512];
+    (void)snprintf(detail, sizeof(detail), "%s", m->error[0] ? m->error : sqlite3_errmsg(m->db));
+    yyjson_mut_doc_free(doc);
+    (void)sqlite3_exec(m->db, "ROLLBACK;", NULL, NULL, NULL);
+    return json_error("status_failed", detail);
+}
 }
 
 static char *json_error(const char *code, const char *message) {
@@ -893,6 +934,259 @@ static int memory_document_upsert(cbm_memory_t *m, const char *kind, const char 
 
 /* ── Immutable source objects ─────────────────────────────────── */
 
+static bool memory_env_enabled(const char *name) {
+    char value[16] = "";
+    if (!cbm_safe_getenv(name, value, sizeof(value), NULL)) {
+        return false;
+    }
+    return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0;
+}
+
+static bool memory_path_is_absolute(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+#ifdef _WIN32
+    return ((((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+             path[1] == ':' && (path[2] == '/' || path[2] == '\\')) ||
+            ((path[0] == '/' || path[0] == '\\') && (path[1] == '/' || path[1] == '\\')));
+#else
+    return path[0] == '/';
+#endif
+}
+
+static bool memory_directory_exists(const char *path) {
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return false;
+    }
+    DWORD attrs = GetFileAttributesW(wide);
+    free(wide);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+static bool memory_canonical_within_root(const char *canonical_root, const char *canonical_path) {
+    size_t root_len = strlen(canonical_root);
+    if (root_len == 0) {
+        return false;
+    }
+#ifdef _WIN32
+    bool prefix = _strnicmp(canonical_root, canonical_path, root_len) == 0;
+#else
+    bool prefix = strncmp(canonical_root, canonical_path, root_len) == 0;
+#endif
+    if (!prefix) {
+        return false;
+    }
+    if (canonical_root[root_len - 1] == '/' || canonical_root[root_len - 1] == '\\') {
+        return true;
+    }
+    return canonical_path[root_len] == '/' || canonical_path[root_len] == '\\' ||
+           canonical_path[root_len] == '\0';
+}
+
+/* Authorize an already-resolved path. Returns 0 when allowed, -2 when path
+ * ingest has no configured authority, and -1 when outside every allowed root. */
+static int memory_authorize_canonical_ingest_path(const char *canonical) {
+    if (memory_env_enabled("CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST")) {
+        return 0;
+    }
+
+    char roots[MEM_INGEST_ROOTS_MAX] = "";
+    if (!cbm_safe_getenv("CBM_MEMORY_INGEST_ROOTS", roots, sizeof(roots), NULL) || !roots[0]) {
+        return -2;
+    }
+#ifdef _WIN32
+    const char separator = ';';
+#else
+    const char separator = ':';
+#endif
+    const char *cursor = roots;
+    while (*cursor) {
+        const char *end = strchr(cursor, separator);
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        if (length > 0 && length < MEM_PATH_MAX) {
+            char root[MEM_PATH_MAX];
+            memcpy(root, cursor, length);
+            root[length] = '\0';
+            if (memory_path_is_absolute(root)) {
+                char canonical_root[MEM_PATH_MAX];
+                if (cbm_canonical_path(root, canonical_root, sizeof(canonical_root))) {
+                    cbm_normalize_path_sep(canonical_root);
+                    if (memory_directory_exists(canonical_root) &&
+                        memory_canonical_within_root(canonical_root, canonical)) {
+                        return 0;
+                    }
+                }
+            }
+        }
+        if (!end) {
+            break;
+        }
+        cursor = end + 1;
+    }
+    return -1;
+}
+
+#ifdef _WIN32
+static bool memory_final_path_from_handle(HANDLE handle, char out[MEM_PATH_MAX]) {
+    wchar_t wide[MEM_PATH_MAX];
+    DWORD length = GetFinalPathNameByHandleW(handle, wide, MEM_PATH_MAX, FILE_NAME_NORMALIZED);
+    if (length == 0 || length >= MEM_PATH_MAX) {
+        return false;
+    }
+    const wchar_t *source = wide;
+    wchar_t normalized[MEM_PATH_MAX];
+    if (wcsncmp(wide, L"\\\\?\\UNC\\", 8) == 0) {
+        int n = swprintf(normalized, MEM_PATH_MAX, L"\\\\%ls", wide + 8);
+        if (n < 0 || n >= MEM_PATH_MAX) {
+            return false;
+        }
+        source = normalized;
+    } else if (wcsncmp(wide, L"\\\\?\\", 4) == 0) {
+        source = wide + 4;
+    }
+    char *utf8 = cbm_wide_to_utf8(source);
+    if (!utf8) {
+        return false;
+    }
+    int n = snprintf(out, MEM_PATH_MAX, "%s", utf8);
+    free(utf8);
+    if (n < 0 || n >= MEM_PATH_MAX) {
+        return false;
+    }
+    cbm_normalize_path_sep(out);
+    return true;
+}
+#endif
+
+/* Open, authorize, and read one path through the same file descriptor/handle.
+ * A preliminary canonical check prevents even opening an obviously out-of-root
+ * path. The post-open identity/final-path check closes the replacement window:
+ * no bytes are read until the opened regular file is proven to be the same
+ * in-root object that was authorized. */
+static int memory_read_authorized_ingest_path(const char *path, unsigned char **out,
+                                              size_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    if (!path || !path[0]) {
+        return -1;
+    }
+    char preliminary[MEM_PATH_MAX];
+    if (!cbm_canonical_path(path, preliminary, sizeof(preliminary))) {
+        return -1;
+    }
+    cbm_normalize_path_sep(preliminary);
+    int authorization = memory_authorize_canonical_ingest_path(preliminary);
+    if (authorization != 0) {
+        return authorization;
+    }
+
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return -1;
+    }
+    HANDLE handle = CreateFileW(
+        wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    free(wide);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    LARGE_INTEGER size;
+    char opened_path[MEM_PATH_MAX];
+    bool valid = GetFileInformationByHandle(handle, &info) &&
+                 !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                 !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                 GetFileSizeEx(handle, &size) && size.QuadPart >= 0 &&
+                 size.QuadPart <= MEM_MAX_SOURCE_BYTES &&
+                 memory_final_path_from_handle(handle, opened_path) &&
+                 memory_authorize_canonical_ingest_path(opened_path) == 0;
+    if (!valid) {
+        CloseHandle(handle);
+        return -1;
+    }
+    size_t len = (size_t)size.QuadPart;
+    unsigned char *bytes = malloc(len + 1U);
+    if (!bytes) {
+        CloseHandle(handle);
+        return -3;
+    }
+    size_t offset = 0;
+    while (offset < len) {
+        DWORD chunk = (DWORD)((len - offset) > UINT32_MAX ? UINT32_MAX : (len - offset));
+        DWORD got = 0;
+        if (!ReadFile(handle, bytes + offset, chunk, &got, NULL) || got == 0) {
+            free(bytes);
+            CloseHandle(handle);
+            return -3;
+        }
+        offset += got;
+    }
+    CloseHandle(handle);
+#else
+    int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = open(path, flags);
+    if (fd < 0) {
+        return -1;
+    }
+    struct stat opened_stat;
+    char opened_path[MEM_PATH_MAX];
+    struct stat resolved_stat;
+    bool valid = fstat(fd, &opened_stat) == 0 && S_ISREG(opened_stat.st_mode) &&
+                 opened_stat.st_size >= 0 && opened_stat.st_size <= MEM_MAX_SOURCE_BYTES &&
+                 cbm_canonical_path(path, opened_path, sizeof(opened_path));
+    if (valid) {
+        cbm_normalize_path_sep(opened_path);
+        valid = stat(opened_path, &resolved_stat) == 0 &&
+                resolved_stat.st_dev == opened_stat.st_dev &&
+                resolved_stat.st_ino == opened_stat.st_ino &&
+                memory_authorize_canonical_ingest_path(opened_path) == 0;
+    }
+    if (!valid) {
+        close(fd);
+        return -1;
+    }
+    size_t len = (size_t)opened_stat.st_size;
+    unsigned char *bytes = malloc(len + 1U);
+    if (!bytes) {
+        close(fd);
+        return -3;
+    }
+    size_t offset = 0;
+    while (offset < len) {
+        ssize_t got = read(fd, bytes + offset, len - offset);
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got <= 0) {
+            free(bytes);
+            close(fd);
+            return -3;
+        }
+        offset += (size_t)got;
+    }
+    close(fd);
+#endif
+    bytes[len] = 0;
+    *out = bytes;
+    *out_len = len;
+    return 0;
+}
+
 static int read_file_bytes(const char *path, unsigned char **out, size_t *out_len) {
     *out = NULL;
     *out_len = 0;
@@ -985,53 +1279,213 @@ static int sync_parent_directory(const char *path) {
 #endif
 }
 
-static int write_raw_object(cbm_memory_t *m, const char *final_path, const unsigned char *bytes,
-                            size_t len, const char *hash) {
-    (void)m;
-    if (cbm_file_exists(final_path)) {
+typedef struct {
+    char root[MEM_PATH_MAX];
+    char staged[MEM_PATH_MAX];
+    char target[MEM_PATH_MAX];
+    char target_parent[MEM_PATH_MAX];
+    bool staged_exists;
+    bool installed;
+    bool target_parent_created;
+} memory_raw_stage_t;
+
+static int memory_link_no_replace(const char *staged, const char *target) {
+#ifdef _WIN32
+    wchar_t *wide_staged = cbm_utf8_to_wide(staged);
+    wchar_t *wide_target = cbm_utf8_to_wide(target);
+    if (!wide_staged || !wide_target) {
+        free(wide_staged);
+        free(wide_target);
+        return -1;
+    }
+    BOOL linked = CreateHardLinkW(wide_target, wide_staged, NULL);
+    DWORD error = linked ? ERROR_SUCCESS : GetLastError();
+    free(wide_staged);
+    free(wide_target);
+    if (linked) {
+        return 0;
+    }
+    return error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS ? 1 : -1;
+#else
+    if (link(staged, target) == 0) {
+        return 0;
+    }
+    return errno == EEXIST ? 1 : -1;
+#endif
+}
+
+static bool memory_paths_are_same_file(const char *left, const char *right) {
+#ifdef _WIN32
+    wchar_t *wide_left = cbm_utf8_to_wide(left);
+    wchar_t *wide_right = cbm_utf8_to_wide(right);
+    if (!wide_left || !wide_right) {
+        free(wide_left);
+        free(wide_right);
+        return false;
+    }
+    HANDLE left_handle =
+        CreateFileW(wide_left, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE right_handle =
+        CreateFileW(wide_right, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wide_left);
+    free(wide_right);
+    BY_HANDLE_FILE_INFORMATION left_info;
+    BY_HANDLE_FILE_INFORMATION right_info;
+    bool same = left_handle != INVALID_HANDLE_VALUE && right_handle != INVALID_HANDLE_VALUE &&
+                GetFileInformationByHandle(left_handle, &left_info) &&
+                GetFileInformationByHandle(right_handle, &right_info) &&
+                left_info.dwVolumeSerialNumber == right_info.dwVolumeSerialNumber &&
+                left_info.nFileIndexHigh == right_info.nFileIndexHigh &&
+                left_info.nFileIndexLow == right_info.nFileIndexLow;
+    if (left_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(left_handle);
+    }
+    if (right_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(right_handle);
+    }
+    return same;
+#else
+    struct stat left_stat;
+    struct stat right_stat;
+    return stat(left, &left_stat) == 0 && stat(right, &right_stat) == 0 &&
+           left_stat.st_dev == right_stat.st_dev && left_stat.st_ino == right_stat.st_ino;
+#endif
+}
+
+static void memory_raw_stage_dispose(memory_raw_stage_t *stage, bool rollback_installed) {
+    if (!stage) {
+        return;
+    }
+    /* Only remove a promoted target while it is still the hard link owned by
+     * this stage. A concurrent/pre-existing immutable object is never deleted. */
+    if (rollback_installed && stage->installed && stage->staged_exists &&
+        memory_paths_are_same_file(stage->staged, stage->target)) {
+        (void)cbm_unlink(stage->target);
+        (void)sync_parent_directory(stage->target);
+    }
+    if (stage->staged_exists) {
+        (void)cbm_unlink(stage->staged);
+    }
+    if (stage->root[0]) {
+        (void)cbm_rmdir(stage->root);
+    }
+    if (rollback_installed && stage->target_parent_created && stage->target_parent[0]) {
+        /* Non-recursive and therefore safe when the prefix pre-existed or a
+         * concurrent ingest populated it. */
+        (void)cbm_rmdir(stage->target_parent);
+    }
+    memset(stage, 0, sizeof(*stage));
+}
+
+static int memory_create_directory_no_replace(const char *path) {
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return -1;
+    }
+    BOOL created = CreateDirectoryW(wide, NULL);
+    DWORD error = created ? ERROR_SUCCESS : GetLastError();
+    free(wide);
+    if (created) {
+        return 0;
+    }
+    return error == ERROR_ALREADY_EXISTS ? 1 : -1;
+#else
+    if (mkdir(path, 0700) == 0) {
+        return 0;
+    }
+    return errno == EEXIST ? 1 : -1;
+#endif
+}
+
+static int memory_raw_stage_create(cbm_memory_t *m, const char *target, const char *target_parent,
+                                   const unsigned char *bytes, size_t len, const char *hash,
+                                   memory_raw_stage_t *stage) {
+    memset(stage, 0, sizeof(*stage));
+    if (snprintf(stage->target, sizeof(stage->target), "%s", target) >=
+            (int)sizeof(stage->target) ||
+        snprintf(stage->target_parent, sizeof(stage->target_parent), "%s", target_parent) >=
+            (int)sizeof(stage->target_parent) ||
+        snprintf(stage->root, sizeof(stage->root), "%s/.ingest-staging", m->home) >=
+            (int)sizeof(stage->root)) {
+        return -1;
+    }
+    if (cbm_file_exists(target)) {
+        return raw_object_matches(target, bytes, len, hash) ? 0 : -1;
+    }
+    if (!cbm_mkdir_p(stage->root, 0700)) {
+        return -1;
+    }
 #ifndef _WIN32
-        if (chmod(final_path, 0600) != 0) {
+    if (chmod(stage->root, 0700) != 0) {
+        memory_raw_stage_dispose(stage, false);
+        return -1;
+    }
+#endif
+    static atomic_uint_fast64_t sequence = 1;
+    FILE *fp = NULL;
+    for (unsigned int attempt = 0; attempt < 32 && !fp; attempt++) {
+        uint64_t seq = atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
+        int n = snprintf(stage->staged, sizeof(stage->staged), "%s/ingest-%ld-%" PRIu64 "-%u",
+                         stage->root, (long)getpid(), seq, attempt);
+        if (n < 0 || n >= (int)sizeof(stage->staged)) {
+            memory_raw_stage_dispose(stage, false);
             return -1;
         }
-#endif
-        return raw_object_matches(final_path, bytes, len, hash) ? 0 : -1;
+        fp = cbm_fopen(stage->staged, "wbx");
+        if (!fp && errno != EEXIST) {
+            memory_raw_stage_dispose(stage, false);
+            return -1;
+        }
     }
-    static atomic_uint_fast64_t sequence = 1;
-    uint64_t seq = atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
-    char temp[MEM_PATH_MAX];
-    int n = snprintf(temp, sizeof(temp), "%s.tmp.%ld.%" PRIu64, final_path, (long)getpid(), seq);
-    if (n < 0 || n >= (int)sizeof(temp)) {
-        return -1;
-    }
-    FILE *fp = cbm_fopen(temp, "wb");
     if (!fp) {
+        memory_raw_stage_dispose(stage, false);
         return -1;
     }
+    stage->staged_exists = true;
     size_t written = len ? fwrite(bytes, 1, len, fp) : 0;
     int flush_rc = written == len ? durable_flush(fp) : -1;
     int close_rc = fclose(fp);
-    if (flush_rc != 0 || close_rc != 0) {
-        (void)cbm_unlink(temp);
+#ifndef _WIN32
+    int mode_rc = chmod(stage->staged, 0600);
+#else
+    int mode_rc = 0;
+#endif
+    if (flush_rc != 0 || close_rc != 0 || mode_rc != 0 ||
+        !raw_object_matches(stage->staged, bytes, len, hash) ||
+        sync_parent_directory(stage->staged) != 0) {
+        memory_raw_stage_dispose(stage, false);
         return -1;
     }
+    return 0;
+}
+
+static int memory_raw_stage_promote(memory_raw_stage_t *stage, const unsigned char *bytes,
+                                    size_t len, const char *hash) {
+    if (!stage->staged_exists) {
+        return raw_object_matches(stage->target, bytes, len, hash) ? 0 : -1;
+    }
+    int directory_rc = memory_create_directory_no_replace(stage->target_parent);
+    if (directory_rc < 0 || (directory_rc == 1 && !memory_directory_exists(stage->target_parent))) {
+        return -1;
+    }
+    stage->target_parent_created = directory_rc == 0;
 #ifndef _WIN32
-    if (chmod(temp, 0600) != 0) {
-        (void)cbm_unlink(temp);
+    if (chmod(stage->target_parent, 0700) != 0) {
         return -1;
     }
 #endif
-    if (cbm_file_exists(final_path)) {
-        (void)cbm_unlink(temp);
-        return raw_object_matches(final_path, bytes, len, hash) ? 0 : -1;
+    int install_rc = memory_link_no_replace(stage->staged, stage->target);
+    if (install_rc == 0) {
+        stage->installed = true;
+        return raw_object_matches(stage->target, bytes, len, hash) &&
+                       sync_parent_directory(stage->target) == 0
+                   ? 0
+                   : -1;
     }
-    if (cbm_rename_replace(temp, final_path) != 0) {
-        (void)cbm_unlink(temp);
-        return -1;
-    }
-    return raw_object_matches(final_path, bytes, len, hash) &&
-                   sync_parent_directory(final_path) == 0
-               ? 0
-               : -1;
+    return install_rc == 1 && raw_object_matches(stage->target, bytes, len, hash) ? 0 : -1;
 }
 
 static bool safe_path_component(const char *value) {
@@ -1145,6 +1599,17 @@ static void iso_after_seconds(int seconds, char out[MEM_TIME_MAX]) {
     (void)strftime(out, MEM_TIME_MAX, "%Y-%m-%dT%H:%M:%SZ", &tmv);
 }
 
+static int memory_outbox_retry_delay(int attempts) {
+    int delay = MEM_OUTBOX_RETRY_BASE_SECONDS;
+    for (int i = 1; i < attempts && delay < MEM_OUTBOX_RETRY_MAX_SECONDS; i++) {
+        delay *= 2;
+        if (delay > MEM_OUTBOX_RETRY_MAX_SECONDS) {
+            delay = MEM_OUTBOX_RETRY_MAX_SECONDS;
+        }
+    }
+    return delay;
+}
+
 static int memory_recover_outbox(cbm_memory_t *m) {
     if (!m) {
         return -1;
@@ -1160,14 +1625,18 @@ static int memory_recover_outbox(cbm_memory_t *m) {
             return processed > 0 ? processed : -1;
         }
         sqlite3_stmt *stmt = NULL;
-        const char *select_sql = "SELECT outbox_id,aggregate_id,revision FROM memory_outbox"
-                                 " WHERE state='pending' OR (state='leased' AND lease_until<=?)"
-                                 " ORDER BY outbox_id LIMIT 1;";
+        const char *select_sql =
+            "SELECT outbox_id,aggregate_id,revision,attempts FROM memory_outbox"
+            " WHERE state='pending' OR (state='leased' AND lease_until<=?)"
+            " OR (state='failed' AND attempts<? AND (lease_until IS NULL OR lease_until<=?))"
+            " ORDER BY outbox_id LIMIT 1;";
         if (memory_prepare(m, select_sql, &stmt) != 0) {
             memory_rollback(m);
             return processed > 0 ? processed : -1;
         }
         bind_text_or_null(stmt, 1, now);
+        sqlite3_bind_int(stmt, 2, MEM_OUTBOX_MAX_ATTEMPTS);
+        bind_text_or_null(stmt, 3, now);
         if (sqlite3_step(stmt) != SQLITE_ROW) {
             sqlite3_finalize(stmt);
             (void)memory_commit_tx(m);
@@ -1177,6 +1646,7 @@ static int memory_recover_outbox(cbm_memory_t *m) {
         const char *aggregate_col = (const char *)sqlite3_column_text(stmt, 1);
         char *aggregate_id = mem_strdup(aggregate_col ? aggregate_col : "");
         int revision = sqlite3_column_int(stmt, 2);
+        int attempts = sqlite3_column_int(stmt, 3) + 1;
         sqlite3_finalize(stmt);
         if (!aggregate_id) {
             memory_rollback(m);
@@ -1185,7 +1655,9 @@ static int memory_recover_outbox(cbm_memory_t *m) {
         if (memory_prepare(m,
                            "UPDATE memory_outbox SET state='leased',lease_owner=?,lease_until=?,"
                            " attempts=attempts+1 WHERE outbox_id=? AND"
-                           " (state='pending' OR (state='leased' AND lease_until<=?));",
+                           " (state='pending' OR (state='leased' AND lease_until<=?) OR"
+                           " (state='failed' AND attempts<? AND"
+                           " (lease_until IS NULL OR lease_until<=?)));",
                            &stmt) != 0) {
             free(aggregate_id);
             memory_rollback(m);
@@ -1195,6 +1667,8 @@ static int memory_recover_outbox(cbm_memory_t *m) {
         bind_text_or_null(stmt, 2, lease_until);
         sqlite3_bind_int64(stmt, 3, outbox_id);
         bind_text_or_null(stmt, 4, now);
+        sqlite3_bind_int(stmt, 5, MEM_OUTBOX_MAX_ATTEMPTS);
+        bind_text_or_null(stmt, 6, now);
         int claim_rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
         if (claim_rc != SQLITE_DONE || sqlite3_changes(m->db) != 1 || memory_commit_tx(m) != 0) {
@@ -1205,25 +1679,32 @@ static int memory_recover_outbox(cbm_memory_t *m) {
 
         int materialize_rc = materialize_page(m, aggregate_id, revision);
         iso_now(now);
+        char retry_at[MEM_TIME_MAX];
+        iso_after_seconds(memory_outbox_retry_delay(attempts), retry_at);
         if (memory_begin(m) != 0) {
             free(aggregate_id);
             return processed > 0 ? processed : -1;
         }
-        const char *finish_sql =
-            materialize_rc == 0
-                ? "UPDATE memory_outbox SET state='done',processed_at=?,lease_owner=NULL,"
-                  " lease_until=NULL,last_error=NULL WHERE outbox_id=? AND lease_owner=?;"
-                : "UPDATE memory_outbox SET state='failed',processed_at=?,lease_owner=NULL,"
-                  " lease_until=NULL,last_error='materialization failed' WHERE outbox_id=?"
-                  " AND lease_owner=?;";
+        const char *finish_sql = materialize_rc == 0
+                                     ? "UPDATE memory_outbox SET state='done',processed_at=?,"
+                                       " lease_owner=NULL,lease_until=NULL,last_error=NULL"
+                                       " WHERE outbox_id=? AND lease_owner=?;"
+                                     : "UPDATE memory_outbox SET state='failed',processed_at=?,"
+                                       " lease_owner=NULL,lease_until=?,"
+                                       " last_error='materialization failed' WHERE outbox_id=?"
+                                       " AND lease_owner=?;";
         if (memory_prepare(m, finish_sql, &stmt) != 0) {
             free(aggregate_id);
             memory_rollback(m);
             return processed > 0 ? processed : -1;
         }
         bind_text_or_null(stmt, 1, now);
-        sqlite3_bind_int64(stmt, 2, outbox_id);
-        bind_text_or_null(stmt, 3, worker);
+        int finish_index = 2;
+        if (materialize_rc != 0) {
+            bind_text_or_null(stmt, finish_index++, retry_at);
+        }
+        sqlite3_bind_int64(stmt, finish_index++, outbox_id);
+        bind_text_or_null(stmt, finish_index, worker);
         int finish_rc = sqlite3_step(stmt);
         int finish_changes = sqlite3_changes(m->db);
         sqlite3_finalize(stmt);
@@ -1232,7 +1713,9 @@ static int memory_recover_outbox(cbm_memory_t *m) {
             memory_rollback(m);
             return processed > 0 ? processed : -1;
         }
-        processed++;
+        if (materialize_rc == 0) {
+            processed++;
+        }
     }
     return processed;
 }
@@ -1348,7 +1831,20 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
     const unsigned char *bytes = NULL;
     size_t len = 0;
     if (path) {
-        if (read_file_bytes(path, &owned_bytes, &len) != 0) {
+        int authorization = memory_read_authorized_ingest_path(path, &owned_bytes, &len);
+        if (authorization == -2) {
+            yyjson_doc_free(doc);
+            return json_error(
+                "path_ingest_disabled",
+                "path ingest requires CBM_MEMORY_INGEST_ROOTS or explicit unsafe opt-in");
+        }
+        if (authorization == -1) {
+            yyjson_doc_free(doc);
+            return json_error("source_path_not_allowed",
+                              "source path must be a regular non-symlink file within an allowed "
+                              "ingest root");
+        }
+        if (authorization != 0 || !owned_bytes) {
             yyjson_doc_free(doc);
             return json_error("source_read_failed",
                               "cannot read source path or source is too large");
@@ -1366,32 +1862,11 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
 
     char hash[CBM_SHA256_HEX_LEN + 1];
     cbm_sha256_hex(bytes, len, hash);
-    char *existing = memory_source_existing(m, hash);
-    if (existing) {
-        free(owned_bytes);
-        yyjson_doc_free(doc);
-        return existing;
-    }
-
     const char *media_type = json_str(root, "media_type");
     if (!media_type) {
         media_type = "text/plain";
     }
     const char *extension = media_extension(media_type);
-    char relpath[MEM_PATH_MAX];
-    int rn = snprintf(relpath, sizeof(relpath), "raw/objects/%.2s/%s.%s", hash, hash, extension);
-    char prefix_dir[MEM_PATH_MAX];
-    int pn = snprintf(prefix_dir, sizeof(prefix_dir), "%s/%.2s", m->raw_objects_dir, hash);
-    char final_path[MEM_PATH_MAX];
-    int fn = snprintf(final_path, sizeof(final_path), "%s/%s.%s", prefix_dir, hash, extension);
-    if (rn < 0 || rn >= (int)sizeof(relpath) || pn < 0 || pn >= (int)sizeof(prefix_dir) || fn < 0 ||
-        fn >= (int)sizeof(final_path) || !cbm_mkdir_p(prefix_dir, 0700) ||
-        write_raw_object(m, final_path, bytes, len, hash) != 0) {
-        free(owned_bytes);
-        yyjson_doc_free(doc);
-        return json_error("raw_store_failed", "failed to persist immutable source object");
-    }
-
     char source_id[MEM_ID_MAX];
     (void)snprintf(source_id, sizeof(source_id), "src_%s", hash);
     const char *title = json_str(root, "title");
@@ -1417,7 +1892,39 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
         return NULL;
     }
 
+    char relpath[MEM_PATH_MAX];
+    int rn = snprintf(relpath, sizeof(relpath), "raw/objects/%.2s/%s.%s", hash, hash, extension);
+    char prefix_dir[MEM_PATH_MAX];
+    int pn = snprintf(prefix_dir, sizeof(prefix_dir), "%s/%.2s", m->raw_objects_dir, hash);
+    char final_path[MEM_PATH_MAX];
+    int fn = snprintf(final_path, sizeof(final_path), "%s/%s.%s", prefix_dir, hash, extension);
+    if (rn < 0 || rn >= (int)sizeof(relpath) || pn < 0 || pn >= (int)sizeof(prefix_dir) || fn < 0 ||
+        fn >= (int)sizeof(final_path)) {
+        free(metadata);
+        free(owned_bytes);
+        yyjson_doc_free(doc);
+        return json_error("invalid_source", "source object path is too long");
+    }
+
+    char *existing = memory_source_existing(m, hash);
+    if (existing) {
+        free(metadata);
+        free(owned_bytes);
+        yyjson_doc_free(doc);
+        return existing;
+    }
+
+    memory_raw_stage_t raw_stage;
+    if (memory_raw_stage_create(m, final_path, prefix_dir, bytes, len, hash, &raw_stage) != 0) {
+        memory_raw_stage_dispose(&raw_stage, false);
+        free(metadata);
+        free(owned_bytes);
+        yyjson_doc_free(doc);
+        return json_error("raw_store_failed", "failed to stage immutable source object");
+    }
+
     if (memory_begin(m) != 0) {
+        memory_raw_stage_dispose(&raw_stage, false);
         free(metadata);
         free(owned_bytes);
         yyjson_doc_free(doc);
@@ -1492,17 +1999,44 @@ char *cbm_memory_ingest_json(cbm_memory_t *m, const char *args_json) {
         }
     }
     free(props);
+    bool canonical_ready =
+        inserted && epoch >= 0 && node_id > 0 && doc_rc == 0 && lineage_rc == 0 && activity_rc == 0;
+    if (!canonical_ready && !m->error[0]) {
+        (void)snprintf(m->error, sizeof(m->error),
+                       "canonical source write failed (inserted=%d epoch=%" PRId64 " node=%" PRId64
+                       " document=%d lineage=%d activity=%d)",
+                       inserted ? 1 : 0, epoch, node_id, doc_rc, lineage_rc, activity_rc);
+    }
+    /* The projection verifies every source body from its canonical raw path,
+     * so expose the staged inode after canonical writes and immediately before
+     * rebuilding derived state. It remains linked to the private stage until
+     * COMMIT, allowing identity-checked rollback below. */
+    if (canonical_ready && memory_raw_stage_promote(&raw_stage, bytes, len, hash) != 0) {
+        (void)snprintf(m->error, sizeof(m->error), "%s",
+                       "failed to promote immutable source object");
+        canonical_ready = false;
+    }
+    if (canonical_ready && memory_rebuild_projection_internal(m, true) != 0) {
+        canonical_ready = false;
+    }
     free(metadata);
 
-    if (!inserted || epoch < 0 || node_id <= 0 || doc_rc != 0 || lineage_rc != 0 ||
-        activity_rc != 0 || memory_rebuild_projection_internal(m, true) != 0 ||
-        memory_commit_tx(m) != 0) {
+    if (!canonical_ready) {
         memory_rollback(m);
+        memory_raw_stage_dispose(&raw_stage, true);
         char *race = memory_source_existing(m, hash);
         free(owned_bytes);
         yyjson_doc_free(doc);
         return race ? race : json_error("ingest_failed", m->error);
     }
+    if (memory_commit_tx(m) != 0) {
+        memory_rollback(m);
+        memory_raw_stage_dispose(&raw_stage, true);
+        free(owned_bytes);
+        yyjson_doc_free(doc);
+        return json_error("ingest_failed", m->error);
+    }
+    memory_raw_stage_dispose(&raw_stage, false);
 
     char *out = ingest_result_json(m, source_id, hash, relpath, title && title[0] ? title : origin,
                                    false, epoch);
@@ -2738,6 +3272,11 @@ char *cbm_memory_commit_json(cbm_memory_t *m, const char *args_json) {
     if (!safe_entity_id(proposal_id_arg) || !safe_operation_id(operation_id_arg)) {
         yyjson_doc_free(args_doc);
         return json_error("invalid_commit", "proposal_id and a valid operation_id are required");
+    }
+    if (!approved) {
+        yyjson_doc_free(args_doc);
+        return json_error("approval_required",
+                          "memory_commit requires explicit user_approved:true authorization");
     }
     char *proposal_id = mem_strdup(proposal_id_arg);
     char *operation_id = mem_strdup(operation_id_arg);
@@ -4240,17 +4779,20 @@ char *cbm_memory_query_json(cbm_memory_t *m, const char *args_json) {
                   " FROM memory_documents WHERE entity_id=?"
                   " AND (?='' OR entity_kind=?) LIMIT 1;";
         } else if (fts && sql_project_boost) {
-            sql = "SELECT d.entity_kind,d.entity_id,d.title,d.summary,"
-                  " snippet(memory_fts,2,'','',' … ',24),bm25(memory_fts),"
+            sql = "WITH ranked AS (SELECT d.entity_kind,d.entity_id,d.title,d.summary,"
+                  " snippet(memory_fts,2,'','',' … ',24) AS snippet,"
+                  " bm25(memory_fts) AS base_rank,"
                   " EXISTS(SELECT 1 FROM memory_relations r JOIN memory_code_refs c ON"
                   " ((r.target_kind='code_ref' AND r.target_id=c.code_ref_id"
                   "   AND r.source_kind=d.entity_kind AND r.source_id=d.entity_id) OR"
                   "  (r.source_kind='code_ref' AND r.source_id=c.code_ref_id"
                   "   AND r.target_kind=d.entity_kind AND r.target_id=d.entity_id))"
-                  " WHERE r.recorded_to IS NULL AND c.project=?) AS project_match"
+                  " WHERE r.recorded_to IS NULL AND c.project=?) AS project_match,d.doc_id"
                   " FROM memory_fts JOIN memory_documents d ON d.doc_id=memory_fts.rowid"
-                  " WHERE memory_fts MATCH ? AND (?='' OR d.entity_kind=?)"
-                  " ORDER BY project_match DESC,bm25(memory_fts) LIMIT ?;";
+                  " WHERE memory_fts MATCH ? AND (?='' OR d.entity_kind=?))"
+                  " SELECT entity_kind,entity_id,title,summary,snippet,base_rank,project_match"
+                  " FROM ranked ORDER BY (-base_rank + CASE WHEN project_match THEN " MEM_STRINGIFY(
+                      MEM_PROJECT_RANKING_BOOST) " ELSE 0.0 END) DESC,doc_id DESC LIMIT ?;";
         } else if (fts) {
             sql = "SELECT d.entity_kind,d.entity_id,d.title,d.summary,"
                   " snippet(memory_fts,2,'','',' … ',24),bm25(memory_fts),0"
@@ -4314,9 +4856,11 @@ char *cbm_memory_query_json(cbm_memory_t *m, const char *args_json) {
                         m, kind ? kind : "", entity_id ? entity_id : "", context_project);
                 }
                 yyjson_mut_obj_add_real(doc, item, "score", base_score);
-                yyjson_mut_obj_add_real(doc, item, "ranking_boost", project_match ? 1.0 : 0.0);
+                yyjson_mut_obj_add_real(doc, item, "ranking_boost",
+                                        project_match ? MEM_PROJECT_RANKING_BOOST : 0.0);
                 yyjson_mut_obj_add_real(doc, item, "ranking_score",
-                                        base_score + (project_match ? 1.0 : 0.0));
+                                        base_score +
+                                            (project_match ? MEM_PROJECT_RANKING_BOOST : 0.0));
                 yyjson_mut_val *boost_reasons = yyjson_mut_arr(doc);
                 if (project_match) {
                     yyjson_mut_arr_add_strcpy(doc, boost_reasons, "current_project_code_reference");
