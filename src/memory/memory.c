@@ -59,9 +59,19 @@ struct cbm_memory {
     char *sync_dir;
     char lease_owner[MEM_ID_MAX];
     char error[CBM_SZ_512];
+    uint64_t projection_runs;
+    int64_t projection_last_ms;
+    int64_t projection_last_documents;
 };
 
 static atomic_uint_fast64_t memory_handle_sequence = ATOMIC_VAR_INIT(1);
+
+static int64_t memory_elapsed_ms(struct timespec start) {
+    struct timespec now;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)(now.tv_sec - start.tv_sec) * 1000LL +
+           (int64_t)(now.tv_nsec - start.tv_nsec) / 1000000LL;
+}
 
 static int memory_recover_outbox(cbm_memory_t *m);
 static int memory_rebuild_projection_internal(cbm_memory_t *m, bool in_transaction);
@@ -709,6 +719,10 @@ char *cbm_memory_status_json(cbm_memory_t *m, const char *args_json) {
     yyjson_mut_obj_add_val(doc, root, "maintenance", maintenance);
 
     yyjson_mut_obj_add_str(doc, projection, "strategy", "full_rebuild");
+    yyjson_mut_obj_add_uint(doc, projection, "runs_in_process", m->projection_runs);
+    yyjson_mut_obj_add_int(doc, projection, "last_rebuild_ms", m->projection_last_ms);
+    yyjson_mut_obj_add_int(doc, projection, "last_rebuild_documents",
+                           m->projection_last_documents);
     yyjson_mut_obj_add_int(doc, projection, "documents",
                            memory_scalar_int64(m, "SELECT count(*) FROM memory_documents;"));
     yyjson_mut_obj_add_int(doc, projection, "nodes",
@@ -3168,6 +3182,8 @@ static int memory_rebuild_projection_internal(cbm_memory_t *m, bool in_transacti
     if (!m) {
         return -1;
     }
+    struct timespec projection_started;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &projection_started);
     bool own_tx = !in_transaction;
     if (own_tx && memory_begin(m) != 0) {
         return -1;
@@ -3302,6 +3318,12 @@ static int memory_rebuild_projection_internal(cbm_memory_t *m, bool in_transacti
         } else {
             memory_rollback(m);
         }
+    }
+    if (rc == 0) {
+        m->projection_runs++;
+        m->projection_last_ms = memory_elapsed_ms(projection_started);
+        m->projection_last_documents =
+            memory_scalar_int64(m, "SELECT count(*) FROM memory_documents;");
     }
     return rc;
 }
