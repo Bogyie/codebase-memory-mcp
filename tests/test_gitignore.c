@@ -6,7 +6,12 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "discover/discover.h"
+#include <stdlib.h>
 #include <string.h> /* strdup (test seam) */
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 /* ── Basic pattern matching ────────────────────────────────────── */
 
@@ -164,7 +169,8 @@ TEST(gi_null_safe_free) {
 /* ── Load from file ────────────────────────────────────────────── */
 
 TEST(gi_load_file) {
-    char path[256]; snprintf(path, sizeof(path), "%s/test_gitignore_file", cbm_tmpdir());
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_gitignore_file", cbm_tmpdir());
     FILE *f = fopen(path, "w");
     ASSERT_NOT_NULL(f);
     fprintf(f, "*.o\nbuild/\n");
@@ -187,11 +193,112 @@ TEST(gi_load_nonexistent) {
     PASS();
 }
 
+TEST(gi_load_embedded_nul_fails_closed) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_gitignore_nul", cbm_tmpdir());
+    FILE *f = fopen(path, "wb");
+    ASSERT_NOT_NULL(f);
+    static const unsigned char bytes[] = {'*', '.', 'o', '\n', '\0', '!', 'k',
+                                          'e', 'e', 'p', '.',  'o',  '\n'};
+    ASSERT_EQ(fwrite(bytes, 1, sizeof(bytes), f), sizeof(bytes));
+    fclose(f);
+
+    cbm_gitignore_t *gi = NULL;
+    ASSERT_EQ(cbm_gitignore_load_ex(path, &gi), CBM_GITIGNORE_LOAD_ERROR);
+    ASSERT_NULL(gi);
+    remove(path);
+    PASS();
+}
+
+TEST(gi_load_oversized_fails_closed) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_gitignore_oversized", cbm_tmpdir());
+    FILE *f = fopen(path, "wb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(fseek(f, 5L * 1024L * 1024L, SEEK_SET), 0);
+    ASSERT_EQ(fputc('\n', f), '\n');
+    fclose(f);
+
+    cbm_gitignore_t *gi = NULL;
+    ASSERT_EQ(cbm_gitignore_load_ex(path, &gi), CBM_GITIGNORE_LOAD_ERROR);
+    ASSERT_NULL(gi);
+    remove(path);
+    PASS();
+}
+
+#ifndef _WIN32
+TEST(gi_load_fifo_fails_without_blocking) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_gitignore_fifo_%ld", cbm_tmpdir(), (long)getpid());
+    ASSERT_EQ(mkfifo(path, 0600), 0);
+
+    cbm_gitignore_t *gi = NULL;
+    ASSERT_EQ(cbm_gitignore_load_ex(path, &gi), CBM_GITIGNORE_LOAD_ERROR);
+    ASSERT_NULL(gi);
+    remove(path);
+    PASS();
+}
+#endif
+
+TEST(gi_iterative_matcher_handles_adversarial_stars) {
+    enum { REPEATS = 2000 };
+    char *pattern = malloc((size_t)REPEATS * 2U + 3U);
+    char *path = malloc((size_t)REPEATS + 2U);
+    ASSERT_NOT_NULL(pattern);
+    ASSERT_NOT_NULL(path);
+    size_t at = 0;
+    for (int i = 0; i < REPEATS; i++) {
+        pattern[at++] = '*';
+        pattern[at++] = 'a';
+        path[i] = 'a';
+    }
+    pattern[at++] = 'b';
+    pattern[at++] = '\n';
+    pattern[at] = '\0';
+    path[REPEATS] = 'c';
+    path[REPEATS + 1] = '\0';
+
+    cbm_gitignore_t *gi = cbm_gitignore_parse(pattern);
+    ASSERT_NOT_NULL(gi);
+    ASSERT_FALSE(cbm_gitignore_matches(gi, path, false));
+    cbm_gitignore_free(gi);
+    free(pattern);
+    free(path);
+    PASS();
+}
+
+TEST(gi_matcher_complexity_cap_is_explicit) {
+    enum { REPEATS = 5000 };
+    char *pattern = malloc((size_t)REPEATS * 2U + 2U);
+    char *path = malloc((size_t)REPEATS + 1U);
+    ASSERT_NOT_NULL(pattern);
+    ASSERT_NOT_NULL(path);
+    size_t at = 0;
+    for (int i = 0; i < REPEATS; i++) {
+        pattern[at++] = '*';
+        pattern[at++] = 'a';
+        path[i] = 'a';
+    }
+    pattern[at++] = '\n';
+    pattern[at] = '\0';
+    path[REPEATS] = '\0';
+
+    cbm_gitignore_t *gi = cbm_gitignore_parse(pattern);
+    ASSERT_NOT_NULL(gi);
+    int result = 123;
+    ASSERT_FALSE(cbm_gitignore_match_result_ex(gi, path, false, &result));
+    ASSERT_EQ(result, 0);
+    cbm_gitignore_free(gi);
+    free(pattern);
+    free(path);
+    PASS();
+}
+
 /* ── Merge ─────────────────────────────────────────────────────── */
 
 TEST(gi_merge_patterns) {
     cbm_gitignore_t *base_gi = cbm_gitignore_parse("*.log\n");
-    cbm_gitignore_t *extra   = cbm_gitignore_parse("tmp/\nbuild/\n");
+    cbm_gitignore_t *extra = cbm_gitignore_parse("tmp/\nbuild/\n");
     ASSERT_NOT_NULL(base_gi);
     ASSERT_NOT_NULL(extra);
 
@@ -225,8 +332,8 @@ TEST(gi_merge_into_empty) {
 
 TEST(gi_merge_null_safe) {
     cbm_gitignore_t *gi = cbm_gitignore_parse("*.log\n");
-    cbm_gitignore_merge(gi, NULL);  /* should not crash */
-    cbm_gitignore_merge(NULL, gi);  /* should not crash */
+    cbm_gitignore_merge(gi, NULL); /* should not crash */
+    cbm_gitignore_merge(NULL, gi); /* should not crash */
     cbm_gitignore_free(gi);
     PASS();
 }
@@ -294,6 +401,13 @@ SUITE(gitignore) {
     RUN_TEST(gi_null_safe_free);
     RUN_TEST(gi_load_file);
     RUN_TEST(gi_load_nonexistent);
+    RUN_TEST(gi_load_embedded_nul_fails_closed);
+    RUN_TEST(gi_load_oversized_fails_closed);
+#ifndef _WIN32
+    RUN_TEST(gi_load_fifo_fails_without_blocking);
+#endif
+    RUN_TEST(gi_iterative_matcher_handles_adversarial_stars);
+    RUN_TEST(gi_matcher_complexity_cap_is_explicit);
     RUN_TEST(gi_merge_patterns);
     RUN_TEST(gi_merge_into_empty);
     RUN_TEST(gi_merge_null_safe);

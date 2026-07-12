@@ -13,6 +13,7 @@
 #define CBM_DISCOVER_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* Use the existing CBMLanguage enum from extraction layer */
@@ -39,13 +40,41 @@ const char *cbm_language_name(CBMLanguage lang);
  * On read failure, defaults to CBM_LANG_MATLAB. */
 CBMLanguage cbm_disambiguate_m(const char *path);
 
+/* Classify an already captured .m source generation. The buffer need not be
+ * NUL-terminated; at most the first 4 KiB are inspected. */
+CBMLanguage cbm_disambiguate_m_content(const char *source, size_t source_len);
+
 /* ── Gitignore pattern matching ──────────────────────────────────── */
 
 typedef struct cbm_gitignore cbm_gitignore_t;
 
+typedef enum {
+    CBM_GITIGNORE_LOAD_ERROR = -1,
+    CBM_GITIGNORE_LOAD_MISSING = 0,
+    CBM_GITIGNORE_LOAD_OK = 1,
+} cbm_gitignore_load_result_t;
+
 /* Parse gitignore patterns from a file. Returns NULL on error (file not found, etc.).
  * Caller must call cbm_gitignore_free(). */
 cbm_gitignore_t *cbm_gitignore_load(const char *path);
+
+/* Load while distinguishing an absent optional file from an allocation or I/O
+ * failure. On MISSING and ERROR, *out is NULL. Discovery uses this form so an
+ * unreadable or partially parsed ignore file cannot silently become an empty
+ * matcher and publish an over-inclusive index. */
+cbm_gitignore_load_result_t cbm_gitignore_load_ex(const char *path, cbm_gitignore_t **out);
+
+/* Stable regular-file variant used by discovery snapshots. On OK, sha256 is
+ * the digest of the exact bytes parsed into *out. Optional absent files return
+ * MISSING with an empty digest. */
+cbm_gitignore_load_result_t cbm_gitignore_load_hashed(const char *path, cbm_gitignore_t **out,
+                                                      char sha256[65]);
+
+/* Allocation-/complexity-aware tri-state matching. Returns false only when a
+ * bounded matcher cannot safely evaluate the path; *result is -1 (explicit
+ * include), 0 (no rule), or 1 (ignore) on success. */
+bool cbm_gitignore_match_result_ex(const cbm_gitignore_t *gi, const char *rel_path, bool is_dir,
+                                   int *result);
 
 /* Parse gitignore patterns from a string (for testing).
  * Caller must call cbm_gitignore_free(). */
@@ -63,7 +92,7 @@ void cbm_gitignore_free(cbm_gitignore_t *gi);
  * NULL-safe on either argument.
  * Returns true on success (or when there is nothing to merge). Returns false on
  * allocation failure, in which case dst is left exactly as it was (atomic) — no
- * partial merge — so a failed merge degrades to "as if src was absent". */
+ * partial merge. Callers must treat failure as fatal rather than dropping src. */
 bool cbm_gitignore_merge(cbm_gitignore_t *dst, const cbm_gitignore_t *src);
 
 /* ── Directory skip / suffix filters ─────────────────────────────── */
@@ -103,6 +132,9 @@ typedef struct {
     char *rel_path;       /* relative to repo root (heap-allocated) */
     CBMLanguage language; /* detected language */
     int64_t size;         /* file size in bytes */
+    /* Non-empty only when language selection depends on content (.m). It
+     * hashes the exact stable generation passed to the classifier. */
+    char selection_sha256[65];
 } cbm_file_info_t;
 
 typedef struct {
@@ -141,6 +173,8 @@ typedef struct {
                      * "size-cap" */
 } cbm_ignored_file_t;
 
+typedef struct cbm_discovery_snapshot cbm_discovery_snapshot_t;
+
 /* Stored per-file ignore entries are capped (the walk still counts ALL of
  * them in *ignored_total_out, so truncation is always explicit, never
  * silent). Whole excluded subtrees stay exhaustive via excluded_out. */
@@ -156,6 +190,20 @@ int cbm_discover_ex2(const char *repo_path, const cbm_discover_opts_t *opts, cbm
                      int *count, char ***excluded_out, int *excluded_count_out,
                      cbm_ignored_file_t **ignored_out, int *ignored_count_out,
                      int *ignored_total_out);
+
+/* Generation-aware discovery. Requested-mode outputs match ex2, while the
+ * snapshot always fingerprints a mode-independent FULL selection: selected
+ * path/language/content-dependent classification, excluded coverage, ignored
+ * path/reason/total, and every loaded ignore-source digest. */
+int cbm_discover_ex3(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
+                     int *count, char ***excluded_out, int *excluded_count_out,
+                     cbm_ignored_file_t **ignored_out, int *ignored_count_out,
+                     int *ignored_total_out, cbm_discovery_snapshot_t **snapshot_out);
+
+const char *cbm_discovery_snapshot_fingerprint(const cbm_discovery_snapshot_t *snapshot);
+/* Rerun FULL discovery and compare its exact selection/coverage generation. */
+bool cbm_discovery_snapshot_verify(const cbm_discovery_snapshot_t *snapshot);
+void cbm_discovery_snapshot_free(cbm_discovery_snapshot_t *snapshot);
 
 /* Free an array of file info results. NULL-safe. */
 void cbm_discover_free(cbm_file_info_t *files, int count);

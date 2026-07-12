@@ -13,19 +13,44 @@
  */
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
+#include "foundation/platform.h"
+#include "foundation/sha256.h"
 
-enum { GI_INIT_CAP = 16, GI_CHAR_IDX1 = 1, GI_CHAR_IDX2 = 2, GI_SKIP3 = 3 };
+enum {
+    GI_INIT_CAP = 16,
+    GI_FILE_MAX_BYTES = 4 * 1024 * 1024,
+    GI_PATTERN_MAX_BYTES = 16 * 1024,
+    GI_PATTERN_COUNT_MAX = 100000,
+    GI_MATCH_PATH_MAX_BYTES = 1024 * 1024,
+    GI_MATCH_STEP_MAX = 16 * 1024 * 1024,
+};
 #include "discover/discover.h"
 
-#include <ctype.h>
-#include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* ── Pattern representation ──────────────────────────────────────── */
 
+typedef enum {
+    GI_TOKEN_LITERAL,
+    GI_TOKEN_QUESTION,
+    GI_TOKEN_STAR,
+    GI_TOKEN_DOUBLESTAR,
+    GI_TOKEN_DOUBLESTAR_SLASH,
+    GI_TOKEN_CHARCLASS,
+} gi_token_kind_t;
+
+typedef struct {
+    gi_token_kind_t kind;
+    size_t offset; /* literal byte or char-class body in pattern */
+    size_t length;
+} gi_token_t;
+
 typedef struct {
     char *pattern; /* the glob pattern (normalized) */
+    gi_token_t *tokens;
+    size_t token_count;
     bool negated;  /* starts with ! */
     bool dir_only; /* ends with / */
     bool rooted;   /* contains / (anchored to root) */
@@ -33,154 +58,179 @@ typedef struct {
 
 struct cbm_gitignore {
     gi_pattern_t *patterns;
-    int count;
-    int capacity;
+    size_t count;
+    size_t capacity;
 };
 
 /* ── Pattern matching engine ─────────────────────────────────────── */
 
-/* Forward declaration for recursive calls. */
-static bool glob_match(const char *pat, const char *str); // NOLINT(misc-no-recursion)
-
-/* Match a ** (doublestar-slash) pattern: try rest at every / boundary. */
-static bool glob_match_doublestar_slash(const char *pat, // NOLINT(misc-no-recursion)
-                                        const char *str) {
-    if (glob_match(pat, str)) {
-        return true;
+static bool gi_compile_pattern(gi_pattern_t *pattern, size_t len) {
+    if (len == 0 || len > GI_PATTERN_MAX_BYTES || len > SIZE_MAX / sizeof(gi_token_t)) {
+        return false;
     }
-    for (const char *s = str; *s; s++) {
-        if (*s == '/' && glob_match(pat, s + SKIP_ONE)) {
-            return true;
+    gi_token_t *tokens = malloc(len * sizeof(gi_token_t));
+    if (!tokens) {
+        return false;
+    }
+    size_t count = 0;
+    for (size_t i = 0; i < len;) {
+        gi_token_t token = {.kind = GI_TOKEN_LITERAL, .offset = i, .length = 1};
+        if (pattern->pattern[i] == '*') {
+            if (i + 1 < len && pattern->pattern[i + 1] == '*') {
+                if (i + 2 < len && pattern->pattern[i + 2] == '/') {
+                    token.kind = GI_TOKEN_DOUBLESTAR_SLASH;
+                    token.length = 3;
+                } else {
+                    token.kind = GI_TOKEN_DOUBLESTAR;
+                    token.length = 2;
+                }
+            } else {
+                token.kind = GI_TOKEN_STAR;
+            }
+        } else if (pattern->pattern[i] == '?') {
+            token.kind = GI_TOKEN_QUESTION;
+        } else if (pattern->pattern[i] == '[') {
+            size_t end = i + 1;
+            while (end < len && pattern->pattern[end] != ']') {
+                end++;
+            }
+            token.kind = GI_TOKEN_CHARCLASS;
+            token.offset = i + 1;
+            token.length = end - token.offset;
+            if (end < len) {
+                end++;
+            }
+            tokens[count++] = token;
+            i = end;
+            continue;
         }
+        tokens[count++] = token;
+        i += token.length;
     }
-    return false;
+    pattern->tokens = tokens;
+    pattern->token_count = count;
+    return true;
 }
 
-/* Match a ** (doublestar) followed by non-slash: try at every position. */
-static bool glob_match_doublestar_any(const char *pat, // NOLINT(misc-no-recursion)
-                                      const char *str) {
-    for (const char *s = str;; s++) {
-        if (glob_match(pat, s)) {
-            return true;
-        }
-        if (!*s) {
-            return false;
-        }
-    }
-}
-
-/* Match a * (single star): match any sequence not containing /. */
-static bool glob_match_star(const char *pat, const char *str) { // NOLINT(misc-no-recursion)
-    for (const char *s = str;; s++) {
-        if (glob_match(pat, s)) {
-            return true;
-        }
-        if (!*s || *s == '/') {
-            return false;
-        }
-    }
-}
-
-/* Match a [...] character class at current position.
- * Returns true if matched. Advances *pat_out past the closing ']'. */
-static bool glob_match_charclass(const char *pat, char ch, const char **pat_out) {
-    bool negate_class = false;
-    if (*pat == '!' || *pat == '^') {
-        negate_class = true;
-        pat++;
+static bool gi_charclass_matches(const gi_pattern_t *pattern, const gi_token_t *token,
+                                 unsigned char ch) {
+    const unsigned char *body = (const unsigned char *)pattern->pattern + token->offset;
+    size_t pos = 0;
+    bool negate = false;
+    if (pos < token->length && (body[pos] == '!' || body[pos] == '^')) {
+        negate = true;
+        pos++;
     }
     bool matched = false;
-    char prev = 0;
-    while (*pat && *pat != ']') {
-        if (*pat == '-' && prev && pat[GI_CHAR_IDX1] && pat[GI_CHAR_IDX1] != ']') {
-            pat++;
-            if (ch >= prev && ch <= *pat) {
+    unsigned char previous = 0;
+    while (pos < token->length) {
+        if (body[pos] == '-' && previous != 0 && pos + 1 < token->length) {
+            pos++;
+            if (ch >= previous && ch <= body[pos]) {
                 matched = true;
             }
-            prev = *pat;
-            pat++;
+            previous = body[pos++];
         } else {
-            if (ch == *pat) {
+            if (ch == body[pos]) {
                 matched = true;
             }
-            prev = *pat;
-            pat++;
+            previous = body[pos++];
         }
     }
-    if (*pat == ']') {
-        pat++;
-    }
-    *pat_out = pat;
-    return negate_class ? !matched : matched;
+    return negate ? !matched : matched;
 }
 
-/*
- * Match a glob pattern against a string.
- * Handles: * (non-slash), ** (any path), ? (single non-slash), [class]
- */
-/* Handle ** at current position. Returns match result. */
-static bool glob_match_doublestar(const char *pat, const char *str) { // NOLINT(misc-no-recursion)
-    if (pat[GI_CHAR_IDX2] == '/') {
-        return glob_match_doublestar_slash(pat + GI_SKIP3, str);
+/* Iterative dynamic programming avoids recursive wildcard backtracking. It
+ * uses two O(path) rows and caps token×path work, so hostile patterns cannot
+ * turn discovery into exponential CPU or a stack overflow. */
+static int gi_glob_match(const gi_pattern_t *pattern, const char *str) {
+    size_t len = strlen(str);
+    if (len > GI_MATCH_PATH_MAX_BYTES || len == SIZE_MAX ||
+        pattern->token_count > GI_MATCH_STEP_MAX / (len + SKIP_ONE)) {
+        return CBM_NOT_FOUND;
     }
-    if (pat[GI_CHAR_IDX2] == '\0') {
-        return true;
+    size_t row_len = len + SKIP_ONE;
+    if (row_len > SIZE_MAX / PAIR_LEN) {
+        return CBM_NOT_FOUND;
     }
-    return glob_match_doublestar_any(pat + GI_CHAR_IDX2, str);
-}
+    unsigned char *rows = calloc(row_len * PAIR_LEN, sizeof(unsigned char));
+    if (!rows) {
+        return CBM_NOT_FOUND;
+    }
+    unsigned char *next = rows;
+    unsigned char *current = rows + row_len;
+    next[len] = 1;
 
-static bool glob_match(const char *pat, const char *str) { // NOLINT(misc-no-recursion)
-    while (*pat && *str) {
-        if (pat[0] == '*' && pat[GI_CHAR_IDX1] == '*') {
-            return glob_match_doublestar(pat, str);
-        }
-
-        if (*pat == '*') {
-            return glob_match_star(pat + SKIP_ONE, str);
-        }
-
-        if (*pat == '?') {
-            if (*str == '/') {
-                return false;
+    for (size_t token_index = pattern->token_count; token_index > 0; token_index--) {
+        const gi_token_t *token = &pattern->tokens[token_index - SKIP_ONE];
+        memset(current, 0, row_len);
+        switch (token->kind) {
+        case GI_TOKEN_LITERAL:
+            for (size_t j = 0; j < len; j++) {
+                current[j] = (unsigned char)((unsigned char)str[j] ==
+                                                 (unsigned char)pattern->pattern[token->offset] &&
+                                             next[j + SKIP_ONE]);
             }
-            pat++;
-            str++;
-            continue;
-        }
-
-        if (*pat == '[') {
-            const char *new_pat = NULL;
-            if (!glob_match_charclass(pat + SKIP_ONE, *str, &new_pat)) {
-                return false;
+            break;
+        case GI_TOKEN_QUESTION:
+            for (size_t j = 0; j < len; j++) {
+                current[j] = (unsigned char)(str[j] != '/' && next[j + SKIP_ONE]);
             }
-            pat = new_pat;
-            str++;
-            continue;
+            break;
+        case GI_TOKEN_CHARCLASS:
+            for (size_t j = 0; j < len; j++) {
+                current[j] =
+                    (unsigned char)(gi_charclass_matches(pattern, token, (unsigned char)str[j]) &&
+                                    next[j + SKIP_ONE]);
+            }
+            break;
+        case GI_TOKEN_STAR:
+            current[len] = next[len];
+            for (size_t j = len; j > 0; j--) {
+                size_t at = j - SKIP_ONE;
+                current[at] =
+                    (unsigned char)(next[at] || (str[at] != '/' && current[at + SKIP_ONE]));
+            }
+            break;
+        case GI_TOKEN_DOUBLESTAR:
+            current[len] = next[len];
+            for (size_t j = len; j > 0; j--) {
+                size_t at = j - SKIP_ONE;
+                current[at] = (unsigned char)(next[at] || current[at + SKIP_ONE]);
+            }
+            break;
+        case GI_TOKEN_DOUBLESTAR_SLASH: {
+            bool suffix_after_slash_matches = false;
+            current[len] = next[len];
+            for (size_t j = len; j > 0; j--) {
+                size_t at = j - SKIP_ONE;
+                if (str[at] == '/' && next[at + SKIP_ONE]) {
+                    suffix_after_slash_matches = true;
+                }
+                current[at] = (unsigned char)(next[at] || suffix_after_slash_matches);
+            }
+            break;
         }
-
-        if (*pat != *str) {
-            return false;
         }
-        pat++;
-        str++;
+        unsigned char *swap = next;
+        next = current;
+        current = swap;
     }
-
-    while (*pat == '*') {
-        pat++;
-    }
-    return *pat == '\0' && *str == '\0';
+    int matched = next[0] ? 1 : 0;
+    free(rows);
+    return matched;
 }
 
 /* ── Pattern parsing ─────────────────────────────────────────────── */
 
-static void gi_add_pattern(cbm_gitignore_t *gi, const char *line, int len) {
+static bool gi_add_pattern(cbm_gitignore_t *gi, const char *line, size_t len) {
     /* Trim trailing whitespace */
     while (len > 0 && (line[len - SKIP_ONE] == ' ' || line[len - SKIP_ONE] == '\t' ||
                        line[len - SKIP_ONE] == '\r')) {
         len--;
     }
     if (len == 0) {
-        return;
+        return true;
     }
 
     gi_pattern_t p = {0};
@@ -194,7 +244,7 @@ static void gi_add_pattern(cbm_gitignore_t *gi, const char *line, int len) {
     }
 
     if (len == 0) {
-        return;
+        return true;
     }
 
     /* Check for trailing / (directory-only) */
@@ -204,7 +254,7 @@ static void gi_add_pattern(cbm_gitignore_t *gi, const char *line, int len) {
     }
 
     if (len == 0) {
-        return;
+        return true;
     }
 
     /* Check for leading / (rooted) */
@@ -215,12 +265,12 @@ static void gi_add_pattern(cbm_gitignore_t *gi, const char *line, int len) {
     }
 
     if (len == 0) {
-        return;
+        return true;
     }
 
     /* Check if pattern contains / anywhere (makes it rooted) */
     if (!p.rooted) {
-        for (int i = 0; i < len; i++) {
+        for (size_t i = 0; i < len; i++) {
             if (start[i] == '/') {
                 p.rooted = true;
                 break;
@@ -229,26 +279,50 @@ static void gi_add_pattern(cbm_gitignore_t *gi, const char *line, int len) {
     }
 
     /* Copy pattern */
+    if (len == SIZE_MAX) {
+        return false;
+    }
     p.pattern = malloc(len + SKIP_ONE);
     if (!p.pattern) {
-        return;
+        return false;
     }
     memcpy(p.pattern, start, len);
     p.pattern[len] = '\0';
+    if (!gi_compile_pattern(&p, len)) {
+        free(p.pattern);
+        return false;
+    }
 
     /* Grow array if needed */
+    if (gi->count >= GI_PATTERN_COUNT_MAX) {
+        free(p.tokens);
+        free(p.pattern);
+        return false;
+    }
     if (gi->count >= gi->capacity) {
-        int new_cap = gi->capacity ? gi->capacity * PAIR_LEN : GI_INIT_CAP;
+        if (gi->capacity > SIZE_MAX / PAIR_LEN) {
+            free(p.tokens);
+            free(p.pattern);
+            return false;
+        }
+        size_t new_cap = gi->capacity ? gi->capacity * PAIR_LEN : GI_INIT_CAP;
+        if (new_cap > SIZE_MAX / sizeof(gi_pattern_t)) {
+            free(p.tokens);
+            free(p.pattern);
+            return false;
+        }
         gi_pattern_t *new_patterns = realloc(gi->patterns, new_cap * sizeof(gi_pattern_t));
         if (!new_patterns) {
+            free(p.tokens);
             free(p.pattern);
-            return;
+            return false;
         }
         gi->patterns = new_patterns;
         gi->capacity = new_cap;
     }
 
     gi->patterns[gi->count++] = p;
+    return true;
 }
 
 /* ── Public API ──────────────────────────────────────────────────── */
@@ -267,11 +341,14 @@ cbm_gitignore_t *cbm_gitignore_parse(const char *content) {
     while (*line) {
         /* Find end of line */
         const char *eol = strchr(line, '\n');
-        int len = eol ? (int)(eol - line) : (int)strlen(line);
+        size_t len = eol ? (size_t)(eol - line) : strlen(line);
 
         /* Skip comments and blank lines */
         if (len > 0 && line[0] != '#') {
-            gi_add_pattern(gi, line, len);
+            if (!gi_add_pattern(gi, line, len)) {
+                cbm_gitignore_free(gi);
+                return NULL;
+            }
         }
 
         if (!eol) {
@@ -283,67 +360,70 @@ cbm_gitignore_t *cbm_gitignore_parse(const char *content) {
     return gi;
 }
 
-cbm_gitignore_t *cbm_gitignore_load(const char *path) {
-    if (!path) {
-        return NULL;
+cbm_gitignore_load_result_t cbm_gitignore_load_hashed(const char *path, cbm_gitignore_t **out,
+                                                      char sha256[65]) {
+    if (out) {
+        *out = NULL;
+    }
+    if (sha256) {
+        sha256[0] = '\0';
+    }
+    if (!path || !out || !sha256) {
+        return CBM_GITIGNORE_LOAD_ERROR;
     }
 
-    FILE *f = cbm_fopen(path, "r");
-    if (!f) {
-        return NULL;
+    /* The stable reader opens O_NONBLOCK on POSIX, rejects non-regular files,
+     * reads and hashes one descriptor generation, and verifies that the live
+     * pathname still names it. This prevents FIFO hangs and mixed-byte parses. */
+    int probe = cbm_path_probe(path);
+    if (probe == 0) {
+        return CBM_GITIGNORE_LOAD_MISSING;
     }
-
-    /* Read entire file */
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-
-    if (size <= 0) {
-        (void)fclose(f);
-        return cbm_gitignore_parse("");
+    if (probe < 0) {
+        return CBM_GITIGNORE_LOAD_ERROR;
     }
-
-    char *buf = malloc(size + SKIP_ONE);
-    if (!buf) {
-        (void)fclose(f);
-        return NULL;
+    char *buf = NULL;
+    size_t size = 0;
+    int read_rc = cbm_sha256_file_read_hex(path, GI_FILE_MAX_BYTES, &buf, &size, sha256);
+    if (read_rc != CBM_SHA256_FILE_HASHED) {
+        return CBM_GITIGNORE_LOAD_ERROR;
     }
-
-    size_t n = fread(buf, SKIP_ONE, size, f);
-    buf[n] = '\0';
-    (void)fclose(f);
-
-    cbm_gitignore_t *gi = cbm_gitignore_parse(buf);
+    /* The parser consumes C strings. Reject embedded NUL instead of silently
+     * treating the suffix (which may contain exclusion rules) as absent. */
+    if (memchr(buf, '\0', size) != NULL) {
+        free(buf);
+        sha256[0] = '\0';
+        return CBM_GITIGNORE_LOAD_ERROR;
+    }
+    *out = cbm_gitignore_parse(buf);
     free(buf);
-    return gi;
+    if (!*out) {
+        sha256[0] = '\0';
+        return CBM_GITIGNORE_LOAD_ERROR;
+    }
+    return CBM_GITIGNORE_LOAD_OK;
 }
 
-/* Match a non-rooted pattern against basename and path suffixes. */
-static bool match_unrooted(const char *pattern, const char *rel_path, const char *basename) {
-    if (glob_match(pattern, basename)) {
-        return true;
+cbm_gitignore_load_result_t cbm_gitignore_load_ex(const char *path, cbm_gitignore_t **out) {
+    char sha256[CBM_SHA256_HEX_LEN + SKIP_ONE];
+    return cbm_gitignore_load_hashed(path, out, sha256);
+}
+
+cbm_gitignore_t *cbm_gitignore_load(const char *path) {
+    cbm_gitignore_t *gi = NULL;
+    return cbm_gitignore_load_ex(path, &gi) == CBM_GITIGNORE_LOAD_OK ? gi : NULL;
+}
+
+bool cbm_gitignore_match_result_ex(const cbm_gitignore_t *gi, const char *rel_path, bool is_dir,
+                                   int *result) {
+    if (result) {
+        *result = 0;
     }
-    if (!strchr(rel_path, '/')) {
+    if (!result || !rel_path) {
         return false;
     }
-    /* Try matching at every / boundary */
-    const char *s = rel_path;
-    while (*s) {
-        if (glob_match(pattern, s)) {
-            return true;
-        }
-        const char *next = strchr(s, '/');
-        if (!next) {
-            break;
-        }
-        s = next + SKIP_ONE;
-    }
-    return false;
-}
-
-int cbm_gitignore_match_result(const cbm_gitignore_t *gi, const char *rel_path, bool is_dir) {
-    if (!gi || !rel_path) {
-        return 0;
+    if (!gi) {
+        return true;
     }
 
     /* Extract the basename for non-rooted pattern matching */
@@ -351,23 +431,39 @@ int cbm_gitignore_match_result(const cbm_gitignore_t *gi, const char *rel_path, 
     basename = basename ? basename + SKIP_ONE : rel_path;
 
     int matched = 0;
+    size_t total_steps = 0;
 
-    for (int i = 0; i < gi->count; i++) {
+    for (size_t i = 0; i < gi->count; i++) {
         const gi_pattern_t *p = &gi->patterns[i];
 
         if (p->dir_only && !is_dir) {
             continue;
         }
 
-        bool this_match = p->rooted ? glob_match(p->pattern, rel_path)
-                                    : match_unrooted(p->pattern, rel_path, basename);
+        const char *candidate = p->rooted ? rel_path : basename;
+        size_t candidate_len = strlen(candidate);
+        if (candidate_len == SIZE_MAX ||
+            p->token_count > (GI_MATCH_STEP_MAX - total_steps) / (candidate_len + SKIP_ONE)) {
+            return false;
+        }
+        total_steps += p->token_count * (candidate_len + SKIP_ONE);
+        int this_match = gi_glob_match(p, candidate);
+        if (this_match == CBM_NOT_FOUND) {
+            return false;
+        }
 
-        if (this_match) {
+        if (this_match > 0) {
             matched = p->negated ? -1 : 1;
         }
     }
 
-    return matched;
+    *result = matched;
+    return true;
+}
+
+int cbm_gitignore_match_result(const cbm_gitignore_t *gi, const char *rel_path, bool is_dir) {
+    int result = 0;
+    return cbm_gitignore_match_result_ex(gi, rel_path, is_dir, &result) ? result : 0;
 }
 
 bool cbm_gitignore_matches(const cbm_gitignore_t *gi, const char *rel_path, bool is_dir) {
@@ -378,7 +474,8 @@ void cbm_gitignore_free(cbm_gitignore_t *gi) {
     if (!gi) {
         return;
     }
-    for (int i = 0; i < gi->count; i++) {
+    for (size_t i = 0; i < gi->count; i++) {
+        free(gi->patterns[i].tokens);
         free(gi->patterns[i].pattern);
     }
     free(gi->patterns);
@@ -396,35 +493,54 @@ bool cbm_gitignore_merge(cbm_gitignore_t *dst, const cbm_gitignore_t *src) {
     if (!src || src->count == 0) {
         return true; /* nothing to merge */
     }
-    int needed = dst->count + src->count;
-    if (needed > dst->capacity) {
-        gi_pattern_t *grown = realloc(dst->patterns, (size_t)needed * sizeof(gi_pattern_t));
-        if (!grown) {
-            return false; /* dst left unchanged */
-        }
-        dst->patterns = grown;
-        dst->capacity = needed;
+    if (src->count > SIZE_MAX - dst->count) {
+        return false;
     }
-    int start_count = dst->count;
-    for (int i = 0; i < src->count; i++) {
+    size_t needed = dst->count + src->count;
+    if (needed > SIZE_MAX / sizeof(gi_pattern_t)) {
+        return false;
+    }
+    /* Build the complete result beside dst. This preserves even dst's backing
+     * allocation/capacity when a later pattern duplication fails. */
+    gi_pattern_t *merged = malloc(needed * sizeof(gi_pattern_t));
+    if (!merged) {
+        return false;
+    }
+    if (dst->count > 0) {
+        memcpy(merged, dst->patterns, dst->count * sizeof(gi_pattern_t));
+    }
+    size_t copied = 0;
+    for (size_t i = 0; i < src->count; i++) {
         char *pat = cbm_gitignore_merge_dup_hook_for_test
                         ? cbm_gitignore_merge_dup_hook_for_test(src->patterns[i].pattern)
                         : strdup(src->patterns[i].pattern);
         if (!pat) {
-            /* Roll back partial copies so dst is unchanged on failure (atomic
-             * merge). A silent partial merge could drop the very exclude
-             * pattern the caller relied on while keeping others. */
-            for (int j = start_count; j < dst->count; j++) {
-                free(dst->patterns[j].pattern);
+            for (size_t j = 0; j < copied; j++) {
+                free(merged[dst->count + j].tokens);
+                free(merged[dst->count + j].pattern);
             }
-            dst->count = start_count;
+            free(merged);
             return false;
         }
-        dst->patterns[dst->count].pattern = pat;
-        dst->patterns[dst->count].negated = src->patterns[i].negated;
-        dst->patterns[dst->count].dir_only = src->patterns[i].dir_only;
-        dst->patterns[dst->count].rooted = src->patterns[i].rooted;
-        dst->count++;
+        merged[dst->count + copied] = src->patterns[i];
+        merged[dst->count + copied].pattern = pat;
+        size_t token_bytes = src->patterns[i].token_count * sizeof(gi_token_t);
+        merged[dst->count + copied].tokens = malloc(token_bytes);
+        if (!merged[dst->count + copied].tokens) {
+            free(pat);
+            for (size_t j = 0; j < copied; j++) {
+                free(merged[dst->count + j].tokens);
+                free(merged[dst->count + j].pattern);
+            }
+            free(merged);
+            return false;
+        }
+        memcpy(merged[dst->count + copied].tokens, src->patterns[i].tokens, token_bytes);
+        copied++;
     }
+    free(dst->patterns);
+    dst->patterns = merged;
+    dst->count = needed;
+    dst->capacity = needed;
     return true;
 }

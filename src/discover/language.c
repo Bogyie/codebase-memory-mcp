@@ -998,21 +998,14 @@ static bool has_matlab_line_markers(const char *buf) {
     return false;
 }
 
-CBMLanguage cbm_disambiguate_m(const char *path) {
-    if (!path) {
+CBMLanguage cbm_disambiguate_m_content(const char *source, size_t source_len) {
+    if (!source) {
         return CBM_LANG_MATLAB;
     }
-
-    FILE *f = cbm_fopen(path, "r");
-    if (!f) {
-        return CBM_LANG_MATLAB;
-    }
-
-    /* Read first 4KB */
     char buf[CBM_SZ_4K + SKIP_ONE];
-    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
+    size_t n = source_len < CBM_SZ_4K ? source_len : CBM_SZ_4K;
+    memcpy(buf, source, n);
     buf[n] = '\0';
-    (void)fclose(f);
 
     if (has_objc_markers(buf)) {
         return CBM_LANG_OBJC;
@@ -1029,4 +1022,19 @@ CBMLanguage cbm_disambiguate_m(const char *path) {
     }
 
     return CBM_LANG_MATLAB;
+}
+
+CBMLanguage cbm_disambiguate_m(const char *path) {
+    if (!path) {
+        return CBM_LANG_MATLAB;
+    }
+
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_MATLAB;
+    }
+    char buf[CBM_SZ_4K];
+    size_t n = fread(buf, SKIP_ONE, sizeof(buf), f);
+    (void)fclose(f);
+    return cbm_disambiguate_m_content(buf, n);
 }
