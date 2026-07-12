@@ -622,7 +622,8 @@ TEST(cli_skill_files_content) {
     /* Reference capabilities */
     ASSERT(strstr(sk[0].content, "query_graph") != NULL);
     ASSERT(strstr(sk[0].content, "Cypher") != NULL);
-    ASSERT(strstr(sk[0].content, "22 MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "23 MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "get_design_context") != NULL);
     ASSERT(strstr(sk[0].content, "Global Memory Retrieval") != NULL);
     ASSERT(strstr(sk[0].content, "Do not search for an opposing view by default") != NULL);
 
