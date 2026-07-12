@@ -49,6 +49,10 @@ export const messages = {
       connected: "Connected context",
       noRelations: "No connected usages or aliases.",
       noTokens: "No tokens match this filter.",
+      loadMore: "Load more",
+      loadingMore: "Loading more...",
+      definitions: "Definitions",
+      ambiguousDefinitions: "source definitions (review ambiguity)",
     },
     memory: {
       title: "Global Memory",
@@ -194,6 +198,10 @@ export const messages = {
       connected: "关联上下文",
       noRelations: "没有关联的使用位置或别名。",
       noTokens: "没有符合筛选条件的令牌。",
+      loadMore: "加载更多",
+      loadingMore: "正在加载...",
+      definitions: "定义来源",
+      ambiguousDefinitions: "个来源定义（请检查歧义）",
     },
     memory: {
       title: "全局记忆",

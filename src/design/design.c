@@ -20,12 +20,14 @@
 #include <yyjson/yyjson.h>
 
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 enum {
     DESIGN_MAX_FILE_SIZE = 8 * 1024 * 1024,
+    DESIGN_MAX_GLOB_LENGTH = 4096,
     DESIGN_PATH_CAP = 1024,
     DESIGN_QN_CAP = 2048,
 };
@@ -59,6 +61,8 @@ typedef struct {
     char *path;
     char *scope;
     int64_t system_id;
+    const cbm_file_info_t *file;
+    char *source;
 } design_document_t;
 
 typedef struct {
@@ -69,6 +73,7 @@ typedef struct {
 
 typedef struct {
     int64_t token_id;
+    char *source_path;
     char *token_path;
     char *type;
     char *value;
@@ -103,6 +108,9 @@ typedef struct {
     int document_count;
     int css_usage_count;
 } design_ctx_t;
+
+static void design_scope_for_file(design_ctx_t *ctx, const char *path, char *scope,
+                                  size_t scope_size, int64_t *system_id);
 
 static char *design_strdup(const char *s) {
     if (!s) {
@@ -219,38 +227,68 @@ static void design_mode_qn(const design_ctx_t *ctx, const char *scope, const cha
              normalized_modifier, normalized_context);
 }
 
-/* Small glob matcher for repository-relative configuration patterns. Supports
- * `*`, `**`, and `?`; path separators are normalized by discovery already. */
+/* Bounded dynamic-programming glob matcher for repository-relative
+ * configuration patterns. Supports `*`, `**`, and `?`; path separators are
+ * normalized by discovery already. The previous recursive backtracker could
+ * take exponential time on patterns such as `*a*a*...*b`. */
 static bool design_glob_match(const char *pattern, const char *text) {
     if (!pattern || !text) {
         return false;
     }
-    if (*pattern == '\0') {
-        return *text == '\0';
-    }
-    if (*pattern == '*') {
-        bool double_star = pattern[1] == '*';
-        const char *next = pattern + (double_star ? 2 : 1);
-        if (double_star && *next == '/') {
-            next++;
-        }
-        if (design_glob_match(next, text)) {
-            return true;
-        }
-        for (const char *p = text; *p; p++) {
-            if (!double_star && *p == '/') {
-                break;
-            }
-            if (design_glob_match(pattern, p + 1)) {
-                return true;
-            }
-        }
+    size_t pattern_len = strlen(pattern);
+    size_t text_len = strlen(text);
+    if (pattern_len > DESIGN_MAX_GLOB_LENGTH || text_len > DESIGN_MAX_GLOB_LENGTH) {
         return false;
     }
-    if (*pattern == '?') {
-        return *text != '\0' && *text != '/' && design_glob_match(pattern + 1, text + 1);
+
+    unsigned char *previous = (unsigned char *)calloc(text_len + 1, 1);
+    unsigned char *current = (unsigned char *)calloc(text_len + 1, 1);
+    if (!previous || !current) {
+        free(previous);
+        free(current);
+        return false;
     }
-    return *pattern == *text && design_glob_match(pattern + 1, text + 1);
+    previous[0] = 1;
+
+    for (size_t i = 0; i < pattern_len;) {
+        memset(current, 0, text_len + 1);
+        char token = pattern[i++];
+        bool double_star = false;
+        if (token == '*' && i < pattern_len && pattern[i] == '*') {
+            double_star = true;
+            i++;
+            /* Preserve the historical recursive-directory wildcard semantics: the separator belongs
+             * to the recursive wildcard and zero directories are allowed. */
+            if (i < pattern_len && pattern[i] == '/') {
+                i++;
+            }
+        }
+
+        if (token == '*') {
+            current[0] = previous[0];
+            for (size_t j = 1; j <= text_len; j++) {
+                bool may_consume = double_star || text[j - 1] != '/';
+                current[j] = (unsigned char)(previous[j] || (may_consume && current[j - 1]));
+            }
+        } else if (token == '?') {
+            for (size_t j = 1; j <= text_len; j++) {
+                current[j] = (unsigned char)(previous[j - 1] && text[j - 1] != '/');
+            }
+        } else {
+            for (size_t j = 1; j <= text_len; j++) {
+                current[j] = (unsigned char)(previous[j - 1] && text[j - 1] == token);
+            }
+        }
+
+        unsigned char *swap = previous;
+        previous = current;
+        current = swap;
+    }
+
+    bool matched = previous[text_len] != 0;
+    free(previous);
+    free(current);
+    return matched;
 }
 
 static bool design_patterns_match(const design_patterns_t *patterns, const char *path) {
@@ -289,6 +327,10 @@ static int design_patterns_load(yyjson_val *obj, const char *key, design_pattern
         if (!s || !s[0]) {
             continue;
         }
+        if (strlen(s) > DESIGN_MAX_GLOB_LENGTH) {
+            cbm_log_warn("design.pattern_skip", "key", key, "reason", "too_long");
+            continue;
+        }
         char **grown = (char **)realloc(out->items, (size_t)(out->count + 1) * sizeof(char *));
         if (!grown) {
             return -1;
@@ -303,30 +345,81 @@ static int design_patterns_load(yyjson_val *obj, const char *key, design_pattern
     return 0;
 }
 
-static char *design_read_file(const cbm_file_info_t *file, size_t *out_len) {
+static char *design_read_file(const cbm_file_info_t *file, size_t *out_len,
+                              const char **out_failure) {
     if (out_len) {
         *out_len = 0;
     }
-    if (!file || !file->path || file->size <= 0 || file->size > DESIGN_MAX_FILE_SIZE) {
+    if (out_failure) {
+        *out_failure = NULL;
+    }
+    if (!file || !file->path || file->size <= 0) {
+        if (out_failure) {
+            *out_failure = "empty_or_invalid_size";
+        }
+        return NULL;
+    }
+    if (file->size > DESIGN_MAX_FILE_SIZE) {
+        if (out_failure) {
+            *out_failure = "oversized";
+        }
         return NULL;
     }
     FILE *f = cbm_fopen(file->path, "rb");
     if (!f) {
+        if (out_failure) {
+            *out_failure = "open_failed";
+        }
         return NULL;
     }
     size_t cap = (size_t)file->size;
     char *buf = (char *)malloc(cap + 1);
     if (!buf) {
         (void)fclose(f);
+        if (out_failure) {
+            *out_failure = "out_of_memory";
+        }
         return NULL;
     }
     size_t n = fread(buf, 1, cap, f);
+    bool complete = n == cap && ferror(f) == 0;
+    if (complete) {
+        int extra = fgetc(f);
+        complete = extra == EOF && ferror(f) == 0;
+    }
     (void)fclose(f);
+    if (!complete) {
+        free(buf);
+        if (out_failure) {
+            *out_failure = "incomplete_or_changed_read";
+        }
+        return NULL;
+    }
     buf[n] = '\0';
     if (out_len) {
         *out_len = n;
     }
     return buf;
+}
+
+/* Return 1 with an owned source buffer, 0 for a diagnosed skippable input,
+ * and -1 for OOM so the staging pass preserves the previous good graph. */
+static int design_load_source(const cbm_file_info_t *file, const char *source_kind,
+                              char **out_source, size_t *out_len) {
+    if (!out_source) {
+        return -1;
+    }
+    *out_source = NULL;
+    const char *failure = NULL;
+    char *source = design_read_file(file, out_len, &failure);
+    if (source) {
+        *out_source = source;
+        return 1;
+    }
+    cbm_log_warn("design.source_skip", "source_kind", source_kind ? source_kind : "unknown", "path",
+                 file && file->rel_path ? file->rel_path : "", "reason",
+                 failure ? failure : "unknown");
+    return failure && strcmp(failure, "out_of_memory") == 0 ? -1 : 0;
 }
 
 static int design_load_config(design_ctx_t *ctx) {
@@ -540,6 +633,7 @@ static int design_token_definition_add(design_ctx_t *ctx, const char *file_path,
     design_token_definition_t *definition = &source->items[source->count++];
     memset(definition, 0, sizeof(*definition));
     definition->token_id = token_id;
+    definition->source_path = design_strdup(file_path);
     definition->token_path = design_strdup(token_path);
     definition->type = design_strdup(type);
     definition->value = design_strdup(value);
@@ -547,7 +641,30 @@ static int design_token_definition_add(design_ctx_t *ctx, const char *file_path,
     definition->format = design_strdup(format);
     definition->provenance = design_strdup(provenance);
     definition->start_line = start_line;
-    return definition->token_path && (!value || definition->value) ? 0 : -1;
+    return definition->source_path && definition->token_path && (!value || definition->value) ? 0
+                                                                                              : -1;
+}
+
+/* Sources are parsed in descending priority, so the first definition for a
+ * qualified token is its canonical definition. Ties are broken by source path
+ * and line through the ordered file walk below. Every later definition is
+ * retained as provenance metadata rather than silently overwriting it. */
+static int design_source_priority(const char *format, const char *provenance) {
+    int provenance_rank = 100;
+    if (provenance && strcmp(provenance, "authoritative") == 0) {
+        provenance_rank = 200;
+    } else if (provenance && strcmp(provenance, "generated") == 0) {
+        provenance_rank = 0;
+    }
+    int format_rank = 0;
+    if (format && strcmp(format, "dtcg") == 0) {
+        format_rank = 30;
+    } else if (format && strcmp(format, "design-md") == 0) {
+        format_rank = 20;
+    } else if (format && strcmp(format, "css") == 0) {
+        format_rank = 10;
+    }
+    return provenance_rank + format_rank;
 }
 
 static int64_t design_upsert_token(design_ctx_t *ctx, const char *scope, const char *token_path,
@@ -560,41 +677,37 @@ static int64_t design_upsert_token(design_ctx_t *ctx, const char *scope, const c
     design_token_qn(ctx, scope, token_path, qn, sizeof(qn));
     const cbm_gbuf_node_t *existing = cbm_gbuf_find_by_qn(ctx->opts->gbuf, qn);
     bool incoming_generated = provenance && strcmp(provenance, "generated") == 0;
-    bool incoming_css = format && strcmp(format, "css") == 0;
-    if (existing && (incoming_generated || incoming_css)) {
-        if (incoming_generated) {
-            char *file_qn =
-                cbm_pipeline_fqn_compute(ctx->opts->project_name, file_path, "__file__");
-            const cbm_gbuf_node_t *file_node =
-                file_qn ? cbm_gbuf_find_by_qn(ctx->opts->gbuf, file_qn) : NULL;
-            if (file_node) {
-                cbm_gbuf_insert_edge(ctx->opts->gbuf, existing->id, file_node->id, "GENERATED_AS",
-                                     "{}");
-            }
-            free(file_qn);
+    int64_t id = existing ? existing->id : 0;
+    if (!existing) {
+        char *props = design_properties(format, file_path, scope, token_path, type, value,
+                                        description, provenance, reference, extends, composite);
+        if (!props) {
+            return 0;
         }
-        return existing->id;
+        const char *name = strrchr(token_path, '.');
+        name = name ? name + 1 : token_path;
+        id = cbm_gbuf_upsert_node(ctx->opts->gbuf, "DesignToken", name, qn, file_path, start_line,
+                                  start_line, props);
+        free(props);
     }
-    char *props = design_properties(format, file_path, scope, token_path, type, value, description,
-                                    provenance, reference, extends, composite);
-    if (!props) {
-        return 0;
-    }
-    const char *name = strrchr(token_path, '.');
-    name = name ? name + 1 : token_path;
-    int64_t id = cbm_gbuf_upsert_node(ctx->opts->gbuf, "DesignToken", name, qn, file_path,
-                                      start_line, start_line, props);
-    free(props);
     if (id > 0 && system_id > 0) {
         cbm_gbuf_insert_edge(ctx->opts->gbuf, system_id, id, "PROVIDES", "{}");
     }
     if (!existing && id > 0) {
         ctx->token_count++;
     }
-    if (id > 0 && !incoming_generated && !incoming_css &&
-        design_token_definition_add(ctx, file_path, id, token_path, type, value, description,
-                                    format, provenance, start_line) != 0) {
+    if (id > 0 && design_token_definition_add(ctx, file_path, id, token_path, type, value,
+                                              description, format, provenance, start_line) != 0) {
         return 0;
+    }
+    if (id > 0 && incoming_generated) {
+        char *file_qn = cbm_pipeline_fqn_compute(ctx->opts->project_name, file_path, "__file__");
+        const cbm_gbuf_node_t *file_node =
+            file_qn ? cbm_gbuf_find_by_qn(ctx->opts->gbuf, file_qn) : NULL;
+        if (file_node) {
+            cbm_gbuf_insert_edge(ctx->opts->gbuf, id, file_node->id, "GENERATED_AS", "{}");
+        }
+        free(file_qn);
     }
     if (value && value[0] == '{') {
         size_t n = strlen(value);
@@ -612,6 +725,174 @@ static int64_t design_upsert_token(design_ctx_t *ctx, const char *scope, const c
         }
     }
     return id;
+}
+
+static int design_definition_compare(const void *a, const void *b) {
+    const design_token_definition_t *left = *(const design_token_definition_t *const *)a;
+    const design_token_definition_t *right = *(const design_token_definition_t *const *)b;
+    if (left->token_id < right->token_id) {
+        return -1;
+    }
+    if (left->token_id > right->token_id) {
+        return 1;
+    }
+    int path_order = strcmp(left->source_path, right->source_path);
+    if (path_order != 0) {
+        return path_order;
+    }
+    if (left->start_line != right->start_line) {
+        return left->start_line < right->start_line ? -1 : 1;
+    }
+    return strcmp(left->value ? left->value : "", right->value ? right->value : "");
+}
+
+static bool design_definition_is_canonical(const cbm_gbuf_node_t *token,
+                                           const design_token_definition_t *definition) {
+    return token && token->file_path && strcmp(token->file_path, definition->source_path) == 0 &&
+           token->start_line == definition->start_line;
+}
+
+static void design_definition_add_json(yyjson_mut_doc *doc, yyjson_mut_val *object,
+                                       const design_token_definition_t *definition, bool canonical,
+                                       bool ambiguous) {
+    yyjson_mut_obj_add_str(doc, object, "source_path", definition->source_path);
+    yyjson_mut_obj_add_int(doc, object, "line", definition->start_line);
+    yyjson_mut_obj_add_str(doc, object, "token_path", definition->token_path);
+    if (definition->type) {
+        yyjson_mut_obj_add_str(doc, object, "token_type", definition->type);
+    }
+    if (definition->value) {
+        yyjson_mut_obj_add_str(doc, object, "value", definition->value);
+    }
+    if (definition->description) {
+        yyjson_mut_obj_add_str(doc, object, "description", definition->description);
+    }
+    if (definition->format) {
+        yyjson_mut_obj_add_str(doc, object, "source_format", definition->format);
+    }
+    if (definition->provenance) {
+        yyjson_mut_obj_add_str(doc, object, "provenance", definition->provenance);
+    }
+    yyjson_mut_obj_add_bool(doc, object, "canonical", canonical);
+    yyjson_mut_obj_add_bool(doc, object, "ambiguous", ambiguous);
+}
+
+static char *design_definition_edge_properties(const design_token_definition_t *definition,
+                                               bool canonical, bool ambiguous) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    design_definition_add_json(doc, root, definition, canonical, ambiguous);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+/* Attach the complete source set to each canonical DesignToken and add one
+ * File-[:DEFINES_TOKEN]->DesignToken edge per source definition. This keeps
+ * duplicate DTCG/CSS values queryable while the token itself remains the
+ * stable identity used by aliases, modes, and usages. */
+static int design_materialize_token_definitions(design_ctx_t *ctx) {
+    int definition_count = 0;
+    for (int i = 0; i < ctx->token_sources.count; i++) {
+        definition_count += ctx->token_sources.items[i].count;
+    }
+    if (definition_count == 0) {
+        return 0;
+    }
+    design_token_definition_t **definitions =
+        (design_token_definition_t **)malloc((size_t)definition_count * sizeof(*definitions));
+    if (!definitions) {
+        return -1;
+    }
+    int cursor = 0;
+    for (int i = 0; i < ctx->token_sources.count; i++) {
+        for (int j = 0; j < ctx->token_sources.items[i].count; j++) {
+            definitions[cursor++] = &ctx->token_sources.items[i].items[j];
+        }
+    }
+    qsort(definitions, (size_t)definition_count, sizeof(*definitions), design_definition_compare);
+
+    int rc = 0;
+    for (int first = 0; first < definition_count;) {
+        int end = first + 1;
+        while (end < definition_count &&
+               definitions[end]->token_id == definitions[first]->token_id) {
+            end++;
+        }
+        const cbm_gbuf_node_t *token =
+            cbm_gbuf_find_by_id(ctx->opts->gbuf, definitions[first]->token_id);
+        yyjson_doc *properties_doc =
+            token && token->properties_json
+                ? yyjson_read(token->properties_json, strlen(token->properties_json), 0)
+                : NULL;
+        if (!token || !properties_doc || !yyjson_is_obj(yyjson_doc_get_root(properties_doc))) {
+            yyjson_doc_free(properties_doc);
+            rc = -1;
+            break;
+        }
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *root =
+            doc ? yyjson_val_mut_copy(doc, yyjson_doc_get_root(properties_doc)) : NULL;
+        yyjson_doc_free(properties_doc);
+        if (!doc || !root) {
+            yyjson_mut_doc_free(doc);
+            rc = -1;
+            break;
+        }
+        yyjson_mut_doc_set_root(doc, root);
+        bool ambiguous = end - first > 1;
+        yyjson_mut_obj_add_int(doc, root, "definition_count", end - first);
+        yyjson_mut_obj_add_bool(doc, root, "ambiguous", ambiguous);
+        yyjson_mut_obj_add_str(
+            doc, root, "canonical_selection",
+            "provenance then source format; ties use source path and first definition");
+        yyjson_mut_val *array = yyjson_mut_arr(doc);
+        for (int i = first; i < end; i++) {
+            bool canonical = design_definition_is_canonical(token, definitions[i]);
+            yyjson_mut_val *entry = yyjson_mut_obj(doc);
+            design_definition_add_json(doc, entry, definitions[i], canonical, ambiguous);
+            yyjson_mut_arr_add_val(array, entry);
+
+            char *file_qn = cbm_pipeline_fqn_compute(ctx->opts->project_name,
+                                                     definitions[i]->source_path, "__file__");
+            const cbm_gbuf_node_t *file_node =
+                file_qn ? cbm_gbuf_find_by_qn(ctx->opts->gbuf, file_qn) : NULL;
+            char *edge_properties =
+                design_definition_edge_properties(definitions[i], canonical, ambiguous);
+            if (!edge_properties ||
+                (file_node && cbm_gbuf_insert_edge(ctx->opts->gbuf, file_node->id, token->id,
+                                                   "DEFINES_TOKEN", edge_properties) <= 0)) {
+                free(file_qn);
+                free(edge_properties);
+                yyjson_mut_doc_free(doc);
+                rc = -1;
+                goto done;
+            }
+            free(file_qn);
+            free(edge_properties);
+        }
+        yyjson_mut_obj_add_val(doc, root, "definitions", array);
+        char *properties = yyjson_mut_write(doc, 0, NULL);
+        yyjson_mut_doc_free(doc);
+        if (!properties ||
+            cbm_gbuf_upsert_node(ctx->opts->gbuf, token->label, token->name, token->qualified_name,
+                                 token->file_path, token->start_line, token->end_line,
+                                 properties) <= 0) {
+            free(properties);
+            rc = -1;
+            break;
+        }
+        free(properties);
+        first = end;
+    }
+
+done:
+    free(definitions);
+    return rc;
 }
 
 static char *design_json_value_string(yyjson_val *value) {
@@ -699,12 +980,12 @@ static int design_parse_dtcg_object(design_ctx_t *ctx, yyjson_val *object, const
     return 0;
 }
 
-static int design_parse_dtcg(design_ctx_t *ctx, const cbm_file_info_t *file, const char *scope,
-                             int64_t system_id) {
+static int design_parse_dtcg(design_ctx_t *ctx, const cbm_file_info_t *file) {
     size_t len = 0;
-    char *source = design_read_file(file, &len);
-    if (!source) {
-        return 0;
+    char *source = NULL;
+    int read_rc = design_load_source(file, "dtcg", &source, &len);
+    if (read_rc <= 0) {
+        return read_rc;
     }
     yyjson_doc *doc = yyjson_read(source, len, 0);
     free(source);
@@ -712,6 +993,9 @@ static int design_parse_dtcg(design_ctx_t *ctx, const cbm_file_info_t *file, con
         cbm_log_warn("design.parse_skip", "format", "dtcg", "path", file->rel_path);
         return 0;
     }
+    char scope[DESIGN_PATH_CAP];
+    int64_t system_id = 0;
+    design_scope_for_file(ctx, file->rel_path, scope, sizeof(scope), &system_id);
     yyjson_val *root = yyjson_doc_get_root(doc);
     const char *provenance = design_provenance(ctx, file->rel_path, "authoritative");
     int rc = design_parse_dtcg_object(ctx, root, "", NULL, NULL, scope, file->rel_path, provenance,
@@ -960,8 +1244,8 @@ static int design_parse_frontmatter(design_ctx_t *ctx, char *source, const cbm_f
     return 0;
 }
 
-static int design_documents_add(design_ctx_t *ctx, const char *path, const char *scope,
-                                int64_t system_id) {
+static int design_documents_add(design_ctx_t *ctx, const cbm_file_info_t *file, const char *scope,
+                                int64_t system_id, char *source) {
     if (ctx->documents.count == ctx->documents.cap) {
         int cap = ctx->documents.cap ? ctx->documents.cap * 2 : 8;
         design_document_t *grown =
@@ -972,11 +1256,21 @@ static int design_documents_add(design_ctx_t *ctx, const char *path, const char 
         ctx->documents.items = grown;
         ctx->documents.cap = cap;
     }
+    char *path = design_strdup(file->rel_path);
+    char *scope_copy = design_strdup(scope);
+    if (!path || !scope_copy || !source) {
+        free(path);
+        free(scope_copy);
+        return -1;
+    }
     design_document_t *doc = &ctx->documents.items[ctx->documents.count++];
-    doc->path = design_strdup(path);
-    doc->scope = design_strdup(scope);
+    memset(doc, 0, sizeof(*doc));
+    doc->path = path;
+    doc->scope = scope_copy;
     doc->system_id = system_id;
-    return doc->path && doc->scope ? 0 : -1;
+    doc->file = file;
+    doc->source = source;
+    return 0;
 }
 
 static void design_frontmatter_name(const char *source, char *out, size_t out_size) {
@@ -1030,7 +1324,11 @@ static int design_parse_document(design_ctx_t *ctx, const cbm_file_info_t *file)
     char name[256];
     snprintf(name, sizeof(name), "%s", strcmp(scope, "root") == 0 ? "Repository Design" : scope);
     size_t len = 0;
-    char *source = design_read_file(file, &len);
+    char *source = NULL;
+    int read_rc = design_load_source(file, "design-md", &source, &len);
+    if (read_rc <= 0) {
+        return read_rc;
+    }
     design_frontmatter_name(source, name, sizeof(name));
     int64_t system_id = design_ensure_system(ctx, scope, file->rel_path, name);
     if (system_id <= 0) {
@@ -1044,19 +1342,21 @@ static int design_parse_document(design_ctx_t *ctx, const cbm_file_info_t *file)
         cbm_gbuf_insert_edge(ctx->opts->gbuf, system_id, file_node->id, "DOCUMENTED_BY", "{}");
     }
     free(file_qn);
-    if (source) {
-        if (design_parse_frontmatter(ctx, source, file, scope, system_id, name, sizeof(name)) !=
-            0) {
-            free(source);
-            return -1;
-        }
+    if (design_documents_add(ctx, file, scope, system_id, source) != 0) {
         free(source);
-    }
-    if (design_documents_add(ctx, file->rel_path, scope, system_id) != 0) {
         return -1;
     }
     ctx->document_count++;
     return 0;
+}
+
+static int design_parse_registered_document(design_ctx_t *ctx, design_document_t *document) {
+    char name[256];
+    snprintf(name, sizeof(name), "%s",
+             strcmp(document->scope, "root") == 0 ? "Repository Design" : document->scope);
+    design_frontmatter_name(document->source, name, sizeof(name));
+    return design_parse_frontmatter(ctx, document->source, document->file, document->scope,
+                                    document->system_id, name, sizeof(name));
 }
 
 static bool design_path_in_scope(const char *path, const char *scope_dir) {
@@ -1273,9 +1573,10 @@ static char *design_mode_override_properties(const design_token_definition_t *de
 
 static int design_parse_resolver(design_ctx_t *ctx, const cbm_file_info_t *file) {
     size_t len = 0;
-    char *source = design_read_file(file, &len);
-    if (!source) {
-        return 0;
+    char *source = NULL;
+    int read_rc = design_load_source(file, "dtcg-resolver", &source, &len);
+    if (read_rc <= 0) {
+        return read_rc;
     }
     yyjson_doc *doc = yyjson_read(source, len, 0);
     free(source);
@@ -1447,9 +1748,11 @@ static int64_t design_find_css_token(design_ctx_t *ctx, const char *scope, const
 static int design_parse_css(design_ctx_t *ctx, const cbm_file_info_t *file, bool definitions,
                             bool usages) {
     size_t len = 0;
-    char *source = design_read_file(file, &len);
-    if (!source) {
-        return 0;
+    char *source = NULL;
+    const char *source_kind = design_has_suffix(file->rel_path, ".scss") ? "scss" : "css";
+    int read_rc = design_load_source(file, source_kind, &source, &len);
+    if (read_rc <= 0) {
+        return read_rc;
     }
     char scope[DESIGN_PATH_CAP];
     int64_t system_id = 0;
@@ -1627,12 +1930,14 @@ static void design_ctx_free(design_ctx_t *ctx) {
     for (int i = 0; i < ctx->documents.count; i++) {
         free(ctx->documents.items[i].path);
         free(ctx->documents.items[i].scope);
+        free(ctx->documents.items[i].source);
     }
     free(ctx->documents.items);
     for (int i = 0; i < ctx->token_sources.count; i++) {
         design_token_source_t *source = &ctx->token_sources.items[i];
         free(source->path);
         for (int j = 0; j < source->count; j++) {
+            free(source->items[j].source_path);
             free(source->items[j].token_path);
             free(source->items[j].type);
             free(source->items[j].value);
@@ -1645,70 +1950,105 @@ static void design_ctx_free(design_ctx_t *ctx) {
     free(ctx->token_sources.items);
 }
 
+static int design_file_compare(const void *a, const void *b) {
+    const cbm_file_info_t *left = *(const cbm_file_info_t *const *)a;
+    const cbm_file_info_t *right = *(const cbm_file_info_t *const *)b;
+    return strcmp(left->rel_path, right->rel_path);
+}
+
 int cbm_design_index(const cbm_design_index_opts_t *opts) {
     if (!opts || !opts->project_name || !opts->repo_path || !opts->gbuf ||
         (!opts->files && opts->file_count > 0) || opts->file_count < 0) {
         return -1;
     }
     design_ctx_t ctx = {.opts = opts};
+    const cbm_file_info_t **files = NULL;
+    int rc = -1;
     if (design_load_config(&ctx) != 0) {
-        design_ctx_free(&ctx);
-        return -1;
+        goto done;
+    }
+    if (opts->file_count > 0) {
+        files = (const cbm_file_info_t **)malloc((size_t)opts->file_count * sizeof(*files));
+        if (!files) {
+            goto done;
+        }
+        for (int i = 0; i < opts->file_count; i++) {
+            files[i] = &opts->files[i];
+        }
+        qsort(files, (size_t)opts->file_count, sizeof(*files), design_file_compare);
     }
 
-    /* Documents first: nested scope inheritance for every later artifact. */
+    /* Register readable documents first so nearest-ancestor scope inheritance
+     * is available to every token source. Frontmatter values are parsed later
+     * in source-priority order. */
     for (int i = 0; i < opts->file_count; i++) {
-        if (design_is_document(&ctx, opts->files[i].rel_path) &&
-            design_parse_document(&ctx, &opts->files[i]) != 0) {
-            design_ctx_free(&ctx);
-            return -1;
+        if (design_is_document(&ctx, files[i]->rel_path) &&
+            design_parse_document(&ctx, files[i]) != 0) {
+            goto done;
         }
     }
 
-    /* Machine-readable token sources are authoritative by default. */
-    for (int i = 0; i < opts->file_count; i++) {
-        const cbm_file_info_t *file = &opts->files[i];
-        if (!design_is_token_source(&ctx, file->rel_path)) {
-            continue;
-        }
-        char scope[DESIGN_PATH_CAP];
-        int64_t system_id = 0;
-        design_scope_for_file(&ctx, file->rel_path, scope, sizeof(scope), &system_id);
-        if (design_parse_dtcg(&ctx, file, scope, system_id) != 0) {
-            design_ctx_free(&ctx);
-            return -1;
-        }
-    }
+    static const int priorities[] = {230, 220, 210, 130, 120, 110, 30, 20, 10};
+    for (size_t phase = 0; phase < sizeof(priorities) / sizeof(priorities[0]); phase++) {
+        int priority = priorities[phase];
 
-    /* CSS definitions precede usages across the whole repository so file
-     * ordering never affects cross-file var() resolution. */
-    for (int i = 0; i < opts->file_count; i++) {
-        const char *path = opts->files[i].rel_path;
-        if (design_has_suffix(path, ".css") || design_has_suffix(path, ".scss")) {
-            if (design_parse_css(&ctx, &opts->files[i], true, false) != 0) {
-                design_ctx_free(&ctx);
-                return -1;
+        for (int i = 0; i < opts->file_count; i++) {
+            const cbm_file_info_t *file = files[i];
+            if (!design_is_token_source(&ctx, file->rel_path)) {
+                continue;
+            }
+            const char *provenance = design_provenance(&ctx, file->rel_path, "authoritative");
+            if (design_source_priority("dtcg", provenance) != priority) {
+                continue;
+            }
+            if (design_parse_dtcg(&ctx, file) != 0) {
+                goto done;
+            }
+        }
+
+        for (int i = 0; i < ctx.documents.count; i++) {
+            design_document_t *document = &ctx.documents.items[i];
+            const char *provenance = design_provenance(&ctx, document->path, "authoritative");
+            if (design_source_priority("design-md", provenance) == priority &&
+                design_parse_registered_document(&ctx, document) != 0) {
+                goto done;
+            }
+        }
+
+        for (int i = 0; i < opts->file_count; i++) {
+            const cbm_file_info_t *file = files[i];
+            if (!design_has_suffix(file->rel_path, ".css") &&
+                !design_has_suffix(file->rel_path, ".scss")) {
+                continue;
+            }
+            const char *provenance = design_provenance(&ctx, file->rel_path, "observed");
+            if (design_source_priority("css", provenance) == priority &&
+                design_parse_css(&ctx, file, true, false) != 0) {
+                goto done;
             }
         }
     }
+
+    /* Definitions across all files precede usages so cross-file var()
+     * resolution does not depend on discovery order. */
     for (int i = 0; i < opts->file_count; i++) {
-        const char *path = opts->files[i].rel_path;
-        if (design_has_suffix(path, ".css") || design_has_suffix(path, ".scss")) {
-            if (design_parse_css(&ctx, &opts->files[i], false, true) != 0) {
-                design_ctx_free(&ctx);
-                return -1;
-            }
+        const char *path = files[i]->rel_path;
+        if ((design_has_suffix(path, ".css") || design_has_suffix(path, ".scss")) &&
+            design_parse_css(&ctx, files[i], false, true) != 0) {
+            goto done;
         }
     }
+
     /* Resolver metadata is indexed after token sources so mode-to-token
      * override edges can be connected without executing the resolver. */
     for (int i = 0; i < opts->file_count; i++) {
-        if (design_is_resolver(&ctx, opts->files[i].rel_path)) {
-            if (design_parse_resolver(&ctx, &opts->files[i]) != 0) {
-                design_ctx_free(&ctx);
-                return -1;
-            }
+        if (design_is_resolver(&ctx, files[i]->rel_path) &&
+            design_parse_resolver(&ctx, files[i]) != 0) {
+            goto done;
         }
+    }
+    if (design_materialize_token_definitions(&ctx) != 0) {
+        goto done;
     }
     design_resolve_aliases(&ctx);
     design_section_link_ctx_t link = {.ctx = &ctx};
@@ -1728,6 +2068,10 @@ int cbm_design_index(const cbm_design_index_opts_t *opts) {
         cbm_log_info("pass.done", "pass", "design_context", "documents", documents, "tokens",
                      tokens, "components", components, "modes", modes, "usages", usages);
     }
+    rc = 0;
+
+done:
+    free(files);
     design_ctx_free(&ctx);
-    return 0;
+    return rc;
 }

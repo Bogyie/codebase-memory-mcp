@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { callTool } from "../api/rpc";
 import { useUiMessages } from "../lib/i18n";
 
@@ -20,6 +20,16 @@ interface DesignNode {
     context?: string;
     default?: boolean;
     sources?: string[];
+    definition_count?: number;
+    ambiguous?: boolean;
+    definitions?: Array<{
+      source_path: string;
+      line: number;
+      value?: string;
+      source_format?: string;
+      provenance?: string;
+      canonical: boolean;
+    }>;
   };
 }
 
@@ -48,9 +58,12 @@ interface DesignContextResponse {
   has_more_relations?: boolean;
   filtered_total?: { systems: number; tokens: number; components: number; modes: number };
   has_more_by_type?: { systems: boolean; tokens: boolean; components: boolean; modes: boolean };
+  offset?: number;
+  relation_offset?: number;
 }
 
-const DESIGN_PAGE_LIMIT = 1000;
+const DESIGN_PAGE_LIMIT = 200;
+const DESIGN_FILTER_DELAY_MS = 150;
 
 function mergeByKey<T>(current: T[], incoming: T[], key: (item: T) => string): T[] {
   const merged = new Map(current.map((item) => [key(item), item]));
@@ -58,42 +71,38 @@ function mergeByKey<T>(current: T[], incoming: T[], key: (item: T) => string): T
   return [...merged.values()];
 }
 
-async function loadDesignContext(project: string): Promise<DesignContextResponse> {
-  let offset = 0;
-  let relationOffset = 0;
-  let result: DesignContextResponse | null = null;
-  let hasMoreNodes = true;
-  let hasMoreRelations = true;
+async function loadDesignContext(
+  project: string,
+  scope: string,
+  token: string,
+  offset: number,
+  relationOffset: number,
+): Promise<DesignContextResponse> {
+  return callTool<DesignContextResponse>("get_design_context", {
+    project,
+    limit: DESIGN_PAGE_LIMIT,
+    offset,
+    relation_offset: relationOffset,
+    ...(scope ? { scope } : {}),
+    ...(token ? { token } : {}),
+  });
+}
 
-  while (hasMoreNodes || hasMoreRelations) {
-    const page = await callTool<DesignContextResponse>("get_design_context", {
-      project,
-      limit: DESIGN_PAGE_LIMIT,
-      offset,
-      relation_offset: relationOffset,
-    });
-    if (!result) {
-      result = { ...page, systems: [], tokens: [], components: [], modes: [], relations: [] };
-    }
-    result.systems = mergeByKey(result.systems, page.systems, (node) => node.qualified_name);
-    result.tokens = mergeByKey(result.tokens, page.tokens, (node) => node.qualified_name);
-    result.components = mergeByKey(result.components, page.components, (node) => node.qualified_name);
-    result.modes = mergeByKey(result.modes, page.modes, (node) => node.qualified_name);
-    result.relations = mergeByKey(
-      result.relations,
-      page.relations,
-      (relation) => `${relation.type}:${relation.source}:${relation.target}:${JSON.stringify(relation.properties ?? {})}`,
-    );
-    hasMoreNodes = page.has_more;
-    hasMoreRelations = page.has_more_relations ?? false;
-    if (hasMoreNodes) offset += DESIGN_PAGE_LIMIT;
-    if (hasMoreRelations) relationOffset += page.returned_relations || DESIGN_PAGE_LIMIT * 4;
-  }
-  if (!result) throw new Error("Design context returned no pages");
-  result.returned_relations = result.relations.length;
-  result.has_more = false;
-  result.has_more_relations = false;
-  return result;
+function mergeDesignPages(current: DesignContextResponse, page: DesignContextResponse): DesignContextResponse {
+  const relations = mergeByKey(
+    current.relations,
+    page.relations,
+    (relation) => `${relation.type}:${relation.source}:${relation.target}:${JSON.stringify(relation.properties ?? {})}`,
+  );
+  return {
+    ...page,
+    systems: mergeByKey(current.systems, page.systems, (node) => node.qualified_name),
+    tokens: mergeByKey(current.tokens, page.tokens, (node) => node.qualified_name),
+    components: mergeByKey(current.components, page.components, (node) => node.qualified_name),
+    modes: mergeByKey(current.modes, page.modes, (node) => node.qualified_name),
+    relations,
+    returned_relations: relations.length,
+  };
 }
 
 function tokenColor(node: DesignNode): string | null {
@@ -138,52 +147,92 @@ export function DesignTab({ project }: { project: string | null }) {
   const t = useUiMessages();
   const [data, setData] = useState<DesignContextResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [scope, setScope] = useState("");
   const [selectedQn, setSelectedQn] = useState<string | null>(null);
+  const [availableSystems, setAvailableSystems] = useState<DesignNode[]>([]);
+  const [nextOffset, setNextOffset] = useState(DESIGN_PAGE_LIMIT);
+  const [nextRelationOffset, setNextRelationOffset] = useState(0);
+  const requestVersion = useRef(0);
+  const previousProject = useRef<string | null>(null);
 
   useEffect(() => {
+    const projectChanged = previousProject.current !== project;
+    previousProject.current = project;
+    if (projectChanged) {
+      setAvailableSystems([]);
+      setSelectedQn(null);
+      setScope("");
+    }
     if (!project) {
       setData(null);
+      setLoading(false);
+      setLoadingMore(false);
       return;
     }
-    let cancelled = false;
+    const version = ++requestVersion.current;
     setLoading(true);
+    setLoadingMore(false);
     setError(null);
-    loadDesignContext(project)
-      .then((response) => {
-        if (!cancelled) setData(response);
-      })
-      .catch((reason: unknown) => {
-        if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+    const timer = window.setTimeout(() => {
+      loadDesignContext(project, scope, query.trim(), 0, 0)
+        .then((response) => {
+          if (requestVersion.current !== version) return;
+          setData(response);
+          setAvailableSystems((current) =>
+            mergeByKey(current, response.systems, (node) => node.qualified_name),
+          );
+          setNextOffset(DESIGN_PAGE_LIMIT);
+          setNextRelationOffset(response.returned_relations || response.relations.length);
+        })
+        .catch((reason: unknown) => {
+          if (requestVersion.current === version) {
+            setError(reason instanceof Error ? reason.message : String(reason));
+          }
+        })
+        .finally(() => {
+          if (requestVersion.current === version) setLoading(false);
+        });
+    }, DESIGN_FILTER_DELAY_MS);
     return () => {
-      cancelled = true;
+      window.clearTimeout(timer);
+      if (requestVersion.current === version) requestVersion.current++;
     };
-  }, [project]);
+  }, [project, query, scope]);
+
+  async function loadMore() {
+    if (!project || !data || loadingMore || (!data.has_more && !data.has_more_relations)) return;
+    const version = requestVersion.current;
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const page = await loadDesignContext(project, scope, query.trim(), nextOffset, nextRelationOffset);
+      if (requestVersion.current !== version) return;
+      setData((current) => (current ? mergeDesignPages(current, page) : page));
+      setAvailableSystems((current) =>
+        mergeByKey(current, page.systems, (node) => node.qualified_name),
+      );
+      setNextOffset((current) => current + DESIGN_PAGE_LIMIT);
+      setNextRelationOffset((current) =>
+        current + (page.returned_relations || page.relations.length || DESIGN_PAGE_LIMIT * 4),
+      );
+    } catch (reason: unknown) {
+      if (requestVersion.current === version) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
+    } finally {
+      if (requestVersion.current === version) setLoadingMore(false);
+    }
+  }
 
   const filteredTokens = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    const scopeNeedle = scope.trim().toLowerCase();
-    return (data?.tokens ?? []).filter((token) => {
-      const haystack = `${token.name} ${token.qualified_name} ${token.properties?.token_path ?? ""}`.toLowerCase();
-      const tokenScope = (token.properties?.scope ?? "root").toLowerCase();
-      return (!needle || haystack.includes(needle)) && (!scopeNeedle || tokenScope === scopeNeedle);
-    });
-  }, [data, query, scope]);
+    return data?.tokens ?? [];
+  }, [data]);
 
-  const filteredComponents = useMemo(
-    () => (data?.components ?? []).filter((node) => !scope || (node.properties?.scope ?? "root") === scope),
-    [data, scope],
-  );
-  const filteredModes = useMemo(
-    () => (data?.modes ?? []).filter((node) => !scope || (node.properties?.scope ?? "root") === scope),
-    [data, scope],
-  );
+  const filteredComponents = data?.components ?? [];
+  const filteredModes = data?.modes ?? [];
 
   const selected = filteredTokens.find((token) => token.qualified_name === selectedQn) ?? filteredTokens[0];
   const selectedRelations = selected
@@ -241,7 +290,7 @@ export function DesignTab({ project }: { project: string | null }) {
                   >
                     {t.design.allScopes}
                   </button>
-                  {data.systems.map((system) => {
+                  {availableSystems.map((system) => {
                     const systemScope = system.properties?.scope ?? "root";
                     return (
                       <button
@@ -296,7 +345,7 @@ export function DesignTab({ project }: { project: string | null }) {
                       className="w-full rounded-lg border border-white/[0.06] bg-black/15 px-3 py-2 text-[12px] text-foreground/80 outline-none placeholder:text-foreground/20 focus:border-primary/30"
                     />
                     <span className="flex items-center rounded-lg bg-white/[0.03] px-3 text-[10px] tabular-nums text-foreground/35">
-                      {filteredTokens.length}
+                      {filteredTokens.length}/{data.filtered_total?.tokens ?? data.total.tokens}
                     </span>
                   </div>
                   <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
@@ -324,6 +373,18 @@ export function DesignTab({ project }: { project: string | null }) {
                       );
                     })}
                   </div>
+                  {(data.has_more || data.has_more_relations) && (
+                    <div className="mt-5 flex justify-center">
+                      <button
+                        type="button"
+                        onClick={() => void loadMore()}
+                        disabled={loadingMore}
+                        className="rounded-lg border border-primary/20 bg-primary/[0.06] px-4 py-2 text-[11px] text-primary/80 transition-colors hover:bg-primary/[0.1] disabled:cursor-wait disabled:opacity-50"
+                      >
+                        {loadingMore ? t.design.loadingMore : t.design.loadMore}
+                      </button>
+                    </div>
+                  )}
                 </section>
 
                 <aside className="rounded-2xl border border-white/[0.06] bg-[#0b1920]/65 p-4">
@@ -341,6 +402,32 @@ export function DesignTab({ project }: { project: string | null }) {
                         <div><dt className="text-foreground/25">{t.design.source}</dt><dd className="mt-1 break-all font-mono text-foreground/55">{selected.file_path}:{selected.line}</dd></div>
                         <div><dt className="text-foreground/25">Qualified name</dt><dd className="mt-1 break-all font-mono text-[9px] text-foreground/35">{selected.qualified_name}</dd></div>
                         {selected.properties?.description && <div><dt className="text-foreground/25">{t.design.descriptionLabel}</dt><dd className="mt-1 leading-relaxed text-foreground/55">{selected.properties.description}</dd></div>}
+                        {(selected.properties?.definition_count ?? 0) > 1 && (
+                          <div>
+                            <dt className="text-foreground/25">{t.design.definitions}</dt>
+                            <dd className="mt-1 text-amber-300/75">
+                              {selected.properties?.definition_count} {t.design.ambiguousDefinitions}
+                            </dd>
+                            <div className="mt-2 space-y-1.5">
+                              {selected.properties?.definitions?.map((definition) => (
+                                <div
+                                  key={`${definition.source_path}:${definition.line}:${definition.value ?? ""}`}
+                                  className="rounded-md border border-white/[0.04] bg-white/[0.02] px-2 py-1.5"
+                                >
+                                  <p className="break-all font-mono text-[9px] text-foreground/45">
+                                    {definition.source_path}:{definition.line}
+                                  </p>
+                                  <p className="mt-0.5 flex items-center justify-between gap-2 font-mono text-[9px] text-foreground/55">
+                                    <span className="truncate">{definition.value ?? "—"}</span>
+                                    {definition.canonical && (
+                                      <span className="shrink-0 uppercase text-primary/65">canonical</span>
+                                    )}
+                                  </p>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </dl>
                       <p className="mt-6 text-[10px] uppercase tracking-[0.16em] text-foreground/30">{t.design.connected}</p>
                       <div className="mt-2 space-y-2">

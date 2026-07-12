@@ -1,6 +1,6 @@
 /* @vitest-environment jsdom */
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DesignTab } from "./DesignTab";
 
@@ -100,13 +100,24 @@ describe("DesignTab", () => {
   });
 
   it("loads curated context and filters token cards", async () => {
+    callToolMock.mockImplementation((_tool: string, args: { token?: string }) =>
+      Promise.resolve(
+        args.token
+          ? {
+              ...RESPONSE,
+              tokens: RESPONSE.tokens.filter((token) => token.properties.token_path.includes(args.token ?? "")),
+              filtered_total: { systems: 1, tokens: 1, components: 1, modes: 0 },
+            }
+          : RESPONSE,
+      ),
+    );
     render(<DesignTab project="demo" />);
     expect((await screen.findAllByText("color.action")).length).toBeGreaterThan(0);
     expect(screen.getByText("button-primary")).toBeInTheDocument();
     expect(screen.getByText(/USES TOKEN/)).toBeInTheDocument();
     expect(callToolMock).toHaveBeenCalledWith("get_design_context", {
       project: "demo",
-      limit: 1000,
+      limit: 200,
       offset: 0,
       relation_offset: 0,
     });
@@ -114,8 +125,15 @@ describe("DesignTab", () => {
     fireEvent.change(screen.getByPlaceholderText("Search token names and paths..."), {
       target: { value: "spacing" },
     });
+    await waitFor(() => expect(screen.queryAllByText("color.action")).toHaveLength(0));
     expect(screen.getAllByText("spacing.sm").length).toBeGreaterThan(0);
-    expect(screen.queryAllByText("color.action")).toHaveLength(0);
+    expect(callToolMock).toHaveBeenLastCalledWith("get_design_context", {
+      project: "demo",
+      limit: 200,
+      offset: 0,
+      relation_offset: 0,
+      token: "spacing",
+    });
   });
 
   it("does not call the backend without a selected project", () => {
@@ -124,7 +142,33 @@ describe("DesignTab", () => {
     expect(callToolMock).not.toHaveBeenCalled();
   });
 
-  it("loads every page and applies exact scope filtering to all artifact types", async () => {
+  it("clears accumulated systems when the project changes with an active filter", async () => {
+    callToolMock.mockImplementation((_tool: string, args: { project: string }) =>
+      Promise.resolve({
+        ...RESPONSE,
+        project: args.project,
+        systems: [
+          {
+            ...RESPONSE.systems[0],
+            name: args.project === "demo" ? "Aurora" : "Borealis",
+            qualified_name: `${args.project}.design.system.root`,
+          },
+        ],
+      }),
+    );
+    const view = render(<DesignTab project="demo" />);
+    expect(await screen.findByRole("button", { name: /Aurora root/ })).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText("Search token names and paths..."), {
+      target: { value: "color" },
+    });
+    await waitFor(() => expect(callToolMock).toHaveBeenCalledTimes(2));
+
+    view.rerender(<DesignTab project="other" />);
+    expect(await screen.findByRole("button", { name: /Borealis root/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Aurora root/ })).not.toBeInTheDocument();
+  });
+
+  it("loads additional pages only on request and sends exact scope filters to the server", async () => {
     const pageOne = {
       ...RESPONSE,
       total: { systems: 2, tokens: 2, components: 2, modes: 2 },
@@ -192,18 +236,45 @@ describe("DesignTab", () => {
       returned_relations: 0,
       has_more: false,
     };
-    callToolMock.mockImplementation((_tool: string, args: { offset: number }) =>
-      Promise.resolve(args.offset === 0 ? pageOne : pageTwo),
+    const scopedPage = {
+      ...pageOne,
+      systems: [pageOne.systems[0]],
+      tokens: [pageOne.tokens[0]],
+      components: [pageOne.components[0]],
+      modes: [pageOne.modes[0]],
+      has_more: false,
+    };
+    callToolMock.mockImplementation(
+      (_tool: string, args: { offset: number; scope?: string }) =>
+        Promise.resolve(args.scope ? scopedPage : args.offset === 0 ? pageOne : pageTwo),
     );
 
     render(<DesignTab project="demo" />);
     expect(await screen.findByText("app-button")).toBeInTheDocument();
     expect(screen.getByText("application-button")).toBeInTheDocument();
+    expect(screen.queryByText("spacing.sm")).not.toBeInTheDocument();
+    expect(callToolMock).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    expect((await screen.findAllByText("spacing.sm")).length).toBeGreaterThan(0);
+    expect(callToolMock).toHaveBeenCalledTimes(2);
+    expect(callToolMock).toHaveBeenLastCalledWith("get_design_context", {
+      project: "demo",
+      limit: 200,
+      offset: 200,
+      relation_offset: 1,
+    });
     fireEvent.click(screen.getByRole("button", { name: /App packages\.app/ }));
+    await waitFor(() => expect(callToolMock).toHaveBeenCalledTimes(3));
     expect(screen.getByText("app-button")).toBeInTheDocument();
     expect(screen.queryByText("application-button")).not.toBeInTheDocument();
     expect(screen.getByText("theme: app")).toBeInTheDocument();
     expect(screen.queryByText("theme: application")).not.toBeInTheDocument();
-    expect(callToolMock).toHaveBeenCalledTimes(2);
+    expect(callToolMock).toHaveBeenLastCalledWith("get_design_context", {
+      project: "demo",
+      limit: 200,
+      offset: 0,
+      relation_offset: 0,
+      scope: "packages.app",
+    });
   });
 });

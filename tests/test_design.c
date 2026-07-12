@@ -431,6 +431,202 @@ TEST(design_pass_rebuild_removes_stale_incremental_context) {
     PASS();
 }
 
+TEST(design_skips_unreadable_oversized_and_short_read_documents) {
+    char *base_raw = th_mktempdir("cbm_design_bad_docs");
+    ASSERT_NOT_NULL(base_raw);
+    char base[1024];
+    snprintf(base, sizeof(base), "%s", base_raw);
+    ASSERT_EQ(th_write_file(TH_PATH(base, "oversized/DESIGN.md"), "# oversized\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(base, "short/DESIGN.md"), "abc"), 0);
+
+    char missing[1024], oversized[1024], short_read[1024];
+    snprintf(missing, sizeof(missing), "%s/missing/DESIGN.md", base);
+    snprintf(oversized, sizeof(oversized), "%s/oversized/DESIGN.md", base);
+    snprintf(short_read, sizeof(short_read), "%s/short/DESIGN.md", base);
+    cbm_file_info_t files[] = {
+        {.path = missing,
+         .rel_path = "missing/DESIGN.md",
+         .language = CBM_LANG_MARKDOWN,
+         .size = 10},
+        {.path = oversized,
+         .rel_path = "oversized/DESIGN.md",
+         .language = CBM_LANG_MARKDOWN,
+         .size = 8 * 1024 * 1024 + 1},
+        {.path = short_read,
+         .rel_path = "short/DESIGN.md",
+         .language = CBM_LANG_MARKDOWN,
+         .size = 20},
+    };
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", base);
+    ASSERT_NOT_NULL(gb);
+    cbm_design_index_opts_t opts = {.project_name = "test",
+                                    .repo_path = base,
+                                    .gbuf = gb,
+                                    .files = files,
+                                    .file_count = 3,
+                                    .mode = CBM_MODE_FULL};
+    ASSERT_EQ(cbm_design_index(&opts), 0);
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.system.missing"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.system.oversized"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.system.short"));
+    cbm_gbuf_free(gb);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(design_glob_matching_is_bounded_for_adversarial_patterns) {
+    char *base_raw = th_mktempdir("cbm_design_glob_bound");
+    ASSERT_NOT_NULL(base_raw);
+    char base[1024];
+    snprintf(base, sizeof(base), "%s", base_raw);
+
+    char pattern[256] = {0};
+    char rel_path[128] = {0};
+    for (int i = 0; i < 32; i++) {
+        strncat(pattern, "*a", sizeof(pattern) - strlen(pattern) - 1);
+        strncat(rel_path, "a", sizeof(rel_path) - strlen(rel_path) - 1);
+    }
+    strncat(pattern, "*b", sizeof(pattern) - strlen(pattern) - 1);
+    strncat(rel_path, "c", sizeof(rel_path) - strlen(rel_path) - 1);
+    char config[512];
+    snprintf(config, sizeof(config), "{\"design\":{\"documents\":[\"%s\"]}}", pattern);
+    ASSERT_EQ(th_write_file(TH_PATH(base, ".codebase-memory.json"), config), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(base, rel_path), "# not matched\n"), 0);
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", base, rel_path);
+    cbm_file_info_t file = {
+        .path = path, .rel_path = rel_path, .language = CBM_LANG_MARKDOWN, .size = 14};
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", base);
+    ASSERT_NOT_NULL(gb);
+    cbm_design_index_opts_t opts = {.project_name = "test",
+                                    .repo_path = base,
+                                    .gbuf = gb,
+                                    .files = &file,
+                                    .file_count = 1,
+                                    .mode = CBM_MODE_FULL};
+    ASSERT_EQ(cbm_design_index(&opts), 0);
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.system.root"));
+    cbm_gbuf_free(gb);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(design_bad_machine_sources_do_not_create_empty_context) {
+    char *base_raw = th_mktempdir("cbm_design_bad_sources");
+    ASSERT_NOT_NULL(base_raw);
+    char base[1024];
+    snprintf(base, sizeof(base), "%s", base_raw);
+    ASSERT_EQ(th_write_file(TH_PATH(base, "design/malformed.tokens.json"), "{bad"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(base, "src/short.css"), "abc"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(base, "src/oversized.scss"), "abc"), 0);
+
+    char malformed[1024], missing_resolver[1024], short_css[1024], oversized_scss[1024];
+    snprintf(malformed, sizeof(malformed), "%s/design/malformed.tokens.json", base);
+    snprintf(missing_resolver, sizeof(missing_resolver), "%s/design/missing.resolver.json", base);
+    snprintf(short_css, sizeof(short_css), "%s/src/short.css", base);
+    snprintf(oversized_scss, sizeof(oversized_scss), "%s/src/oversized.scss", base);
+    cbm_file_info_t files[] = {
+        {.path = malformed,
+         .rel_path = "design/malformed.tokens.json",
+         .language = CBM_LANG_JSON,
+         .size = 4},
+        {.path = missing_resolver,
+         .rel_path = "design/missing.resolver.json",
+         .language = CBM_LANG_JSON,
+         .size = 10},
+        {.path = short_css, .rel_path = "src/short.css", .language = CBM_LANG_CSS, .size = 20},
+        {.path = oversized_scss,
+         .rel_path = "src/oversized.scss",
+         .language = CBM_LANG_SCSS,
+         .size = 8 * 1024 * 1024 + 1},
+    };
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", base);
+    ASSERT_NOT_NULL(gb);
+    cbm_design_index_opts_t opts = {.project_name = "test",
+                                    .repo_path = base,
+                                    .gbuf = gb,
+                                    .files = files,
+                                    .file_count = 4,
+                                    .mode = CBM_MODE_FULL};
+    ASSERT_EQ(cbm_design_index(&opts), 0);
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.system.root"));
+    ASSERT_EQ(design_edge_count(gb, "DEFINES_TOKEN"), 0);
+    cbm_gbuf_free(gb);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(design_preserves_duplicate_token_definitions_and_canonical_source) {
+    char *base_raw = th_mktempdir("cbm_design_duplicate_defs");
+    ASSERT_NOT_NULL(base_raw);
+    char base[1024];
+    snprintf(base, sizeof(base), "%s", base_raw);
+    const char *config = "{\"design\":{\"generated\":[\"src/generated/*.css\"]}}";
+    const char *a_tokens = "{\"color\":{\"action\":{\"$type\":\"color\",\"$value\":\"#111111\"}}}";
+    const char *z_tokens = "{\"color\":{\"action\":{\"$type\":\"color\",\"$value\":\"#222222\"}}}";
+    const char *observed_css = ":root { --color-action: #333333; }\n";
+    const char *generated_css = ":root { --color-action: #444444; }\n";
+    ASSERT_EQ(th_write_file(TH_PATH(base, ".codebase-memory.json"), config), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(base, "design/a.tokens.json"), a_tokens), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(base, "design/z.tokens.json"), z_tokens), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(base, "src/styles/local.css"), observed_css), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(base, "src/generated/tokens.css"), generated_css), 0);
+
+    char p0[1024], p1[1024], p2[1024], p3[1024];
+    snprintf(p0, sizeof(p0), "%s/design/z.tokens.json", base);
+    snprintf(p1, sizeof(p1), "%s/src/generated/tokens.css", base);
+    snprintf(p2, sizeof(p2), "%s/design/a.tokens.json", base);
+    snprintf(p3, sizeof(p3), "%s/src/styles/local.css", base);
+    /* Deliberately reverse priority/path order: canonical selection must not
+     * depend on the caller's file-array ordering. */
+    cbm_file_info_t files[] = {
+        {.path = p0,
+         .rel_path = "design/z.tokens.json",
+         .language = CBM_LANG_JSON,
+         .size = (int64_t)strlen(z_tokens)},
+        {.path = p1,
+         .rel_path = "src/generated/tokens.css",
+         .language = CBM_LANG_CSS,
+         .size = (int64_t)strlen(generated_css)},
+        {.path = p2,
+         .rel_path = "design/a.tokens.json",
+         .language = CBM_LANG_JSON,
+         .size = (int64_t)strlen(a_tokens)},
+        {.path = p3,
+         .rel_path = "src/styles/local.css",
+         .language = CBM_LANG_CSS,
+         .size = (int64_t)strlen(observed_css)},
+    };
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", base);
+    ASSERT_NOT_NULL(gb);
+    for (int i = 0; i < 4; i++) {
+        design_add_file_node(gb, "test", files[i].rel_path);
+    }
+    cbm_design_index_opts_t opts = {.project_name = "test",
+                                    .repo_path = base,
+                                    .gbuf = gb,
+                                    .files = files,
+                                    .file_count = 4,
+                                    .mode = CBM_MODE_FULL};
+    ASSERT_EQ(cbm_design_index(&opts), 0);
+    const cbm_gbuf_node_t *token = cbm_gbuf_find_by_qn(gb, "test.design.token.root.color.action");
+    ASSERT_NOT_NULL(token);
+    ASSERT_STR_EQ(token->file_path, "design/a.tokens.json");
+    ASSERT_NOT_NULL(strstr(token->properties_json, "#111111"));
+    ASSERT_NOT_NULL(strstr(token->properties_json, "#222222"));
+    ASSERT_NOT_NULL(strstr(token->properties_json, "#333333"));
+    ASSERT_NOT_NULL(strstr(token->properties_json, "#444444"));
+    ASSERT_NOT_NULL(strstr(token->properties_json, "\"definition_count\":4"));
+    ASSERT_NOT_NULL(strstr(token->properties_json, "\"ambiguous\":true"));
+    ASSERT_NOT_NULL(strstr(token->properties_json, "\"canonical\":true"));
+    ASSERT_EQ(design_edge_count(gb, "DEFINES_TOKEN"), 4);
+    ASSERT_EQ(design_edge_count(gb, "GENERATED_AS"), 1);
+    cbm_gbuf_free(gb);
+    th_cleanup(base);
+    PASS();
+}
+
 void suite_design(void) {
     RUN_TEST(design_indexes_dtcg_design_md_and_css);
     RUN_TEST(design_uses_nearest_nested_document_scope);
@@ -440,4 +636,8 @@ void suite_design(void) {
     RUN_TEST(design_indexes_dtcg_structural_references_and_root_tokens);
     RUN_TEST(design_indexes_google_typography_as_composite_token);
     RUN_TEST(design_pass_rebuild_removes_stale_incremental_context);
+    RUN_TEST(design_skips_unreadable_oversized_and_short_read_documents);
+    RUN_TEST(design_glob_matching_is_bounded_for_adversarial_patterns);
+    RUN_TEST(design_bad_machine_sources_do_not_create_empty_context);
+    RUN_TEST(design_preserves_duplicate_token_definitions_and_canonical_source);
 }
