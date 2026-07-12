@@ -826,17 +826,23 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
     /* Build hash set of deleted node IDs for O(1) lookup */
     CBMHashTable *deleted_set = cbm_ht_create(arr->count);
     for (int i = 0; i < arr->count; i++) {
-        const cbm_gbuf_node_t *n = arr->items[i];
+        cbm_gbuf_node_t *n = (cbm_gbuf_node_t *)arr->items[i];
 
         char id_buf[CBM_SZ_32];
         make_id_key(id_buf, sizeof(id_buf), n->id);
         cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
 
-        /* Remove from primary indexes */
+        /* Remove from secondary and primary indexes. Keep the tombstoned node
+         * allocated until gbuf teardown, but clear its QN so inserting a
+         * replacement with the same QN cannot make the old node look live to
+         * foreach/dump/flush scans. This mirrors delete_by_file. */
+        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, n->name), n->id);
         cbm_ht_delete(gb->node_by_qn, n->qualified_name);
         if (n->id >= 0 && n->id < gb->by_id_cap) {
             gb->by_id[n->id] = NULL;
         }
+        free(n->qualified_name);
+        n->qualified_name = NULL;
     }
 
     /* Clear the label array */
@@ -909,6 +915,33 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         cbm_log_info("gbuf.delete_by_file", "file", file_path, "scanned", s_buf, "deleted", d_buf);
     }
     return deleted_count;
+}
+
+int cbm_gbuf_delete_node_by_id(cbm_gbuf_t *gb, int64_t id) {
+    if (!gb || id <= 0 || id >= gb->by_id_cap) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_gbuf_node_t *node = gb->by_id[id];
+    if (!node || !node->qualified_name || !cbm_ht_get(gb->node_by_qn, node->qualified_name)) {
+        return 0;
+    }
+
+    remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, node->label), id);
+    remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, node->name), id);
+    cbm_ht_delete(gb->node_by_qn, node->qualified_name);
+    gb->by_id[id] = NULL;
+
+    CBMHashTable *deleted_set = cbm_ht_create(SKIP_ONE);
+    char id_buf[CBM_SZ_32];
+    make_id_key(id_buf, sizeof(id_buf), id);
+    cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
+    cascade_delete_edges(gb, deleted_set);
+    cbm_ht_foreach(deleted_set, free_key_only, NULL);
+    cbm_ht_free(deleted_set);
+
+    free(node->qualified_name);
+    node->qualified_name = NULL;
+    return 1;
 }
 
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {

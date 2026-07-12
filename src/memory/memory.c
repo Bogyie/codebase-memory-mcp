@@ -59,9 +59,19 @@ struct cbm_memory {
     char *sync_dir;
     char lease_owner[MEM_ID_MAX];
     char error[CBM_SZ_512];
+    uint64_t projection_runs;
+    int64_t projection_last_ms;
+    int64_t projection_last_documents;
 };
 
 static atomic_uint_fast64_t memory_handle_sequence = ATOMIC_VAR_INIT(1);
+
+static int64_t memory_elapsed_ms(struct timespec start) {
+    struct timespec now;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)(now.tv_sec - start.tv_sec) * 1000LL +
+           (int64_t)(now.tv_nsec - start.tv_nsec) / 1000000LL;
+}
 
 static int memory_recover_outbox(cbm_memory_t *m);
 static int memory_rebuild_projection_internal(cbm_memory_t *m, bool in_transaction);
@@ -72,6 +82,7 @@ static int memory_relation_add(cbm_memory_t *m, const char *source_kind, const c
 static int dirty_source_dependents(cbm_memory_t *m, const char *old_source_id,
                                    const char *new_source_id, int64_t epoch, const char *now);
 static char *fts_expression(const char *query);
+static char *json_error(const char *code, const char *message);
 
 static char *mem_strdup(const char *s) {
     if (!s) {
@@ -626,6 +637,109 @@ int64_t cbm_memory_snapshot_epoch(cbm_memory_t *m) {
 static char *json_write_mut(yyjson_mut_doc *doc) {
     size_t len = 0;
     return yyjson_mut_write(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, &len);
+}
+
+static int64_t memory_scalar_int64(cbm_memory_t *m, const char *sql) {
+    sqlite3_stmt *stmt = NULL;
+    if (!m || memory_prepare(m, sql, &stmt) != 0) {
+        return -1;
+    }
+    int64_t value = sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
+    sqlite3_finalize(stmt);
+    return value;
+}
+
+char *cbm_memory_status_json(cbm_memory_t *m, const char *args_json) {
+    (void)args_json;
+    if (!m) {
+        return json_error("memory_unavailable", "memory handle is null");
+    }
+    if (sqlite3_exec(m->db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK) {
+        return json_error("database_busy", sqlite3_errmsg(m->db));
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    yyjson_mut_val *entities = doc ? yyjson_mut_obj(doc) : NULL;
+    yyjson_mut_val *maintenance = doc ? yyjson_mut_obj(doc) : NULL;
+    yyjson_mut_val *projection = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!doc || !root || !entities || !maintenance || !projection) {
+        yyjson_mut_doc_free(doc);
+        (void)sqlite3_exec(m->db, "ROLLBACK;", NULL, NULL, NULL);
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_bool(doc, root, "ok", true);
+    yyjson_mut_obj_add_int(doc, root, "snapshot_epoch", cbm_memory_snapshot_epoch(m));
+
+    struct {
+        const char *name;
+        const char *sql;
+    } entity_metrics[] = {
+        {"sources", "SELECT count(*) FROM memory_sources;"},
+        {"pages", "SELECT count(*) FROM memory_pages;"},
+        {"claims", "SELECT count(*) FROM memory_claims WHERE recorded_to IS NULL;"},
+        {"decisions", "SELECT count(*) FROM memory_decisions;"},
+        {"experiences", "SELECT count(*) FROM memory_experiences;"},
+        {"preferences", "SELECT count(*) FROM memory_preferences;"},
+        {"code_refs", "SELECT count(*) FROM memory_code_refs;"},
+        {"relations", "SELECT count(*) FROM memory_relations WHERE recorded_to IS NULL;"},
+    };
+    int64_t entity_total = 0;
+    for (size_t i = 0; i < sizeof(entity_metrics) / sizeof(entity_metrics[0]); i++) {
+        int64_t value = memory_scalar_int64(m, entity_metrics[i].sql);
+        yyjson_mut_obj_add_int(doc, entities, entity_metrics[i].name, value);
+        if (value > 0) {
+            entity_total += value;
+        }
+    }
+    yyjson_mut_obj_add_int(doc, entities, "total", entity_total);
+    yyjson_mut_obj_add_val(doc, root, "entities", entities);
+
+    yyjson_mut_obj_add_int(doc, maintenance, "open_dirty",
+                           memory_scalar_int64(m,
+                                               "SELECT count(*) FROM memory_dirty WHERE "
+                                               "status='open';"));
+    yyjson_mut_obj_add_int(doc, maintenance, "unresolved_code_refs",
+                           memory_scalar_int64(m,
+                                               "SELECT count(*) FROM memory_code_refs WHERE "
+                                               "resolution_status!='resolved';"));
+    yyjson_mut_obj_add_int(doc, maintenance, "missing_code_refs",
+                           memory_scalar_int64(m,
+                                               "SELECT count(*) FROM memory_code_refs WHERE "
+                                               "resolution_status='missing';"));
+    yyjson_mut_obj_add_int(doc, maintenance, "pending_outbox",
+                           memory_scalar_int64(m,
+                                               "SELECT count(*) FROM memory_outbox WHERE "
+                                               "state IN ('pending','leased','failed');"));
+    yyjson_mut_obj_add_int(doc, maintenance, "pending_proposals",
+                           memory_scalar_int64(m,
+                                               "SELECT count(*) FROM memory_proposals WHERE "
+                                               "status='pending';"));
+    yyjson_mut_obj_add_val(doc, root, "maintenance", maintenance);
+
+    yyjson_mut_obj_add_str(doc, projection, "strategy", "full_rebuild");
+    yyjson_mut_obj_add_uint(doc, projection, "runs_in_process", m->projection_runs);
+    yyjson_mut_obj_add_int(doc, projection, "last_rebuild_ms", m->projection_last_ms);
+    yyjson_mut_obj_add_int(doc, projection, "last_rebuild_documents",
+                           m->projection_last_documents);
+    yyjson_mut_obj_add_int(doc, projection, "documents",
+                           memory_scalar_int64(m, "SELECT count(*) FROM memory_documents;"));
+    yyjson_mut_obj_add_int(doc, projection, "nodes",
+                           memory_scalar_int64(
+                               m, "SELECT count(*) FROM nodes WHERE project='global-memory';"));
+    yyjson_mut_obj_add_int(doc, projection, "edges",
+                           memory_scalar_int64(
+                               m, "SELECT count(*) FROM edges WHERE project='global-memory';"));
+    yyjson_mut_obj_add_val(doc, root, "projection", projection);
+    if (sqlite3_exec(m->db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        yyjson_mut_doc_free(doc);
+        (void)sqlite3_exec(m->db, "ROLLBACK;", NULL, NULL, NULL);
+        return json_error("status_failed", sqlite3_errmsg(m->db));
+    }
+    char *out = json_write_mut(doc);
+    yyjson_mut_doc_free(doc);
+    return out;
 }
 
 static char *json_error(const char *code, const char *message) {
@@ -3068,6 +3182,8 @@ static int memory_rebuild_projection_internal(cbm_memory_t *m, bool in_transacti
     if (!m) {
         return -1;
     }
+    struct timespec projection_started;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &projection_started);
     bool own_tx = !in_transaction;
     if (own_tx && memory_begin(m) != 0) {
         return -1;
@@ -3202,6 +3318,12 @@ static int memory_rebuild_projection_internal(cbm_memory_t *m, bool in_transacti
         } else {
             memory_rollback(m);
         }
+    }
+    if (rc == 0) {
+        m->projection_runs++;
+        m->projection_last_ms = memory_elapsed_ms(projection_started);
+        m->projection_last_documents =
+            memory_scalar_int64(m, "SELECT count(*) FROM memory_documents;");
     }
     return rc;
 }

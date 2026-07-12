@@ -231,6 +231,9 @@ TEST(pipeline_structure_nodes) {
 
     int rc = cbm_pipeline_run(p);
     ASSERT_EQ(rc, 0);
+    char staged_path[520];
+    snprintf(staged_path, sizeof(staged_path), "%s.building", db_path);
+    ASSERT_FALSE(cbm_file_exists(staged_path));
 
     /* Verify results by opening the store */
     cbm_store_t *s = cbm_store_open_path(db_path);
@@ -342,6 +345,69 @@ TEST(pipeline_adr_survives_full_reindex) {
 
     rm_rf(tmp);
     PASS();
+}
+
+TEST(pipeline_failed_publish_preserves_previous_snapshot) {
+#ifdef _WIN32
+    /* Windows ACL semantics do not provide a portable chmod-based write
+     * failure fixture. The replacement primitive itself has Windows tests. */
+    PASS();
+#else
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_snapshot_failure_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+
+    char src_path[512];
+    char db_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp);
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    FILE *f = fopen(src_path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def published():\n    return 1\n");
+    fclose(f);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
+
+    cbm_store_t *before = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(before);
+    int nodes_before = cbm_store_count_nodes(before, project);
+    ASSERT_GT(nodes_before, 0);
+    cbm_store_close(before);
+
+    f = fopen(src_path, "a");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "\ndef unpublished():\n    return 2\n");
+    fclose(f);
+
+    ASSERT_EQ(chmod(tmp, 0555), 0);
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    int rebuild_rc = cbm_pipeline_run(p2);
+    cbm_pipeline_free(p2);
+    int restore_mode_rc = chmod(tmp, 0755);
+
+    ASSERT_EQ(restore_mode_rc, 0);
+    ASSERT(rebuild_rc != 0);
+    ASSERT_TRUE(cbm_file_exists(db_path));
+    char staged_path[520];
+    snprintf(staged_path, sizeof(staged_path), "%s.building", db_path);
+    ASSERT_FALSE(cbm_file_exists(staged_path));
+
+    cbm_store_t *after = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_EQ(cbm_store_count_nodes(after, project), nodes_before);
+    cbm_store_close(after);
+
+    rm_rf(tmp);
+    PASS();
+#endif
 }
 
 TEST(pipeline_structure_edges) {
@@ -627,6 +693,57 @@ TEST(pipeline_definitions_properties) {
     PASS();
 }
 
+TEST(pipeline_yaml_config_paths_remain_distinct) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/config.yml", g_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "services:\n  api:\n    timeout: 30\n  worker:\n    timeout: 60\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_config_paths.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *vars = NULL;
+    int var_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, cbm_pipeline_project_name(p), "Variable", &vars,
+                                            &var_count),
+              CBM_STORE_OK);
+
+    int timeout_count = 0;
+    bool saw_api = false;
+    bool saw_worker = false;
+    for (int i = 0; i < var_count; i++) {
+        if (strcmp(vars[i].name, "timeout") != 0) {
+            continue;
+        }
+        timeout_count++;
+        ASSERT_NOT_NULL(vars[i].properties_json);
+        saw_api |= strstr(vars[i].properties_json,
+                          "\"config_path\":\"services.api.timeout\"") != NULL;
+        saw_worker |= strstr(vars[i].properties_json,
+                             "\"config_path\":\"services.worker.timeout\"") != NULL;
+    }
+    ASSERT_EQ(timeout_count, 2);
+    ASSERT_TRUE(saw_api);
+    ASSERT_TRUE(saw_worker);
+
+    cbm_store_free_nodes(vars, var_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 /* Node properties must remain VALID JSON even when a definition's serialized
  * properties exceed the fixed 2 KB build buffer. Found on the Linux kernel:
  * 135 nodes (50-param functions with struct-typed signatures) had properties
@@ -891,6 +1008,9 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p2);
     ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    char staged_path[520];
+    snprintf(staged_path, sizeof(staged_path), "%s.building", db_path);
+    ASSERT_FALSE(cbm_file_exists(staged_path));
 
     /* 4. The inbound cross-file CALLS edge must survive and the total CALLS
      *    count must not regress. (Before the fix: Serve->Help is dropped.)
@@ -6857,6 +6977,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
+    RUN_TEST(pipeline_failed_publish_preserves_previous_snapshot);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);
@@ -6865,6 +6986,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_definitions_function_nodes);
     RUN_TEST(pipeline_definitions_defines_edges);
     RUN_TEST(pipeline_definitions_properties);
+    RUN_TEST(pipeline_yaml_config_paths_remain_distinct);
     RUN_TEST(pipeline_def_props_valid_json_when_oversized);
     RUN_TEST(pipeline_edge_props_valid_json);
     /* Complexity propagation pass (Tier B) */

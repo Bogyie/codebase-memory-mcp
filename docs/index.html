@@ -486,6 +486,7 @@
             <a href="#hybrid-lsp">Hybrid LSP</a>
             <a href="#semantic-search">Semantic search</a>
             <a href="#design-context">Design Context</a>
+            <a href="#memory-safety">Memory safety</a>
             <a href="#releases">Releases</a>
             <a href="#faq">FAQ</a>
             <a class="nav-cta nav-star" href="https://github.com/bogyie/codebase-memory-mcp" title="Star codebase-memory-mcp on GitHub" aria-label="Star this project on GitHub">★ Star on GitHub</a>
@@ -791,12 +792,16 @@
                 <p>Trace callers and callees across files and packages with import-aware, type-inferred resolution. BFS traversal up to depth 5.</p>
             </div>
             <div class="feature">
+                <h3>Source-first BM25 search</h3>
+                <p>Natural-language graph search softly prioritizes source files over equivalent test and vendored/generated hits without hiding them. Results expose their source scope, and bounded candidate-window counts are explicit.</p>
+            </div>
+            <div class="feature">
                 <h3>Dead-code detection</h3>
                 <p>Find functions with zero callers, with smart filtering that excludes entry points like route handlers, <code>main()</code>, and framework decorators.</p>
             </div>
             <div class="feature">
                 <h3>Cross-service linking</h3>
-                <p>Matches REST routes to HTTP call sites across services with confidence scoring — and detects gRPC, GraphQL, and tRPC services plus pub/sub channels (<code>EMITS</code>/<code>LISTENS_ON</code> for Socket.IO, EventEmitter, and message buses) and async queue dispatch.</p>
+                <p>Matches REST routes to HTTP call sites across services with confidence scoring. Each caller → Route occurrence is retained, and a synthetic call-literal Route is removed only after its last source occurrence disappears. Source-backed handler Routes take precedence when identities match. Also detects gRPC, GraphQL, and tRPC services plus pub/sub channels (<code>EMITS</code>/<code>LISTENS_ON</code> for Socket.IO, EventEmitter, and message buses) and async queue dispatch.</p>
             </div>
             <div class="feature">
                 <h3>Infrastructure-as-code indexing</h3>
@@ -805,6 +810,10 @@
             <div class="feature">
                 <h3>Design Context</h3>
                 <p>Index portable design intent, DTCG tokens and modes, CSS custom properties, aliases, generated outputs, and code usage without adding an authoring-tool runtime dependency.</p>
+            </div>
+            <div class="feature">
+                <h3>Value-free YAML path search</h3>
+                <p>Find nested keys such as <code>services.api.timeout</code> through <code>search_graph</code> without indexing scalar values. Paths are bounded per file, and Helm values files retain their top-level-only guard.</p>
             </div>
             <div class="feature">
                 <h3>Auto-sync</h3>
@@ -820,7 +829,7 @@
             </div>
             <div class="feature">
                 <h3>23 MCP tools</h3>
-                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_design_context</code>, <code>manage_adr</code>, and 16 more.</p>
+                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>memory_status</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_design_context</code>, <code>get_code_snippet</code>, <code>manage_adr</code>, and 14 more.</p>
             </div>
             <div class="feature">
                 <h3>Global Memory</h3>
@@ -855,6 +864,38 @@
                 <p><code>manage_adr</code> persists architectural decisions alongside the graph, so design rationale survives across sessions and teammates.</p>
             </div>
         </div>
+    </section>
+
+    <section id="memory-safety">
+        <h2>How do code indexing and Global Memory interact?</h2>
+        <p class="lead">
+            Code discovery is observational. Durable memory changes stay explicit, while completed graph
+            snapshots keep long-running MCP sessions fresh without exposing a half-built index.
+        </p>
+        <div class="features">
+            <div class="feature">
+                <h3>Read-only change detection</h3>
+                <p><code>detect_changes</code> reports changed files and impacted symbols without writing Global Memory. Its response includes <code>global_memory_updated: false</code>.</p>
+            </div>
+            <div class="feature">
+                <h3>No-op-safe CodeRefs</h3>
+                <p>After a successful index, symbolic CodeRefs are validated directly. Unchanged resolution does not create a new Memory epoch or revision.</p>
+            </div>
+            <div class="feature">
+                <h3>Published graph generations</h3>
+                <p>Hashes, coverage, and FTS finish before a generation is published. Active readers switch only to a completed snapshot; the Projects UI shows its status and generation.</p>
+            </div>
+            <div class="feature">
+                <h3>Stale-source warnings</h3>
+                <p><code>get_code_snippet</code> identifies its line range as graph-derived, compares the indexed file version with the live worktree, and warns when they differ. Source payloads are capped at 16 KiB and report truncation explicitly.</p>
+            </div>
+        </div>
+        <p style="margin-top: 16px;">
+            <a href="GLOBAL_MEMORY.md">Read the full Global Memory contract →</a>
+        </p>
+        <p style="margin-top: 8px;">
+            The current ASan scaling probe measured a full projection rebuild at 13 ms for 100 entities and 108 ms for 1,000. The implementation stays simple while this remains approximately linear; <a href="GLOBAL_MEMORY_PERFORMANCE.md">see the decision gate</a>.
+        </p>
     </section>
 
     <section id="releases">

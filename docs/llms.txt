@@ -7,7 +7,7 @@
 - License: MIT, open source.
 - Languages: 158 (158 vendored tree-sitter grammars compiled into the binary).
 - Hybrid LSP type resolution: 9 language families (Python, TypeScript/JavaScript/JSX/TSX, PHP, C#, Go, C/C++, Java, Kotlin, Rust) — a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers including tsserver, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer.
-- MCP tools: 23 (including search_graph with semantic_query, trace_path, query_graph, detect_changes, get_architecture, get_design_context, get_code_snippet, manage_adr, and Global Memory tools).
+- MCP tools: 23 (including search_graph with semantic_query and value-free YAML config_path filtering, trace_path, query_graph, detect_changes, memory_status, get_architecture, get_design_context, get_code_snippet, manage_adr, and Global Memory tools).
 - Design Context: project-local, read-only indexing of DESIGN.md, DTCG 2025.10 token and resolver JSON, CSS/SCSS custom properties, modes, aliases, generated assets, and implementation usages. Authoring and generation remain external.
 - Global Memory storage: immutable content-addressed raw sources plus revisioned wiki pages, claims, decisions, experiences, preferences, relations, and symbolic CodeRefs.
 - Safe retrieval: current-context applicability, bitemporal history, freshness and conflict warnings, evidence lineage, and a risk-adaptive route. Opposing-view search is not statically required.

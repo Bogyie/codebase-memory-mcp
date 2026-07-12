@@ -108,6 +108,7 @@ typedef struct {
     const char *name_pattern; /* regex on name, NULL = any */
     const char *qn_pattern;   /* regex on qualified_name, NULL = any */
     const char *file_pattern; /* glob on file_path, NULL = any */
+    const char *config_path;  /* regex on properties.config_path, NULL = any */
     const char *relationship; /* edge type filter, NULL = any */
     const char *direction;    /* "inbound" / "outbound" / "any", NULL = any */
     int min_degree;           /* -1 = no filter (default), 0+ = minimum */
@@ -397,6 +398,12 @@ int cbm_store_upsert_file_hash(cbm_store_t *s, const char *project, const char *
 int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash_t **out,
                               int *count);
 
+/* Fetch the indexed version metadata for one file without allocating the
+ * complete project hash list. sha256_out may be NULL; when provided, caller
+ * owns the returned string. */
+int cbm_store_get_file_version(cbm_store_t *s, const char *project, const char *rel_path,
+                               int64_t *mtime_ns, int64_t *size, char **sha256_out);
+
 int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *rel_path);
 
 int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project);
@@ -420,6 +427,14 @@ typedef struct {
  * were persisted for the run. */
 int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_coverage_row_t *rows,
                                int count);
+
+/* Mark a graph database complete after all post-dump metadata and FTS writes.
+ * The generated opaque ID changes on every successful publish. */
+int cbm_store_mark_index_complete(cbm_store_t *s, const char *project);
+
+/* Return the latest completed generation. Caller owns *generation. A missing
+ * row (or a legacy DB without this table) returns CBM_STORE_NOT_FOUND. */
+int cbm_store_get_index_generation(cbm_store_t *s, const char *project, char **generation);
 
 /* Fetch all coverage rows (ordered by rel_path). Caller frees via
  * cbm_store_free_coverage. */

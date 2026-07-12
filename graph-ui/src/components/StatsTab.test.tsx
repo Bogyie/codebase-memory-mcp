@@ -47,6 +47,55 @@ describe("StatsTab index modal", () => {
     vi.unstubAllGlobals();
   });
 
+  it("shows the published snapshot generation for an indexed project", async () => {
+    mockProjectsFetch((url, init) => {
+      if (url !== "/rpc") return undefined;
+      const request = JSON.parse(String(init?.body));
+      const tool = request.params?.name;
+      const payload = tool === "list_projects"
+        ? { projects: [{ name: "sample", root_path: "/work/sample", indexed_at: "2026-07-12" }] }
+        : tool === "get_graph_schema"
+          ? { node_labels: [{ label: "Function", count: 3 }], edge_types: [], total_nodes: 3, total_edges: 0 }
+          : { project: "sample", status: "ready", nodes: 3, edges: 0, snapshot_complete: true, index_generation: "0123456789abcdef0123456789abcdef" };
+      return new Response(JSON.stringify({ result: { content: [{ text: JSON.stringify(payload) }] } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    render(<StatsTab onSelectProject={() => {}} />);
+    expect(await screen.findByText("Published snapshot")).toBeInTheDocument();
+    expect(screen.getByText("Generation 01234567")).toBeInTheDocument();
+  });
+
+  it("loads Global Memory status only after an explicit inspection", async () => {
+    const fetchMock = mockProjectsFetch((url, init) => {
+      if (url !== "/rpc") return undefined;
+      const request = JSON.parse(String(init?.body));
+      if (request.params?.name !== "memory_status") return undefined;
+      const payload = {
+        snapshot_epoch: 7,
+        entities: { total: 5 },
+        maintenance: { open_dirty: 2, unresolved_code_refs: 1 },
+        projection: { strategy: "full_rebuild", documents: 4, nodes: 8, edges: 3, runs_in_process: 1, last_rebuild_ms: 12, last_rebuild_documents: 4 },
+      };
+      return new Response(JSON.stringify({ result: { content: [{ text: JSON.stringify(payload) }] } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    render(<StatsTab onSelectProject={() => {}} />);
+    expect(await screen.findByText("Loaded only on request; no background write is performed.")).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some((call) => String(call[1]?.body).includes("memory_status"))).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Inspect Memory" }));
+    expect(await screen.findByText("Epoch")).toBeInTheDocument();
+    expect(screen.getByText("7")).toBeInTheDocument();
+    expect(screen.getByText("5")).toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(screen.getByText("full_rebuild · last rebuild 12 ms · 4 documents")).toBeInTheDocument();
+  });
+
   it("submits a custom path and project name", async () => {
     let submitted: unknown = null;
     mockProjectsFetch((url, init) => {

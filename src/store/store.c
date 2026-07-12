@@ -283,6 +283,14 @@ static int init_schema(cbm_store_t *s) {
         "  kind TEXT NOT NULL,"
         "  detail TEXT DEFAULT '',"
         "  PRIMARY KEY (project, rel_path, kind)"
+        ");"
+        /* Completion marker written only after hashes, coverage and FTS are
+         * durable. Readers that already hold an older graph use this marker
+         * to avoid switching to a database while an indexer is rebuilding it. */
+        "CREATE TABLE IF NOT EXISTS index_snapshots ("
+        "  project TEXT PRIMARY KEY,"
+        "  generation TEXT NOT NULL,"
+        "  completed_at TEXT NOT NULL"
         ");";
 
     int rc = exec_sql(s, ddl);
@@ -1883,6 +1891,52 @@ int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash
     return CBM_STORE_OK;
 }
 
+int cbm_store_get_file_version(cbm_store_t *s, const char *project, const char *rel_path,
+                               int64_t *mtime_ns, int64_t *size, char **sha256_out) {
+    if (mtime_ns) {
+        *mtime_ns = 0;
+    }
+    if (size) {
+        *size = 0;
+    }
+    if (sha256_out) {
+        *sha256_out = NULL;
+    }
+    if (!s || !s->db || !project || !rel_path || !mtime_ns || !size) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT mtime_ns,size,sha256 FROM file_hashes "
+                           "WHERE project=?1 AND rel_path=?2;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "file version prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    int step = sqlite3_step(stmt);
+    int rc = CBM_STORE_NOT_FOUND;
+    if (step == SQLITE_ROW) {
+        *mtime_ns = sqlite3_column_int64(stmt, 0);
+        *size = sqlite3_column_int64(stmt, 1);
+        if (sha256_out) {
+            *sha256_out = heap_strdup((const char *)sqlite3_column_text(stmt, 2));
+            if (!*sha256_out) {
+                rc = CBM_STORE_ERR;
+                sqlite3_finalize(stmt);
+                return rc;
+            }
+        }
+        rc = CBM_STORE_OK;
+    } else if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "file version read");
+        rc = CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
 int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *rel_path) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_delete_file_hash,
@@ -1959,6 +2013,10 @@ static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
             sqlite3_finalize(del);
         }
     }
+    /* The projects row is derived too. Remove it before rebuilding so a run
+     * whose current coverage has no failures does not leave a stale
+     * <project>::missed entry behind. It is re-created below when needed. */
+    (void)cbm_store_delete_project(s, covproj);
 
     cbm_coverage_row_t *rows = NULL;
     int count = 0;
@@ -1981,8 +2039,8 @@ static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
     }
 
     /* nodes.project has an FK to projects(name) (enforced: foreign_keys=ON),
-     * so the shadow project needs its row. Invisible to list_projects, which
-     * scans the cache directory for .db files, not this table. */
+     * so the shadow project needs its row. list_projects scans DB files and
+     * explicitly ignores the ::missed internal row when resolving each file. */
     if (cbm_store_upsert_project(s, covproj, "") != CBM_STORE_OK) {
         cbm_store_free_coverage(rows, count);
         return;
@@ -2131,6 +2189,59 @@ int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_co
      * contents (same transaction — the table and its view stay in step). */
     cov_rebuild_shadow_graph(s, project);
     return exec_sql(s, "COMMIT;");
+}
+
+int cbm_store_mark_index_complete(cbm_store_t *s, const char *project) {
+    if (!s || !s->db || !project || !project[0]) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "INSERT INTO index_snapshots(project,generation,completed_at) "
+        "VALUES(?1,lower(hex(randomblob(16))),strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+        "ON CONFLICT(project) DO UPDATE SET generation=excluded.generation,"
+        "completed_at=excluded.completed_at;";
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "index snapshot prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int rc = sqlite3_step(stmt) == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+    if (rc != CBM_STORE_OK) {
+        store_set_error_sqlite(s, "index snapshot write");
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+int cbm_store_get_index_generation(cbm_store_t *s, const char *project, char **generation) {
+    if (generation) {
+        *generation = NULL;
+    }
+    if (!s || !s->db || !project || !generation) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT generation FROM index_snapshots WHERE project=?1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        /* Legacy databases do not have index_snapshots. Callers may continue
+         * using an already-open legacy store, but must not treat it as a newly
+         * completed replacement. */
+        return CBM_STORE_NOT_FOUND;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int step = sqlite3_step(stmt);
+    int rc = CBM_STORE_NOT_FOUND;
+    if (step == SQLITE_ROW) {
+        *generation = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        rc = *generation ? CBM_STORE_OK : CBM_STORE_ERR;
+    } else if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "index snapshot read");
+        rc = CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
 }
 
 int cbm_store_coverage_get(cbm_store_t *s, const char *project, cbm_coverage_row_t **out,
@@ -2940,6 +3051,11 @@ static int search_where_basic(const cbm_search_params_t *params, char *where, in
                              binds, bind_idx, pool);
         where_add_regex(where, where_sz, wlen, nparams, binds, bind_idx, "n.qualified_name",
                         params->qn_pattern, params->case_sensitive);
+    }
+    if (params->config_path) {
+        where_add_regex(where, where_sz, wlen, nparams, binds, bind_idx,
+                        "json_extract(n.properties,'$.config_path')", params->config_path,
+                        params->case_sensitive);
     }
     if (params->file_pattern) {
         char *lp = cbm_glob_to_like(params->file_pattern);

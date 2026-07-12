@@ -3,9 +3,25 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { useProjects } from "../hooks/useProjects";
 import { colorForLabel } from "../lib/colors";
 import { useUiMessages } from "../lib/i18n";
+import { callTool } from "../api/rpc";
 
 interface StatsTabProps {
   onSelectProject: (project: string) => void;
+}
+
+interface MemoryStatus {
+  snapshot_epoch: number;
+  entities: { total: number };
+  maintenance: { open_dirty: number; unresolved_code_refs: number };
+  projection: {
+    strategy: string;
+    documents: number;
+    nodes: number;
+    edges: number;
+    runs_in_process: number;
+    last_rebuild_ms: number;
+    last_rebuild_documents: number;
+  };
 }
 
 /* ── Glowy health dot ───────────────────────────────────── */
@@ -502,6 +518,21 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
   const { projects, loading, error, refresh } = useProjects();
   const [showModal, setShowModal] = useState(false);
   const [indexing, setIndexing] = useState(false);
+  const [memoryStatus, setMemoryStatus] = useState<MemoryStatus | null>(null);
+  const [memoryLoading, setMemoryLoading] = useState(false);
+  const [memoryError, setMemoryError] = useState<string | null>(null);
+
+  const inspectMemory = useCallback(async () => {
+    setMemoryLoading(true);
+    setMemoryError(null);
+    try {
+      setMemoryStatus(await callTool<MemoryStatus>("memory_status"));
+    } catch (error) {
+      setMemoryError(error instanceof Error ? error.message : "Global Memory status failed");
+    } finally {
+      setMemoryLoading(false);
+    }
+  }, []);
 
   const aggregate = useMemo(() => {
     let totalNodes = 0, totalEdges = 0;
@@ -520,6 +551,45 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
   return (
     <ScrollArea className="h-full">
       <div className="p-8 max-w-3xl mx-auto">
+        <div className="mb-6 rounded-xl border border-violet-400/15 bg-violet-400/[0.035] p-4">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h2 className="text-[13px] font-semibold text-violet-200/85">{t.projects.globalMemory}</h2>
+              {!memoryStatus && !memoryError && (
+                <p className="mt-1 text-[11px] text-foreground/30">{t.projects.memoryNotLoaded}</p>
+              )}
+              {memoryError && <p className="mt-1 text-[11px] text-destructive">{memoryError}</p>}
+            </div>
+            <button onClick={inspectMemory} disabled={memoryLoading} className="shrink-0 rounded-lg bg-violet-400/10 px-3 py-1.5 text-[11px] font-medium text-violet-200/75 transition-all hover:bg-violet-400/15 disabled:opacity-40">
+              {memoryLoading ? t.common.loading : t.projects.inspectMemory}
+            </button>
+          </div>
+          {memoryStatus && (
+            <>
+              <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+              {[
+                [t.projects.memoryEpoch, memoryStatus.snapshot_epoch],
+                [t.projects.memoryEntities, memoryStatus.entities.total],
+                [t.projects.memoryReview, memoryStatus.maintenance.open_dirty],
+                [t.projects.memoryRefs, memoryStatus.maintenance.unresolved_code_refs],
+                [t.projects.memoryProjection, memoryStatus.projection.documents],
+              ].map(([label, value]) => (
+                <div key={String(label)} className="rounded-lg border border-white/[0.04] bg-black/10 px-2.5 py-2">
+                  <p className="text-[9px] uppercase tracking-wide text-foreground/25">{label}</p>
+                  <p className="mt-0.5 text-[14px] font-semibold tabular-nums text-foreground/65">{Number(value).toLocaleString()}</p>
+                </div>
+              ))}
+              </div>
+              <p className="mt-2 text-[10px] text-foreground/25">
+                {t.projects.memoryProjectionDetail(
+                  memoryStatus.projection.strategy,
+                  memoryStatus.projection.last_rebuild_ms,
+                  memoryStatus.projection.last_rebuild_documents,
+                )}
+              </p>
+            </>
+          )}
+        </div>
         {projects.length > 0 && (
           <div className="flex gap-4 mb-8">
             {[
@@ -566,6 +636,19 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
                     <div className="min-w-0">
                       <h3 className="text-[14px] font-semibold text-foreground/90 mb-0.5">{p.project.name}</h3>
                       <p className="text-[11px] text-foreground/20 font-mono truncate">{p.project.root_path}</p>
+                      {p.status && (
+                        <div className="mt-2 flex items-center gap-2 text-[10px]">
+                          <span className={`inline-flex items-center gap-1 rounded-md px-1.5 py-[2px] ${p.status.snapshot_complete ? "bg-emerald-500/10 text-emerald-400/80" : "bg-amber-500/10 text-amber-300/80"}`}>
+                            <span className={`h-1 w-1 rounded-full ${p.status.snapshot_complete ? "bg-emerald-400" : "bg-amber-300"}`} />
+                            {p.status.snapshot_complete ? t.projects.snapshotReady : t.projects.snapshotLegacy}
+                          </span>
+                          {p.status.index_generation && (
+                            <span className="font-mono text-foreground/25" title={p.status.index_generation}>
+                              {t.projects.generation} {p.status.index_generation.slice(0, 8)}
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0">

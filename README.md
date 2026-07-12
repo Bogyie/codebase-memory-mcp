@@ -39,7 +39,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
 - **Design Context** — read-only indexing for `DESIGN.md`, DTCG tokens/resolvers, CSS custom properties, modes, aliases, generated assets, and implementation usage. See the [Design Context guide](docs/DESIGN_CONTEXT.md).
-- **23 MCP tools** — search, trace, architecture, design context, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, Global Memory, and more.
+- **23 MCP tools** — search, trace, architecture, design context, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, Global Memory status and management, and more.
 
 ## Quick Start
 
@@ -72,6 +72,12 @@ Unblock-File .\install.ps1
 > **Note:** If you see a script execution policy error, run `Set-ExecutionPolicy -Scope Process Bypass` first, or invoke with `PowerShell -ExecutionPolicy Bypass -File .\install.ps1`.
 
 Options: `--ui` (graph visualization), `--skip-config` (binary only, no agent setup), `--dir=<path>` (custom location).
+
+The official installers record the managed binary path in
+`~/.config/codebase-memory-mcp/install.conf`. `codebase-memory-mcp update` updates only that
+managed path (or the legacy canonical `~/.local/bin` install); package-manager binaries are left to
+their package manager. Archive and checksum download are a single fail-closed operation: a missing
+checksum, checksum tool, or matching entry aborts installation before extraction.
 
 Restart your coding agent. Say **"Index this project"** — done.
 
@@ -168,12 +174,12 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 
 ### Search
 - **Semantic search** (`semantic_query`): vector search across the entire graph, powered by bundled Nomic `nomic-embed-code` embeddings (40K tokens, 768d int8) compiled into the binary — no API key, no Ollama, no Docker. 11-signal combined scoring (TF-IDF, RRI, API/Type/Decorator signatures, AST profiles, data flow, Halstead-lite, MinHash, module proximity, graph diffusion).
-- **BM25 full-text search** via SQLite FTS5 with `cbm_camel_split` tokenizer (camelCase / snake_case aware)
-- **Structural search** (`search_graph`): regex name patterns, label filters, min/max degree, file scoping
+- **BM25 full-text search** via SQLite FTS5 with `cbm_camel_split` tokenizer (camelCase / snake_case aware). Source files receive soft priority over equivalent test and vendored/generated hits; lower-priority results remain searchable and are tagged with `source_scope`.
+- **Structural search** (`search_graph`): regex name patterns, label filters, min/max degree, file scoping, and value-free [nested YAML path search](docs/CONFIG_PATH_SEARCH.md)
 - **Code search** (`search_code`): graph-augmented grep over indexed files only
 
 ### Cross-service linking
-- **HTTP** route ↔ call-site matching with confidence scoring
+- **HTTP** route ↔ call-site matching with confidence scoring. Call-site occurrences are retained as caller → Route edges, and call-literal Routes are removed only after their last source occurrence disappears.
 - **gRPC, GraphQL, tRPC** service detection with protobuf Route extraction
 - **Channel detection** (`EMITS` / `LISTENS_ON`) for Socket.IO, EventEmitter, and generic pub-sub patterns across 8 languages with constant resolution
 
@@ -200,7 +206,7 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 ### Distribution & operation
 - **Single static binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
 - **Auto-sync**: Background watcher detects file changes and re-indexes automatically
-- **Route nodes**: REST endpoints are first-class graph entities
+- **Route nodes**: REST endpoints are first-class graph entities. Source-backed handler Routes take precedence over synthetic call-literal Routes with the same identity.
 - **CLI mode**: `codebase-memory-mcp cli search_graph '{"project": "my-project", "name_pattern": ".*Handler.*"}'`
 - **Available on**: npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, `go install`
 
@@ -472,18 +478,18 @@ concurrency, and sharing contracts.
 | `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. |
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
-| `index_status` | Check indexing status of a project. |
+| `index_status` | Check project health, coverage, and the latest completed snapshot generation. |
 
 ### Querying
 
 | Tool | Description |
 |------|-------------|
-| `search_graph` | Structured search by label, name pattern, file pattern, degree filters. Pagination via limit/offset. |
+| `search_graph` | Structured search by label, name pattern, file pattern, YAML `config_path`, and degree filters. Pagination via limit/offset. |
 | `trace_path` | BFS traversal — who calls a function and what it calls (alias: `trace_call_path`). Depth 1-5. |
-| `detect_changes` | Map git diff to affected symbols + blast radius with risk classification. |
+| `detect_changes` | Read-only mapping from git diff to affected symbols + blast radius. Never writes Global Memory. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
-| `get_code_snippet` | Read source code for a function by qualified name. |
+| `get_code_snippet` | Read bounded live source by qualified name, with indexed-range provenance and explicit current, stale, missing, or unknown worktree state. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `get_design_context` | Paginated project-local design systems, tokens, components, mode-specific values, aliases, guidance, and usages. |
 | `search_code` | Grep-like text search within indexed project files. |
@@ -499,10 +505,22 @@ provenance, bitemporal claim state, proposals, activities, and full-text search.
 [Using Global Memory](docs/GLOBAL_MEMORY_GUIDE.md) for task-oriented workflows and
 [Global Memory Architecture](docs/GLOBAL_MEMORY.md) for its epistemic and concurrency contracts.
 
+Code discovery and durable memory writes have separate contracts. `detect_changes` is strictly
+observational. After a successful repository index, CodeRefs are validated against the completed
+graph directly; unchanged resolution is a no-op and does not create a Memory epoch or revision.
+Project graph replacements are built at a sibling staging path. Readers switch generations only
+after hashes, coverage, FTS, the completion marker, and an atomic install have succeeded,
+and `index_status` exposes `snapshot_complete` plus the opaque `index_generation`.
+
+Projection rebuild timing is exposed through `memory_status`. The opt-in scaling gate and the
+current decision thresholds are documented in
+[Global Memory Performance](docs/GLOBAL_MEMORY_PERFORMANCE.md).
+
 | Tool | Description |
 |------|-------------|
 | `memory_ingest` | Deduplicate and retain an immutable raw source with provenance. |
 | `memory_query` | Applicability-first search, lookup, timeline, and as-of retrieval. |
+| `memory_status` | Read-only epoch, entity, maintenance, CodeRef, and projection counters. |
 | `memory_propose` | Stage revision-aware page, claim, decision, experience, preference, relation, or CodeRef operations. |
 | `memory_commit` | Atomically commit a proposal using entity revisions and an idempotent operation ID. |
 | `memory_lint` | Check epistemic, temporal, graph, materialization, bias, and CodeRef health. |
@@ -686,7 +704,7 @@ Upstream release binaries are verified through a multi-layer pipeline before pub
 - **VirusTotal** — all binaries scanned by 70+ antivirus engines (zero detections required to publish)
 - **SLSA Level 3** — cryptographic build provenance generated by the trusted GitHub Actions build workflow; verify with `gh attestation verify <file> --repo DeusData/codebase-memory-mcp --signer-workflow DeusData/codebase-memory-mcp/.github/workflows/_build.yml`
 - **Sigstore cosign** — keyless signatures on all artifacts; bundles included in every release
-- **SHA-256 checksums** — `checksums.txt` published with every release; verified by both install scripts before extraction
+- **SHA-256 checksums** — `checksums.txt` published with every release; both official install scripts fail closed unless the exact archive entry is verified before extraction
 - **CodeQL SAST** — blocks release pipeline if any open alerts remain
 - **Zero runtime dependencies** — no transitive supply chain; all libraries vendored at compile time
 

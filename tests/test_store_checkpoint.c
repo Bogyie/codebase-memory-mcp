@@ -74,6 +74,48 @@ TEST(checkpoint_does_not_truncate_wal) {
     PASS();
 }
 
+TEST(index_snapshot_generation_is_published_explicitly) {
+    enum { PATH_BUF = 256, PATH_BUF_EXT = 300 };
+    char db_path[PATH_BUF];
+    snprintf(db_path, sizeof(db_path), "%s/cbm_test_generation_%d.db", cbm_tmpdir(),
+             (int)getpid());
+    char wal_path[PATH_BUF_EXT];
+    char shm_path[PATH_BUF_EXT];
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
+    unlink(db_path);
+    unlink(wal_path);
+    unlink(shm_path);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "snapshot-test", "/tmp/snapshot-test"), CBM_STORE_OK);
+
+    char *generation = NULL;
+    ASSERT_EQ(cbm_store_get_index_generation(s, "snapshot-test", &generation),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_NULL(generation);
+    ASSERT_EQ(cbm_store_mark_index_complete(s, "snapshot-test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_index_generation(s, "snapshot-test", &generation), CBM_STORE_OK);
+    ASSERT_NOT_NULL(generation);
+    ASSERT(strlen(generation) == 32);
+    char first[33];
+    snprintf(first, sizeof(first), "%s", generation);
+    free(generation);
+    generation = NULL;
+
+    ASSERT_EQ(cbm_store_mark_index_complete(s, "snapshot-test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_index_generation(s, "snapshot-test", &generation), CBM_STORE_OK);
+    ASSERT_NOT_NULL(generation);
+    ASSERT(strcmp(first, generation) != 0);
+    free(generation);
+    cbm_store_close(s);
+    unlink(db_path);
+    unlink(wal_path);
+    unlink(shm_path);
+    PASS();
+}
+
 
 /* #897: any code path installing a fresh DB file must delete the
  * destination's -wal/-shm first. SQLite decides whether to replay a WAL
@@ -185,5 +227,6 @@ TEST(dump_install_ignores_stale_wal_sidecar) {
 
 SUITE(store_checkpoint) {
     RUN_TEST(checkpoint_does_not_truncate_wal);
+    RUN_TEST(index_snapshot_generation_is_published_explicitly);
     RUN_TEST(dump_install_ignores_stale_wal_sidecar);
 }

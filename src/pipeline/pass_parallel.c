@@ -499,6 +499,7 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "config_path", def->config_path);
 
     /* MinHash fingerprint — append if present and buffer has room.
      * Hex-encoded K=64 uint32 = 512 chars + key/quotes ≈ 520 chars. */
@@ -910,6 +911,10 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
              * the MCP layer reports it separately from skipped[]. */
             pp_err_add(errs, fi->rel_path, result->error_ranges ? result->error_ranges : "unknown",
                        "parse_partial");
+        }
+        if (result->yaml_config_path_truncated) {
+            pp_err_add(errs, fi->rel_path, "nested YAML config paths capped at 512",
+                       "config_path_truncated");
         }
 
         /* Create definition nodes in local gbuf */

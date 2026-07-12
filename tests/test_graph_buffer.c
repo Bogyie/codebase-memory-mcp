@@ -136,6 +136,34 @@ TEST(gbuf_delete_by_label) {
     ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "pkg.bar"));
     ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "pkg.Baz"));
 
+    /* Reusing a deleted QN must not revive the tombstoned node during a later
+     * dump/flush. This is the incremental Design Context replacement shape. */
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "foo2", "pkg.foo", "new.go", 1, 3, "{}"),
+              0);
+    ASSERT_EQ(cbm_gbuf_node_count(gb), 2);
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_gbuf_flush_to_store(gb, store), 0);
+    ASSERT_EQ(cbm_store_count_nodes(store, "test"), 2);
+    cbm_store_close(store);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(gbuf_delete_node_by_id_cascades_edges) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("p", "/tmp/p");
+    int64_t caller = cbm_gbuf_upsert_node(gb, "Function", "caller", "p.caller", "a.c", 1, 2,
+                                          "{}");
+    int64_t route = cbm_gbuf_upsert_node(gb, "Route", "/x", "__route__GET__/x", "", 0, 0,
+                                         "{\"origin\":\"call_literal\"}");
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, caller, route, "HTTP_CALLS", "{}"), 0);
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 1);
+    ASSERT_EQ(cbm_gbuf_delete_node_by_id(gb, route), 1);
+    ASSERT_NULL(cbm_gbuf_find_by_id(gb, route));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__GET__/x"));
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 0);
+    ASSERT_EQ(cbm_gbuf_delete_node_by_id(gb, route), 0);
     cbm_gbuf_free(gb);
     PASS();
 }
@@ -1020,6 +1048,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_find_by_label);
     RUN_TEST(gbuf_find_by_name);
     RUN_TEST(gbuf_delete_by_label);
+    RUN_TEST(gbuf_delete_node_by_id_cascades_edges);
     RUN_TEST(gbuf_insert_edge);
     RUN_TEST(gbuf_edge_dedup);
     RUN_TEST(gbuf_imports_multi_symbol_dedup);

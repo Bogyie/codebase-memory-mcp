@@ -77,6 +77,7 @@ int cbm_memory_validate_code_refs(cbm_memory_t *memory, cbm_store_t *code_store,
  *         {project, files?:[...], qualified_names?:[...], deleted?:bool, reason?:string}
  */
 char *cbm_memory_ingest_json(cbm_memory_t *memory, const char *args_json);
+char *cbm_memory_status_json(cbm_memory_t *memory, const char *args_json);
 char *cbm_memory_query_json(cbm_memory_t *memory, const char *args_json);
 char *cbm_memory_propose_json(cbm_memory_t *memory, const char *args_json);
 char *cbm_memory_commit_json(cbm_memory_t *memory, const char *args_json);

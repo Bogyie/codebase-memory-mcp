@@ -445,9 +445,9 @@ static void incr_free_edge_capture(cbm_edge_capture_t *cap) {
  * indexed at all (forced re-parse on the next run for current-files,
  * potential orphaned-node revival for mode_skipped). The warning surface
  * is the only signal that something went wrong. */
-static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
-                           int file_count, const cbm_file_hash_t *mode_skipped,
-                           int mode_skipped_count) {
+static int persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
+                          int file_count, const cbm_file_hash_t *mode_skipped,
+                          int mode_skipped_count) {
     int current_failed = 0;
     int ms_failed = 0;
 
@@ -456,6 +456,9 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
     for (int i = 0; i < file_count; i++) {
         struct stat st;
         if (stat(files[i].path, &st) != 0) {
+            current_failed++;
+            cbm_log_warn("incremental.persist_hash_failed", "scope", "stat", "rel_path",
+                         files[i].rel_path);
             continue;
         }
         int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, "",
@@ -498,6 +501,7 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
         cbm_log_warn("incremental.persist_summary", "current_failed", itoa_buf(current_failed),
                      "mode_skipped_failed", itoa_buf(ms_failed));
     }
+    return current_failed == 0 && ms_failed == 0 ? CBM_STORE_OK : CBM_STORE_ERR;
 }
 
 /* ── Registry seed visitor ────────────────────────────────────────── */
@@ -637,33 +641,46 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
-static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                             cbm_file_info_t *files, int file_count,
-                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                             const char *repo_path, const cbm_coverage_row_t *cov, int cov_count) {
+static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
+                            cbm_file_info_t *files, int file_count,
+                            const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
+                            const char *repo_path, const cbm_coverage_row_t *cov, int cov_count) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
-    cbm_unlink(db_path);
-    char wal[INCR_WAL_BUF];
-    char shm[INCR_WAL_BUF];
-    snprintf(wal, sizeof(wal), "%s-wal", db_path);
-    snprintf(shm, sizeof(shm), "%s-shm", db_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
+    char staged_path[CBM_SZ_4K];
+    if (snprintf(staged_path, sizeof(staged_path), "%s.building", db_path) >=
+        (int)sizeof(staged_path)) {
+        return CBM_STORE_ERR;
+    }
+    cbm_unlink(staged_path);
+    cbm_remove_db_sidecars(staged_path);
 
-    int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, db_path);
+    int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, staged_path);
     cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
+    if (dump_rc != 0) {
+        cbm_unlink(staged_path);
+        cbm_remove_db_sidecars(staged_path);
+        return dump_rc;
+    }
 
-    cbm_store_t *hash_store = cbm_store_open_path(db_path);
-    if (hash_store) {
-        persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
+    cbm_store_t *hash_store = cbm_store_open_path(staged_path);
+    if (!hash_store) {
+        cbm_log_error("incremental.err", "msg", "reopen_persisted_db", "project", project);
+        cbm_unlink(staged_path);
+        cbm_remove_db_sidecars(staged_path);
+        return CBM_STORE_ERR;
+    }
+    {
+        bool persist_ok = persist_hashes(hash_store, project, files, file_count, mode_skipped,
+                                         mode_skipped_count) == CBM_STORE_OK;
 
         /* Coverage rows (#963): re-write the merged set into the rebuilt DB
          * (AFTER hashes, so the deleted-file prune sees the live file set). */
         if (cov_count > 0 &&
             cbm_store_coverage_replace(hash_store, project, cov, cov_count) != CBM_STORE_OK) {
+            persist_ok = false;
             cbm_log_error("incremental.err", "msg", "persist_coverage", "project", project);
         }
 
@@ -671,23 +688,50 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
          * any triggers that could have kept nodes_fts synchronized, so we
          * rebuild from the nodes table here.  See the full-dump path in
          * pipeline.c for the matching logic. */
-        cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
-        if (cbm_store_exec(hash_store,
+        if (cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');") !=
+            CBM_STORE_OK) {
+            persist_ok = false;
+        }
+        if (persist_ok && cbm_store_exec(hash_store,
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
                            "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
                            "FROM nodes;") != CBM_STORE_OK) {
-            cbm_store_exec(hash_store,
+            if (cbm_store_exec(hash_store,
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+                               "SELECT id, name, qualified_name, label, file_path FROM nodes;") !=
+                CBM_STORE_OK) {
+                persist_ok = false;
+            }
+        }
+
+        if (!persist_ok || cbm_store_mark_index_complete(hash_store, project) != CBM_STORE_OK ||
+            cbm_store_checkpoint(hash_store) != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "msg", "publish_snapshot", "project", project);
+            cbm_store_close(hash_store);
+            cbm_unlink(staged_path);
+            cbm_remove_db_sidecars(staged_path);
+            return CBM_STORE_ERR;
         }
 
         cbm_store_close(hash_store);
     }
 
+    cbm_remove_db_sidecars(staged_path);
+    cbm_remove_db_sidecars(db_path);
+    if (cbm_rename_replace(staged_path, db_path) != 0) {
+        cbm_log_error("incremental.err", "msg", "install_snapshot", "project", project);
+        cbm_unlink(staged_path);
+        cbm_remove_db_sidecars(staged_path);
+        return CBM_STORE_ERR;
+    }
+
     /* Auto-update artifact if one already exists (persistence was enabled previously) */
     if (repo_path && cbm_artifact_exists(repo_path)) {
-        cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
+        if (cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST) != 0) {
+            return CBM_STORE_ERR;
+        }
     }
+    return 0;
 }
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
@@ -958,13 +1002,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full ones. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
-    dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                     mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n);
+    int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
+                                      mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
-    return 0;
+    return persist_rc;
 }

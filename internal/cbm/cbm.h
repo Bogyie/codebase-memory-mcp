@@ -195,6 +195,7 @@ typedef struct {
     const char **return_types; // NULL-terminated array (NULL if none)
     const char *route_path;    // HTTP route path from decorator (e.g., "/api/users") or NULL
     const char *route_method;  // HTTP method from decorator (e.g., "POST") or NULL
+    const char *config_path;   // dotted config path for nested config definitions, or NULL
     int complexity;            // cyclomatic complexity
     int cognitive;             // cognitive complexity (nesting-weighted)
     int loop_count;            // number of loop constructs in the body
@@ -458,6 +459,8 @@ typedef struct {
     bool parse_incomplete;
     const char *error_ranges;
     int error_region_count;
+    int yaml_config_defs_emitted;      // nested YAML config-path definitions retained
+    bool yaml_config_path_truncated;   // per-file YAML_CONFIG_DEF_CAP was reached
     bool is_test_file;
     int imports_count;
     TSTree *cached_tree;     // retained parse tree (caller frees via cbm_free_tree)

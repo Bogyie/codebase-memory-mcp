@@ -121,6 +121,7 @@ recover pending outbox entries after a crash.
 
 - `memory_ingest`: add/deduplicate immutable raw sources and return related memory candidates.
 - `memory_query`: search/get/overview/neighbors/path/timeline/as-of and applicability routing.
+- `memory_status`: read-only epoch, entity, maintenance, CodeRef, and projection counters.
 - `memory_propose`: create revision-safe graph/wiki operations.
 - `memory_commit`: commit or reject a proposal with epoch/revision/idempotency checks.
 - `memory_lint`: epistemic, temporal, bias, graph, materialization, and code-reference health.
@@ -147,8 +148,22 @@ may contain sensitive data.
 ## Code graph integration
 
 Memory stores symbolic `CodeRef` values (project, qualified name, file, and optional commit/tree
-hash), never raw node IDs from a project database. Index and change-detection paths validate
-references and mark connected memory dirty when referenced files/symbols change or disappear.
+hash), never raw node IDs from a project database.
+
+`detect_changes` is observational: it reports changed files and impacted symbols and returns
+`global_memory_updated: false`. It does not open, dirty, or revise Global Memory. This keeps a
+diagnostic query from becoming an implicit durable write.
+
+After a repository index completes, the indexer publishes an opaque graph generation only after
+file hashes, coverage metadata, and FTS are durable. Replacements are built in a sibling staging
+database and atomically installed only after the completion marker and checkpoint succeed. A
+failed rebuild therefore leaves the previous completed database at its published path. Long-running
+MCP readers keep serving that snapshot while a replacement is being built, then reopen after the
+completed file is installed. CodeRef validation runs against that completed graph. It updates only references
+whose resolved/missing result actually changed; a no-op reindex therefore does not create a Memory
+epoch or CodeRef revision. Connected memory is marked for review only when validation detects a
+real resolution change.
+
 Repository ADRs remain repository-scoped unless explicitly promoted through a memory proposal.
 
 ## Maintenance
@@ -161,6 +176,10 @@ materialization, and conflicting proposals.
 
 Frequently reused or high-impact memory receives higher audit priority, never higher truth
 weight.
+
+Projection performance is measured rather than assumed. See
+[Global Memory Performance](GLOBAL_MEMORY_PERFORMANCE.md) for the opt-in scaling probe, current
+baseline, and the thresholds that would trigger an incremental-projection redesign.
 
 ## Sharing scope (Phase 5)
 

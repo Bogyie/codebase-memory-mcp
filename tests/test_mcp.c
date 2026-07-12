@@ -1132,6 +1132,124 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     PASS();
 }
 
+TEST(tool_search_graph_bm25_soft_source_first_ranking) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "bm25-source-first";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/bm25-source-first");
+
+    cbm_node_t node = {0};
+    node.project = proj;
+    node.label = "Function";
+    node.name = "hydrateCache";
+    node.start_line = 1;
+    node.end_line = 3;
+
+    node.qualified_name = "bm25.vendor.hydrateCache";
+    node.file_path = "vendored/cache.c";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    node.qualified_name = "bm25.test.hydrateCache";
+    node.file_path = "tests/cache_test.c";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    node.qualified_name = "bm25.source.hydrateCache";
+    node.file_path = "src/cache.c";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    node.name = "testSentinelGamma";
+    node.qualified_name = "bm25.test.testSentinelGamma";
+    node.file_path = "tests/only_test.c";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    cbm_store_exec(st, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    ASSERT_EQ(cbm_store_exec(st,
+                             "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                             "file_path) "
+                             "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+                             "FROM nodes;"),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":553,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"bm25-source-first\","
+        "\"query\":\"hydrate cache\",\"limit\":10}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    const char *source_pos = strstr(inner, "src/cache.c");
+    const char *test_pos = strstr(inner, "tests/cache_test.c");
+    const char *vendor_pos = strstr(inner, "vendored/cache.c");
+    ASSERT_NOT_NULL(source_pos);
+    ASSERT_NOT_NULL(test_pos);
+    ASSERT_NOT_NULL(vendor_pos);
+    ASSERT_TRUE(source_pos < test_pos);
+    ASSERT_TRUE(test_pos < vendor_pos);
+    ASSERT_NOT_NULL(strstr(inner, "total_scope: candidate_window"));
+    ASSERT_NOT_NULL(strstr(inner, "ranking_policy: source_first_soft_penalty"));
+    ASSERT_NOT_NULL(strstr(inner, "scope"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":554,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"bm25-source-first\","
+        "\"query\":\"sentinel gamma\",\"limit\":10}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "tests/only_test.c"));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_filters_dotted_config_path) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "config-path-search";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/config-path-search");
+
+    cbm_node_t node = {0};
+    node.project = proj;
+    node.label = "Variable";
+    node.name = "timeout";
+    node.file_path = "config.yml";
+    node.start_line = 3;
+    node.end_line = 3;
+    node.qualified_name = "config.services.api.timeout";
+    node.properties_json = "{\"config_path\":\"services.api.timeout\"}";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    node.qualified_name = "config.services.worker.timeout";
+    node.properties_json = "{\"config_path\":\"services.worker.timeout\"}";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":555,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"config-path-search\","
+        "\"config_path\":\"services\\\\.api\\\\.timeout\","
+        "\"fields\":[\"config_path\"],\"limit\":10}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "config.services.api.timeout"));
+    ASSERT_NOT_NULL(strstr(inner, "services.api.timeout"));
+    ASSERT_NULL(strstr(inner, "config.services.worker.timeout"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* MCP discovery methods this server doesn't populate must return EMPTY
  * lists, not -32601 Method-not-found: clients like Cline probe
  * resources/list + prompts/list + resources/templates/list on connect and
@@ -1209,6 +1327,9 @@ TEST(tool_index_status_includes_git_metadata) {
     ASSERT_NOT_NULL(strstr(inner, "\"git\""));
     ASSERT_NOT_NULL(strstr(inner, "\"is_git\":false"));
     ASSERT_NOT_NULL(strstr(inner, "\"root_exists\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"snapshot_complete\":false"));
+    ASSERT_NOT_NULL(strstr(inner, "\"index_generation\":\"\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_at\""));
 
     free(inner);
     free(resp);
@@ -3101,6 +3222,16 @@ TEST(parse_file_uri_invalid) {
  * Writes a source file to tmp_dir/project/main.go.
  * Caller must free the server with cbm_mcp_server_free and
  * unlink the source file + rmdir manually. */
+static int64_t snippet_test_mtime_ns(const struct stat *st) {
+#if defined(__APPLE__)
+    return (int64_t)st->st_mtimespec.tv_sec * 1000000000LL + st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * 1000000000LL;
+#else
+    return (int64_t)st->st_mtim.tv_sec * 1000000000LL + st->st_mtim.tv_nsec;
+#endif
+}
+
 static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     /* Create temp dir */
     snprintf(tmp_dir, tmp_sz, "/tmp/cbm_snippet_test_XXXXXX");
@@ -3146,6 +3277,11 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     const char *proj_name = "test-project";
     cbm_mcp_server_set_project(srv, proj_name);
     cbm_store_upsert_project(st, proj_name, proj_dir);
+    struct stat source_stat;
+    if (stat(src_path, &source_stat) == 0) {
+        cbm_store_upsert_file_hash(st, proj_name, "main.go", "",
+                                   snippet_test_mtime_ns(&source_stat), source_stat.st_size);
+    }
 
     /* Create nodes */
     cbm_node_t n_hr = {0};
@@ -3295,6 +3431,8 @@ TEST(snippet_exact_qn) {
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source_state\":\"current\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source_truncated\":false"));
     /* Exact match should NOT have match_method */
     ASSERT_NULL(strstr(resp, "\"match_method\""));
     /* No property-blob spill: the source IS the payload (signature and
@@ -3613,6 +3751,96 @@ TEST(snippet_source_invalid_utf8) {
 
     free(resp);
     free(raw);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(snippet_stale_worktree_is_explicit) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    FILE *fp = fopen(src_path, "a");
+    ASSERT_NOT_NULL(fp);
+    fputs("\n// live edit after indexing\n", fp);
+    fclose(fp);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"source_state\":\"stale_worktree\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source_warning\""));
+    ASSERT_NOT_NULL(strstr(resp, "re-index before relying on it"));
+    ASSERT_NOT_NULL(strstr(resp, "\"line_range_source\":\"indexed_graph\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(snippet_missing_worktree_is_not_current) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    ASSERT_EQ(cbm_unlink(src_path), 0);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"source_state\":\"missing_worktree\""));
+    ASSERT_NULL(strstr(resp, "\"source_state\":\"current\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source_warning\""));
+    ASSERT_NOT_NULL(strstr(resp, "missing or unreadable"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(snippet_long_physical_lines_are_counted_once_and_bounded) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    for (int i = 0; i < 20000; i++) {
+        fputc('x', fp);
+    }
+    fputs("\n\nfunc HandleRequest() error {\n\treturn nil\n}\n", fp);
+    fclose(fp);
+    char *physical =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(physical);
+    ASSERT_NOT_NULL(strstr(physical, "func HandleRequest() error"));
+    ASSERT_NOT_NULL(strstr(physical, "\"source_truncated\":false"));
+    free(physical);
+
+    fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("package main\n\n", fp);
+    for (int i = 0; i < 20000; i++) {
+        fputc('y', fp);
+    }
+    fputs("\n", fp);
+    fclose(fp);
+    char *bounded =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(bounded);
+    ASSERT_NOT_NULL(strstr(bounded, "\"source_truncated\":true"));
+    ASSERT_NOT_NULL(strstr(bounded, "\"source_bytes\":16384"));
+    free(bounded);
+
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();
@@ -4221,6 +4449,14 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
 
     /* (1) control: filename == internal name */
     ASSERT_TRUE(issue704_make_db(cache, "alpha704.db", "alpha704", "alphaFunc704"));
+    /* Coverage materializes a second internal projects row in the same DB.
+     * list_projects must ignore this derived graph and still advertise alpha. */
+    char alpha_path[700];
+    snprintf(alpha_path, sizeof(alpha_path), "%s/alpha704.db", cache);
+    cbm_store_t *alpha_store = cbm_store_open_path(alpha_path);
+    ASSERT_NOT_NULL(alpha_store);
+    ASSERT_EQ(cbm_store_upsert_project(alpha_store, "alpha704::missed", ""), CBM_STORE_OK);
+    cbm_store_close(alpha_store);
 
     /* (2) DRIFT: build beta704.db (internal "beta704") then rename the file to
      *     gamma704.db, so filename "gamma704" != internal "beta704". */
@@ -4298,18 +4534,16 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
     } else {
         cbm_unsetenv("CBM_CACHE_DIR");
     }
-    char a_path[700];
-    snprintf(a_path, sizeof(a_path), "%s/alpha704.db", cache);
     char corrupt_path[720];
     snprintf(corrupt_path, sizeof(corrupt_path), "%s.corrupt", ghost_path);
-    cbm_unlink(a_path);
+    cbm_unlink(alpha_path);
     cbm_unlink(gamma_path);
     cbm_unlink(ghost_path);
     cbm_unlink(corrupt_path); /* ghost may be quarantined by resolve_store */
     char side[740];
-    snprintf(side, sizeof(side), "%s-wal", a_path);
+    snprintf(side, sizeof(side), "%s-wal", alpha_path);
     cbm_unlink(side);
-    snprintf(side, sizeof(side), "%s-shm", a_path);
+    snprintf(side, sizeof(side), "%s-shm", alpha_path);
     cbm_unlink(side);
     snprintf(side, sizeof(side), "%s-wal", gamma_path);
     cbm_unlink(side);
@@ -4317,6 +4551,79 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
     cbm_unlink(side);
     cbm_rmdir(cache);
     PASS();
+}
+
+TEST(active_store_refresh_waits_for_completed_snapshot) {
+#ifdef _WIN32
+    /* Windows may deny replacing a SQLite file held by the active reader; the
+     * same completion-marker behavior is covered by the store-level test. */
+    PASS();
+#else
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-snapshot-refresh-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char path[700];
+    snprintf(path, sizeof(path), "%s/refresh.db", cache);
+    ASSERT_TRUE(issue704_make_db(cache, "refresh.db", "refresh", "oldSnapshotFn"));
+    cbm_store_t *published = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(published);
+    ASSERT_EQ(cbm_store_mark_index_complete(published, "refresh"), CBM_STORE_OK);
+    cbm_store_close(published);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    const char *query_old =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+        "\"project\":\"refresh\",\"name_pattern\":\".*SnapshotFn\",\"limit\":5}}}";
+    char *first = cbm_mcp_server_handle(srv, query_old);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(strstr(first, "oldSnapshotFn"));
+    free(first);
+
+    /* Replace the backing path with a structurally valid but unpublished DB.
+     * The active server must keep serving its old, complete snapshot. */
+    ASSERT_EQ(cbm_unlink(path), 0);
+    ASSERT_TRUE(issue704_make_db(cache, "refresh.db", "refresh", "newSnapshotFn"));
+    char *during = cbm_mcp_server_handle(srv, query_old);
+    ASSERT_NOT_NULL(during);
+    ASSERT_NOT_NULL(strstr(during, "oldSnapshotFn"));
+    ASSERT_NULL(strstr(during, "newSnapshotFn"));
+    free(during);
+
+    published = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(published);
+    ASSERT_EQ(cbm_store_mark_index_complete(published, "refresh"), CBM_STORE_OK);
+    cbm_store_close(published);
+
+    char *after = cbm_mcp_server_handle(srv, query_old);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "newSnapshotFn"));
+    ASSERT_NULL(strstr(after, "oldSnapshotFn"));
+    free(after);
+    cbm_mcp_server_free(srv);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_unlink(path);
+    char side[740];
+    snprintf(side, sizeof(side), "%s-wal", path);
+    cbm_unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", path);
+    cbm_unlink(side);
+    cbm_rmdir(cache);
+    PASS();
+#endif
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -5787,6 +6094,7 @@ TEST(global_memory_tools_and_graph_need_no_project) {
                                   "RETURN s.name LIMIT 1\",\"format\":\"json\"}")
             : NULL;
     char *lint = srv ? cbm_mcp_handle_tool(srv, "memory_lint", "{}") : NULL;
+    char *status = srv ? cbm_mcp_handle_tool(srv, "memory_status", "{}") : NULL;
 
     bool ingest_ok = ingest && strstr(ingest, "unknown tool") == NULL &&
                      response_contains_json_fragment(ingest, "\"ok\":true");
@@ -5797,12 +6105,16 @@ TEST(global_memory_tools_and_graph_need_no_project) {
     bool cypher_ok = cypher && strstr(cypher, "Memory graph is unavailable") == NULL &&
                      response_contains_json_fragment(cypher, "\"snapshot_epoch\"");
     bool lint_ok = lint && strstr(lint, "unknown tool") == NULL;
+    bool status_ok = status && strstr(status, "unknown tool") == NULL &&
+                     response_contains_json_fragment(status, "\"snapshot_epoch\"") &&
+                     response_contains_json_fragment(status, "\"projection\"");
 
     free(ingest);
     free(query);
     free(schema);
     free(cypher);
     free(lint);
+    free(status);
     cbm_mcp_server_free(srv);
     if (saved) {
         cbm_setenv("CBM_MEMORY_HOME", saved, 1);
@@ -5817,13 +6129,14 @@ TEST(global_memory_tools_and_graph_need_no_project) {
     ASSERT_TRUE(schema_ok);
     ASSERT_TRUE(cypher_ok);
     ASSERT_TRUE(lint_ok);
+    ASSERT_TRUE(status_ok);
     PASS();
 }
 
 TEST(global_memory_tool_schemas_are_registered) {
     static const char *const names[] = {
-        "memory_ingest", "memory_query",  "memory_propose", "memory_commit",
-        "memory_lint",   "memory_export", "memory_import",  "memory_sync",
+        "memory_ingest", "memory_query",  "memory_status", "memory_propose", "memory_commit",
+        "memory_lint",   "memory_export", "memory_import", "memory_sync",
     };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         const char *schema = cbm_mcp_tool_input_schema(names[i]);
@@ -5928,6 +6241,8 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
+    RUN_TEST(tool_search_graph_bm25_soft_source_first_ranking);
+    RUN_TEST(tool_search_graph_filters_dotted_config_path);
     RUN_TEST(mcp_discovery_methods_return_empty_lists);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
@@ -6031,9 +6346,13 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_default);
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
+    RUN_TEST(snippet_stale_worktree_is_explicit);
+    RUN_TEST(snippet_missing_worktree_is_not_current);
+    RUN_TEST(snippet_long_physical_lines_are_counted_once_and_bounded);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
+    RUN_TEST(active_store_refresh_waits_for_completed_snapshot);
 
     /* auto_watch gate (distilled from PR #625) */
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);

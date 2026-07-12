@@ -11,10 +11,12 @@
 #include <yyjson/yyjson.h>
 
 #include <stdbool.h>
+#include <inttypes.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum { MEMORY_TEST_PATH = 1024, MEMORY_TEST_JSON = 32768 };
 
@@ -126,6 +128,53 @@ static char *memory_propose_commit(cbm_memory_t *memory, const char *proposal_id
     n = snprintf(commit, sizeof(commit), "{\"proposal_id\":\"%s\",\"operation_id\":\"%s\"}",
                  proposal_id, operation_id);
     return n >= 0 && n < (int)sizeof(commit) ? cbm_memory_commit_json(memory, commit) : NULL;
+}
+
+static bool memory_add_claim_batch(cbm_memory_t *memory, int start, int count, int batch) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *operations = doc ? yyjson_mut_arr(doc) : NULL;
+    if (!doc || !operations) {
+        yyjson_mut_doc_free(doc);
+        return false;
+    }
+    yyjson_mut_doc_set_root(doc, operations);
+    for (int i = start; i < start + count; i++) {
+        char id[64];
+        char subject[64];
+        snprintf(id, sizeof(id), "claim:benchmark:%d", i);
+        snprintf(subject, sizeof(subject), "benchmark subject %d", i);
+        yyjson_mut_val *op = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, op, "type", "add_claim");
+        yyjson_mut_obj_add_strcpy(doc, op, "claim_id", id);
+        yyjson_mut_obj_add_str(doc, op, "claim_kind", "fact");
+        yyjson_mut_obj_add_str(doc, op, "status", "active");
+        yyjson_mut_obj_add_strcpy(doc, op, "subject", subject);
+        yyjson_mut_obj_add_str(doc, op, "predicate", "is");
+        yyjson_mut_obj_add_str(doc, op, "object", "projection benchmark data");
+        yyjson_mut_arr_add_val(operations, op);
+    }
+    char *operations_json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    if (!operations_json) {
+        return false;
+    }
+    char proposal_id[64];
+    char operation_id[64];
+    snprintf(proposal_id, sizeof(proposal_id), "proposal:benchmark:%d", batch);
+    snprintf(operation_id, sizeof(operation_id), "operation:benchmark:%d", batch);
+    char *result =
+        memory_propose_commit(memory, proposal_id, operation_id, operations_json, "{}");
+    free(operations_json);
+    bool ok = memory_result_ok(result);
+    free(result);
+    return ok;
+}
+
+static int64_t memory_test_elapsed_ms(struct timespec start) {
+    struct timespec now;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)(now.tv_sec - start.tv_sec) * 1000LL +
+           (int64_t)(now.tv_nsec - start.tv_nsec) / 1000000LL;
 }
 
 typedef struct {
@@ -828,8 +877,84 @@ TEST(memory_rebuild_projection_restores_graph_and_search) {
     PASS();
 }
 
+TEST(memory_status_reports_entities_maintenance_and_projection) {
+    char home[MEMORY_TEST_PATH];
+    char *temporary = th_mktempdir("cbm_memory_status");
+    ASSERT_NOT_NULL(temporary);
+    snprintf(home, sizeof(home), "%s", temporary);
+    cbm_memory_t *memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+
+    char *empty = cbm_memory_status_json(memory, "{}");
+    ASSERT_TRUE(memory_result_ok(empty));
+    ASSERT_NOT_NULL(strstr(empty, "\"snapshot_epoch\":0"));
+    ASSERT_NOT_NULL(strstr(empty, "\"sources\":0"));
+    ASSERT_NOT_NULL(strstr(empty, "\"open_dirty\":0"));
+    ASSERT_NOT_NULL(strstr(empty, "\"strategy\":\"full_rebuild\""));
+    free(empty);
+
+    char *ingest = cbm_memory_ingest_json(
+        memory, "{\"content\":\"observable source\",\"origin\":\"unit-test\"}");
+    ASSERT_TRUE(memory_result_ok(ingest));
+    free(ingest);
+    char *populated = cbm_memory_status_json(memory, "{}");
+    ASSERT_TRUE(memory_result_ok(populated));
+    ASSERT_NOT_NULL(strstr(populated, "\"sources\":1"));
+    ASSERT_NOT_NULL(strstr(populated, "\"documents\":1"));
+    ASSERT_NOT_NULL(strstr(populated, "\"runs_in_process\":1"));
+    ASSERT_NOT_NULL(strstr(populated, "\"last_rebuild_documents\":1"));
+    free(populated);
+
+    cbm_memory_close(memory);
+    th_rmtree(home);
+    PASS();
+}
+
+TEST(memory_projection_scaling_benchmark_opt_in) {
+    const char *enabled = getenv("CBM_RUN_MEMORY_BENCHMARK");
+    if (!enabled || strcmp(enabled, "1") != 0) {
+        PASS();
+    }
+    char home[MEMORY_TEST_PATH];
+    char *temporary = th_mktempdir("cbm_memory_benchmark");
+    ASSERT_NOT_NULL(temporary);
+    snprintf(home, sizeof(home), "%s", temporary);
+    cbm_memory_t *memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+
+    ASSERT_TRUE(memory_add_claim_batch(memory, 0, 100, 1));
+    struct timespec started;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &started);
+    ASSERT_EQ(cbm_memory_rebuild_projection(memory), 0);
+    int64_t at_100_ms = memory_test_elapsed_ms(started);
+
+    for (int batch = 0; batch < 9; batch++) {
+        ASSERT_TRUE(memory_add_claim_batch(memory, 100 + batch * 100, 100, batch + 2));
+    }
+    cbm_clock_gettime(CLOCK_MONOTONIC, &started);
+    ASSERT_EQ(cbm_memory_rebuild_projection(memory), 0);
+    int64_t at_1000_ms = memory_test_elapsed_ms(started);
+    printf("\n  [memory-projection] entities=100 rebuild=%" PRId64
+           "ms entities=1000 rebuild=%" PRId64 "ms\n",
+           at_100_ms, at_1000_ms);
+
+    /* A ten-fold data increase should remain within a deliberately generous
+     * 30x envelope. This catches accidental superlinear regressions without
+     * turning the probe into a machine-specific absolute latency test. */
+    ASSERT(at_1000_ms <= at_100_ms * 30 + 500);
+    char *status = cbm_memory_status_json(memory, "{}");
+    ASSERT_TRUE(memory_result_ok(status));
+    ASSERT_NOT_NULL(strstr(status, "\"last_rebuild_documents\":1000"));
+    free(status);
+    cbm_memory_close(memory);
+    th_rmtree(home);
+    PASS();
+}
+
 SUITE(memory) {
     RUN_TEST(memory_open_schema);
+    RUN_TEST(memory_status_reports_entities_maintenance_and_projection);
+    RUN_TEST(memory_projection_scaling_benchmark_opt_in);
     RUN_TEST(memory_ingest_deduplicates);
     RUN_TEST(memory_source_revision_dirties_supported_claim);
     RUN_TEST(memory_commit_all_epistemic_entities_and_materializes_wiki);
