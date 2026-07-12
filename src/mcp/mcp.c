@@ -1003,6 +1003,12 @@ struct cbm_mcp_server {
     bool owns_store;                /* true if we opened the store */
     char *current_project;          /* which project store is open for (heap) */
     time_t store_last_used;         /* last time resolve_store was called for a named project */
+    char current_store_path[CBM_SZ_1K]; /* backing path used for freshness checks */
+    uint64_t store_device;          /* cached file identity: device */
+    uint64_t store_inode;           /* cached file identity: inode/file index */
+    int64_t store_mtime_ns;         /* cached high-resolution modification time */
+    int64_t store_size;             /* cached DB size */
+    bool store_identity_valid;
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
@@ -1175,8 +1181,94 @@ static bool db_internal_project_name(const char *full_path, char *name_out, size
  * passed name (drifted filename). Defined after is_project_db_file below. */
 static cbm_store_t *resolve_store_fallback_scan(const char *project);
 
-/* Open the right project's .db file for query tools.
- * Caches the connection — reopens only when project changes.
+static int64_t mcp_stat_mtime_ns(const struct stat *st) {
+#if defined(__APPLE__)
+    return (int64_t)st->st_mtimespec.tv_sec * 1000000000LL + st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * 1000000000LL;
+#else
+    return (int64_t)st->st_mtim.tv_sec * 1000000000LL + st->st_mtim.tv_nsec;
+#endif
+}
+
+static bool read_store_identity(const char *path, uint64_t *device, uint64_t *inode,
+                                int64_t *mtime_ns, int64_t *size) {
+    struct stat st;
+    if (!path || stat(path, &st) != 0) {
+        return false;
+    }
+    *device = (uint64_t)st.st_dev;
+    *inode = (uint64_t)st.st_ino;
+    *mtime_ns = mcp_stat_mtime_ns(&st);
+    *size = (int64_t)st.st_size;
+    return true;
+}
+
+static void remember_store_identity(cbm_mcp_server_t *srv, const char *path) {
+    if (!srv || !path) {
+        return;
+    }
+    if (path != srv->current_store_path) {
+        snprintf(srv->current_store_path, sizeof(srv->current_store_path), "%s", path);
+    }
+    srv->store_identity_valid =
+        read_store_identity(path, &srv->store_device, &srv->store_inode, &srv->store_mtime_ns,
+                            &srv->store_size);
+}
+
+static bool cached_store_file_changed(cbm_mcp_server_t *srv) {
+    if (!srv || !srv->store_identity_valid || !srv->current_store_path[0]) {
+        return false;
+    }
+    uint64_t device = 0;
+    uint64_t inode = 0;
+    int64_t mtime_ns = 0;
+    int64_t size = 0;
+    if (!read_store_identity(srv->current_store_path, &device, &inode, &mtime_ns, &size)) {
+        /* The indexer briefly removes/recreates the path. Keep serving the
+         * already-open snapshot until a complete replacement is visible. */
+        return false;
+    }
+    return device != srv->store_device || inode != srv->store_inode ||
+           mtime_ns != srv->store_mtime_ns || size != srv->store_size;
+}
+
+/* Switch an active reader only when the replacement carries the completion
+ * marker written after hashes, coverage and FTS. A partially rebuilt DB may
+ * be structurally valid, so integrity_check alone is not a publish barrier. */
+static bool refresh_cached_store(cbm_mcp_server_t *srv, const char *project) {
+    if (!cached_store_file_changed(srv)) {
+        return false;
+    }
+    cbm_store_t *fresh = cbm_store_open_path_query(srv->current_store_path);
+    if (!fresh) {
+        return false;
+    }
+    char *generation = NULL;
+    cbm_project_t verified = {0};
+    bool complete = cbm_store_get_index_generation(fresh, project, &generation) == CBM_STORE_OK;
+    bool valid = complete && cbm_store_check_integrity(fresh) &&
+                 cbm_store_get_project(fresh, project, &verified) == CBM_STORE_OK;
+    cbm_project_free_fields(&verified);
+    free(generation);
+    if (!valid) {
+        cbm_store_close(fresh);
+        return false;
+    }
+
+    cbm_store_t *old = srv->store;
+    srv->store = fresh;
+    remember_store_identity(srv, srv->current_store_path);
+    if (srv->owns_store && old) {
+        cbm_store_close(old);
+    }
+    srv->owns_store = true;
+    cbm_log_info("store.snapshot_refresh", "project", project, "status", "complete");
+    return true;
+}
+
+/* Open the right project's .db file for query tools. Caches the connection,
+ * but refreshes it when a completed replacement generation is published.
  * Tracks last-access time so the event loop can evict idle stores. */
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     if (!project) {
@@ -1187,6 +1279,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
 
     /* Already open for this project? */
     if (srv->current_project && strcmp(srv->current_project, project) == 0 && srv->store) {
+        (void)refresh_cached_store(srv, project);
         return srv->store;
     }
 
@@ -1195,6 +1288,8 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         cbm_store_close(srv->store);
         srv->store = NULL;
     }
+    srv->store_identity_valid = false;
+    srv->current_store_path[0] = '\0';
 
     /* Open project's .db file — query-only open (no SQLITE_OPEN_CREATE) to
      * prevent ghost .db file creation for unknown/unindexed projects. */
@@ -1236,6 +1331,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
             srv->owns_store = true;
             free(srv->current_project);
             srv->current_project = heap_strdup(project);
+            remember_store_identity(srv, path);
             return srv->store; /* fast path: filename == internal name */
         }
         /* #704: <project>.db exists but its INTERNAL project name differs from
@@ -1257,6 +1353,11 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         srv->owns_store = true;
         free(srv->current_project);
         srv->current_project = heap_strdup(project);
+        /* Fallback scans may open a DB whose filename differs from the
+         * project. Leave identity tracking disabled rather than watching the
+         * wrong derived path. */
+        srv->store_identity_valid = false;
+        srv->current_store_path[0] = '\0';
     }
 
     return srv->store;
@@ -3143,10 +3244,18 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
         yyjson_mut_obj_add_int(doc, root, "edges", edges);
         yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
+        char *generation = NULL;
+        bool snapshot_complete =
+            cbm_store_get_index_generation(store, project, &generation) == CBM_STORE_OK;
+        yyjson_mut_obj_add_bool(doc, root, "snapshot_complete", snapshot_complete);
+        yyjson_mut_obj_add_strcpy(doc, root, "index_generation", generation ? generation : "");
+        free(generation);
         cbm_project_t proj_info = {0};
         if (cbm_store_get_project(store, project, &proj_info) == CBM_STORE_OK) {
             yyjson_mut_obj_add_strcpy(doc, root, "root_path",
                                       proj_info.root_path ? proj_info.root_path : "");
+            yyjson_mut_obj_add_strcpy(doc, root, "indexed_at",
+                                      proj_info.indexed_at ? proj_info.indexed_at : "");
             add_git_context_json(doc, root, proj_info.root_path);
             safe_str_free(&proj_info.name);
             safe_str_free(&proj_info.indexed_at);

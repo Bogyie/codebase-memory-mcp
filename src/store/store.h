@@ -421,6 +421,14 @@ typedef struct {
 int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_coverage_row_t *rows,
                                int count);
 
+/* Mark a graph database complete after all post-dump metadata and FTS writes.
+ * The generated opaque ID changes on every successful publish. */
+int cbm_store_mark_index_complete(cbm_store_t *s, const char *project);
+
+/* Return the latest completed generation. Caller owns *generation. A missing
+ * row (or a legacy DB without this table) returns CBM_STORE_NOT_FOUND. */
+int cbm_store_get_index_generation(cbm_store_t *s, const char *project, char **generation);
+
 /* Fetch all coverage rows (ordered by rel_path). Caller frees via
  * cbm_store_free_coverage. */
 int cbm_store_coverage_get(cbm_store_t *s, const char *project, cbm_coverage_row_t **out,

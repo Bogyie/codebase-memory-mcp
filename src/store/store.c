@@ -283,6 +283,14 @@ static int init_schema(cbm_store_t *s) {
         "  kind TEXT NOT NULL,"
         "  detail TEXT DEFAULT '',"
         "  PRIMARY KEY (project, rel_path, kind)"
+        ");"
+        /* Completion marker written only after hashes, coverage and FTS are
+         * durable. Readers that already hold an older graph use this marker
+         * to avoid switching to a database while an indexer is rebuilding it. */
+        "CREATE TABLE IF NOT EXISTS index_snapshots ("
+        "  project TEXT PRIMARY KEY,"
+        "  generation TEXT NOT NULL,"
+        "  completed_at TEXT NOT NULL"
         ");";
 
     int rc = exec_sql(s, ddl);
@@ -2131,6 +2139,59 @@ int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_co
      * contents (same transaction — the table and its view stay in step). */
     cov_rebuild_shadow_graph(s, project);
     return exec_sql(s, "COMMIT;");
+}
+
+int cbm_store_mark_index_complete(cbm_store_t *s, const char *project) {
+    if (!s || !s->db || !project || !project[0]) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "INSERT INTO index_snapshots(project,generation,completed_at) "
+        "VALUES(?1,lower(hex(randomblob(16))),strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+        "ON CONFLICT(project) DO UPDATE SET generation=excluded.generation,"
+        "completed_at=excluded.completed_at;";
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "index snapshot prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int rc = sqlite3_step(stmt) == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+    if (rc != CBM_STORE_OK) {
+        store_set_error_sqlite(s, "index snapshot write");
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+int cbm_store_get_index_generation(cbm_store_t *s, const char *project, char **generation) {
+    if (generation) {
+        *generation = NULL;
+    }
+    if (!s || !s->db || !project || !generation) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT generation FROM index_snapshots WHERE project=?1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        /* Legacy databases do not have index_snapshots. Callers may continue
+         * using an already-open legacy store, but must not treat it as a newly
+         * completed replacement. */
+        return CBM_STORE_NOT_FOUND;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int step = sqlite3_step(stmt);
+    int rc = CBM_STORE_NOT_FOUND;
+    if (step == SQLITE_ROW) {
+        *generation = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        rc = *generation ? CBM_STORE_OK : CBM_STORE_ERR;
+    } else if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "index snapshot read");
+        rc = CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
 }
 
 int cbm_store_coverage_get(cbm_store_t *s, const char *project, cbm_coverage_row_t **out,

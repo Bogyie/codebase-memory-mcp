@@ -1209,6 +1209,9 @@ TEST(tool_index_status_includes_git_metadata) {
     ASSERT_NOT_NULL(strstr(inner, "\"git\""));
     ASSERT_NOT_NULL(strstr(inner, "\"is_git\":false"));
     ASSERT_NOT_NULL(strstr(inner, "\"root_exists\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"snapshot_complete\":false"));
+    ASSERT_NOT_NULL(strstr(inner, "\"index_generation\":\"\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_at\""));
 
     free(inner);
     free(resp);
@@ -4319,6 +4322,79 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
     PASS();
 }
 
+TEST(active_store_refresh_waits_for_completed_snapshot) {
+#ifdef _WIN32
+    /* Windows may deny replacing a SQLite file held by the active reader; the
+     * same completion-marker behavior is covered by the store-level test. */
+    PASS();
+#else
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-snapshot-refresh-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char path[700];
+    snprintf(path, sizeof(path), "%s/refresh.db", cache);
+    ASSERT_TRUE(issue704_make_db(cache, "refresh.db", "refresh", "oldSnapshotFn"));
+    cbm_store_t *published = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(published);
+    ASSERT_EQ(cbm_store_mark_index_complete(published, "refresh"), CBM_STORE_OK);
+    cbm_store_close(published);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    const char *query_old =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+        "\"project\":\"refresh\",\"name_pattern\":\".*SnapshotFn\",\"limit\":5}}}";
+    char *first = cbm_mcp_server_handle(srv, query_old);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(strstr(first, "oldSnapshotFn"));
+    free(first);
+
+    /* Replace the backing path with a structurally valid but unpublished DB.
+     * The active server must keep serving its old, complete snapshot. */
+    ASSERT_EQ(cbm_unlink(path), 0);
+    ASSERT_TRUE(issue704_make_db(cache, "refresh.db", "refresh", "newSnapshotFn"));
+    char *during = cbm_mcp_server_handle(srv, query_old);
+    ASSERT_NOT_NULL(during);
+    ASSERT_NOT_NULL(strstr(during, "oldSnapshotFn"));
+    ASSERT_NULL(strstr(during, "newSnapshotFn"));
+    free(during);
+
+    published = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(published);
+    ASSERT_EQ(cbm_store_mark_index_complete(published, "refresh"), CBM_STORE_OK);
+    cbm_store_close(published);
+
+    char *after = cbm_mcp_server_handle(srv, query_old);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "newSnapshotFn"));
+    ASSERT_NULL(strstr(after, "oldSnapshotFn"));
+    free(after);
+    cbm_mcp_server_free(srv);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_unlink(path);
+    char side[740];
+    snprintf(side, sizeof(side), "%s-wal", path);
+    cbm_unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", path);
+    cbm_unlink(side);
+    cbm_rmdir(cache);
+    PASS();
+#endif
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  QUERY STORE READ-ONLY  (data-integrity reproductions)
  *
@@ -6034,6 +6110,7 @@ SUITE(mcp) {
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
+    RUN_TEST(active_store_refresh_waits_for_completed_snapshot);
 
     /* auto_watch gate (distilled from PR #625) */
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);

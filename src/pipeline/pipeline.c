@@ -1208,8 +1208,25 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         }
         CBM_PROF_END("persist", "5_fts_backfill", t_fts);
 
+        /* Publish the completion marker last. Cached MCP readers use this to
+         * distinguish a fully persisted graph from a DB being rebuilt. */
+        if (cbm_store_mark_index_complete(hash_store, p->project_name) != CBM_STORE_OK) {
+            cbm_log_error("pipeline.err", "phase", "publish_snapshot", "project",
+                          p->project_name);
+            cbm_store_close(hash_store);
+            free(p->saved_adr);
+            p->saved_adr = NULL;
+            return CBM_STORE_ERR;
+        }
+
         cbm_store_close(hash_store);
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
+    } else {
+        cbm_log_error("pipeline.err", "phase", "reopen_persisted_db", "project",
+                      p->project_name);
+        free(p->saved_adr);
+        p->saved_adr = NULL;
+        return CBM_STORE_ERR;
     }
     free(p->saved_adr);
     p->saved_adr = NULL;
