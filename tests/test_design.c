@@ -79,7 +79,9 @@ TEST(design_indexes_dtcg_design_md_and_css) {
                                     .mode = CBM_MODE_FULL};
     ASSERT_EQ(cbm_design_index(&opts), 0);
 
-    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.system.root"));
+    const cbm_gbuf_node_t *system = cbm_gbuf_find_by_qn(gb, "test.design.system.root");
+    ASSERT_NOT_NULL(system);
+    ASSERT_STR_EQ(system->name, "Aurora");
     ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.token.root.colors.primary"));
     ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.token.root.color.base"));
     ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "test.design.token.root.color.action"));
@@ -89,6 +91,7 @@ TEST(design_indexes_dtcg_design_md_and_css) {
     ASSERT_GTE(design_edge_count(gb, "USES_TOKEN"), 1);
     ASSERT_GTE(design_edge_count(gb, "DOCUMENTED_BY"), 1);
     ASSERT_GTE(design_edge_count(gb, "GUIDED_BY"), 1);
+    ASSERT_EQ(design_edge_count(gb, "GENERATED_AS"), 0);
 
     cbm_gbuf_free(gb);
     th_cleanup(base);

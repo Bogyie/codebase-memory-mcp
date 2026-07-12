@@ -462,14 +462,17 @@ static int64_t design_upsert_token(design_ctx_t *ctx, const char *scope, const c
     bool incoming_generated = provenance && strcmp(provenance, "generated") == 0;
     bool incoming_css = format && strcmp(format, "css") == 0;
     if (existing && (incoming_generated || incoming_css)) {
-        char *file_qn = cbm_pipeline_fqn_compute(ctx->opts->project_name, file_path, "__file__");
-        const cbm_gbuf_node_t *file_node =
-            file_qn ? cbm_gbuf_find_by_qn(ctx->opts->gbuf, file_qn) : NULL;
-        if (file_node) {
-            cbm_gbuf_insert_edge(ctx->opts->gbuf, existing->id, file_node->id, "GENERATED_AS",
-                                 "{}");
+        if (incoming_generated) {
+            char *file_qn =
+                cbm_pipeline_fqn_compute(ctx->opts->project_name, file_path, "__file__");
+            const cbm_gbuf_node_t *file_node =
+                file_qn ? cbm_gbuf_find_by_qn(ctx->opts->gbuf, file_qn) : NULL;
+            if (file_node) {
+                cbm_gbuf_insert_edge(ctx->opts->gbuf, existing->id, file_node->id, "GENERATED_AS",
+                                     "{}");
+            }
+            free(file_qn);
         }
-        free(file_qn);
         return existing->id;
     }
     char *props = design_properties(format, file_path, scope, token_path, type, value, description,
@@ -756,6 +759,49 @@ static int design_documents_add(design_ctx_t *ctx, const char *path, const char 
     return doc->path && doc->scope ? 0 : -1;
 }
 
+static void design_frontmatter_name(const char *source, char *out, size_t out_size) {
+    if (!source || strncmp(source, "---", 3) != 0) {
+        return;
+    }
+    const char *cursor = strchr(source, '\n');
+    if (!cursor) {
+        return;
+    }
+    cursor++;
+    while (*cursor) {
+        const char *end = strchr(cursor, '\n');
+        size_t n = end ? (size_t)(end - cursor) : strlen(cursor);
+        if (n == 3 && strncmp(cursor, "---", 3) == 0) {
+            return;
+        }
+        if (n > 5 && strncmp(cursor, "name:", 5) == 0) {
+            const char *value = cursor + 5;
+            while ((size_t)(value - cursor) < n && isspace((unsigned char)*value)) {
+                value++;
+            }
+            size_t value_len = n - (size_t)(value - cursor);
+            while (value_len > 0 && isspace((unsigned char)value[value_len - 1])) {
+                value_len--;
+            }
+            if (value_len >= 2 && ((value[0] == '"' && value[value_len - 1] == '"') ||
+                                   (value[0] == '\'' && value[value_len - 1] == '\''))) {
+                value++;
+                value_len -= 2;
+            }
+            if (value_len >= out_size) {
+                value_len = out_size - 1;
+            }
+            memcpy(out, value, value_len);
+            out[value_len] = '\0';
+            return;
+        }
+        if (!end) {
+            return;
+        }
+        cursor = end + 1;
+    }
+}
+
 static int design_parse_document(design_ctx_t *ctx, const cbm_file_info_t *file) {
     char dir[DESIGN_PATH_CAP];
     char scope[DESIGN_PATH_CAP];
@@ -763,8 +809,12 @@ static int design_parse_document(design_ctx_t *ctx, const cbm_file_info_t *file)
     design_scope_from_dir(dir, scope, sizeof(scope));
     char name[256];
     snprintf(name, sizeof(name), "%s", strcmp(scope, "root") == 0 ? "Repository Design" : scope);
+    size_t len = 0;
+    char *source = design_read_file(file, &len);
+    design_frontmatter_name(source, name, sizeof(name));
     int64_t system_id = design_ensure_system(ctx, scope, file->rel_path, name);
     if (system_id <= 0) {
+        free(source);
         return -1;
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->opts->project_name, file->rel_path, "__file__");
@@ -774,21 +824,8 @@ static int design_parse_document(design_ctx_t *ctx, const cbm_file_info_t *file)
         cbm_gbuf_insert_edge(ctx->opts->gbuf, system_id, file_node->id, "DOCUMENTED_BY", "{}");
     }
     free(file_qn);
-    size_t len = 0;
-    char *source = design_read_file(file, &len);
     if (source) {
-        char original_name[sizeof(name)];
-        snprintf(original_name, sizeof(original_name), "%s", name);
         (void)design_parse_frontmatter(ctx, source, file, scope, system_id, name, sizeof(name));
-        if (strcmp(name, original_name) != 0) {
-            char qn[DESIGN_QN_CAP];
-            design_system_qn(ctx, scope, qn, sizeof(qn));
-            char *props = design_properties("design-context", file->rel_path, scope, NULL, NULL,
-                                            NULL, NULL, "authoritative");
-            (void)cbm_gbuf_upsert_node(ctx->opts->gbuf, "DesignSystem", name, qn, file->rel_path, 1,
-                                       1, props ? props : "{}");
-            free(props);
-        }
         free(source);
     }
     if (design_documents_add(ctx, file->rel_path, scope, system_id) != 0) {
