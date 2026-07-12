@@ -138,10 +138,12 @@ These environment variables affect runtime behavior:
 |---|---|---|
 | `CBM_ALLOWED_ROOT` | *(unset)* | Restrict `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused; unset imposes no restriction. Useful when the server may be driven by an untrusted caller (agentic or multi-tenant deployments). |
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the cache directory used for indexes, `_config.db`, and UI `config.json`. |
-| `CBM_DIAGNOSTICS` | `false` | Enable periodic diagnostics output to `/tmp/cbm-diagnostics-<pid>.json`. |
+| `CBM_CURL_BIN` | trusted `curl` from the platform search path | Select an absolute curl executable for release checks and downloads; relative/current-directory executable lookup is rejected. |
+| `CBM_DIAGNOSTICS` | `false` | Enable periodic diagnostics output in a private, randomly named system-temp directory. |
+| `CBM_DISABLE_UPDATE_CHECK` | `false` | Set to `1` or `true` to disable the bounded background GitHub release-metadata check after MCP initialization. Explicit `update` commands are unaffected. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
 | `CBM_DUMP_VERIFY_MIN_RATIO` | `0.5` | Minimum persisted-to-committed node ratio before an index is marked degraded; range `0`–`1`, with `0` disabling the check. |
-| `CBM_GIT_BIN` | trusted `git` from `PATH` | On POSIX, absolute executable used by `memory_sync`. Relative and current-directory executable lookup is rejected. |
+| `CBM_GIT_BIN` | trusted `git` from the platform search path | Absolute executable used for repository probes and `memory_sync`. Relative and current-directory executable lookup is rejected. |
 | `CBM_LOG_LEVEL` | `info` | Set stderr log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). |
 | `CBM_MAX_FILE_BYTES` | `536870912` | Maximum source-file size read by the indexer, in bytes. Larger files are reported as oversized rather than silently dropped. |
 | `CBM_MEMORY_HOME` | platform user-data directory | Override the durable Global Memory root. Defaults to `XDG_DATA_HOME/codebase-memory-mcp/memory` (or `~/.local/share/...`) on Linux, `~/Library/Application Support/.../memory` on macOS, and the local application-data directory on Windows. |

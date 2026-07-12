@@ -2,26 +2,27 @@
 
 > This is the `bogyie/codebase-memory-mcp` fork, based on
 > [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp).
-> Installation and self-update use releases published from this fork.
+> The first-party install scripts, manual downloads, and self-update use releases
+> published from this fork. Package-manager entries currently remain upstream
+> distributions and download DeusData release artifacts.
 
 [![GitHub Release](https://img.shields.io/github/v/release/bogyie/codebase-memory-mcp?style=flat&color=blue)](https://github.com/bogyie/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/bogyie/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/bogyie/codebase-memory-mcp/actions/workflows/dry-run.yml)
-[![Tests](https://img.shields.io/badge/tests-5604_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
-[![Languages](https://img.shields.io/badge/languages-158-orange)](https://github.com/DeusData/codebase-memory-mcp)
+[![Fork release](https://img.shields.io/github/actions/workflow/status/bogyie/codebase-memory-mcp/fork-release.yml?branch=main&label=fork%20release)](https://github.com/bogyie/codebase-memory-mcp/actions/workflows/fork-release.yml)
+[![Languages](https://img.shields.io/badge/languages-158-orange)](https://github.com/bogyie/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
-[![Agents](https://img.shields.io/badge/agents-13-purple)](https://github.com/DeusData/codebase-memory-mcp)
-[![Pure C](https://img.shields.io/badge/pure_C-zero_dependencies-blue)](https://github.com/DeusData/codebase-memory-mcp)
+[![Agents](https://img.shields.io/badge/agents-13-purple)](https://github.com/bogyie/codebase-memory-mcp)
+[![Self-contained](https://img.shields.io/badge/runtime-self--contained-blue)](https://github.com/bogyie/codebase-memory-mcp)
 [![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/bogyie/codebase-memory-mcp/releases/latest)
 [![arXiv](https://img.shields.io/badge/arXiv-2603.27277-b31b1b?logo=arxiv)](https://arxiv.org/abs/2603.27277)
 
-**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
+**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a self-contained native executable for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, cross-service links, and repository design context. 24 MCP tools. Zero dependencies. Plug and play across 13 coding agents.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, cross-service links, and repository design context. 24 MCP tools. No separate language-server or database service. Plug and play across 13 coding agents.
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
-> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. Fork releases are built from this repository by GitHub Actions and include SHA-256 checksums. Indexing, querying, and Global Memory storage run locally and collect no telemetry. An explicitly approved `memory_export` can write a bundle containing raw sources outside the Memory home, and `memory_sync` can send that bundle to a configured Git remote; review the destination before sharing. Found a security issue? See [SECURITY.md](SECURITY.md).
+> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. Fork releases are built from this repository by GitHub Actions and include SHA-256 checksums. Indexing, querying, and Global Memory storage run locally and collect no telemetry. After MCP initialization, a bounded background request checks this fork's public GitHub release metadata; set `CBM_DISABLE_UPDATE_CHECK=1` to disable it. An explicitly approved `memory_export` can write a bundle containing raw sources outside the Memory home, and `memory_sync` can send that bundle to a configured Git remote; review the destination before sharing. Found a security issue? See [SECURITY.md](SECURITY.md).
 
 <p align="center">
   <img src="docs/graph-ui-screenshot.png" alt="Graph visualization UI showing the codebase-memory-mcp knowledge graph" width="800">
@@ -32,7 +33,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 ## Why codebase-memory-mcp
 
 - **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline: LZ4 compression, in-memory SQLite, fused Aho-Corasick pattern matching. Memory released after indexing.
-- **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys. Download → `install` → restart agent → done.
+- **Plug and play** — one self-contained executable for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (arm64/amd64). No Docker, separate language runtime, database service, or API key. Fully static `-portable` archives are also published for Linux. Download → `install` → restart agent → done.
 - **158 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
 - **13 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, OpenClaw, Kiro, and Junie — and installs each supported MCP, instruction, and hook integration.
@@ -86,6 +87,7 @@ Restart your coding agent. Say **"Index this project"** — done.
 
 1. **Download** the archive for your platform from the [latest fork release](https://github.com/bogyie/codebase-memory-mcp/releases/latest):
    - `codebase-memory-mcp-<os>-<arch>.tar.gz` (macOS/Linux) or `.zip` (Windows) — standard
+   - `codebase-memory-mcp-linux-<arch>-portable.tar.gz` — fully static Linux build used by `install.sh`
    - `codebase-memory-mcp-ui-<os>-<arch>.tar.gz` / `.zip` — with graph visualization
 
 2. **Extract and install** (each archive includes `install.sh` or `install.ps1`):
@@ -112,12 +114,14 @@ The `install` command auto-detects all installed coding agents and configures MC
 
 ### Graph Visualization UI
 
-The UI ships as a separate `ui` build (it embeds the frontend). The default install on every channel is the lean, headless server; opt into the UI build with:
+The UI ships as a separate `ui` build (it embeds the frontend). The default fork install is the lean, headless server; opt into the UI build with:
 
 - **install.sh:** add `--ui` (see [Quick Start](#quick-start))
-- **npm:** `CBM_VARIANT=ui npm install -g codebase-memory-mcp`
-- **PyPI:** `CBM_VARIANT=ui pip install codebase-memory-mcp`
 - **Manual:** download the `codebase-memory-mcp-ui-<os>-<arch>` archive
+
+The npm and PyPI packages currently download upstream DeusData releases, not
+artifacts from this fork. Do not use those package commands when you intend to
+install the `bogyie` build.
 
 Then run it:
 
@@ -204,27 +208,35 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 - **RAM-first pipeline**: LZ4 compression, in-memory SQLite, single dump at end. Memory released after.
 
 ### Distribution & operation
-- **Single static binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
+- **Self-contained executable, zero service infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
 - **Auto-sync**: Background watcher detects file changes and re-indexes automatically
 - **Route nodes**: REST endpoints are first-class graph entities. Source-backed handler Routes take precedence over synthetic call-literal Routes with the same identity.
 - **CLI mode**: `codebase-memory-mcp cli search_graph '{"project": "my-project", "name_pattern": ".*Handler.*"}'`
-- **Available on**: npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, `go install`
+- **Fork distribution**: `install.sh`, `install.ps1`, or a manual archive from
+  this repository's GitHub Releases. Existing npm, PyPI, Homebrew, Scoop,
+  Winget, Chocolatey, AUR, and `go install` metadata still targets upstream
+  DeusData releases.
 
 ## Team-Shared Graph Artifact
 
-Commit a single compressed file to your repo and your teammates skip the reindex.
+Commit the artifact manifest and its compressed generation to your repo and your teammates skip the reindex.
 
-`.codebase-memory/graph.db.zst` is a zstd-compressed snapshot of the knowledge graph that lives next to your source. When you index, the artifact is written or refreshed; when a teammate clones the repo and runs `codebase-memory-mcp` for the first time, the artifact is decompressed and incremental indexing fills in their local diff.
+`.codebase-memory/artifact.json` atomically selects an immutable
+`graph.db.<sha256>.zst` snapshot next to your source. The manifest binds exact
+compressed/decompressed sizes and the compressed SHA-256 to one generation.
+When a teammate clones the repo and runs `codebase-memory-mcp` for the first
+time, the verified artifact is imported and incremental indexing fills in their
+local diff.
 
-- **Format**: SQLite database, indexes stripped, `VACUUM INTO` compacted, then zstd 1.5.7 compressed (8–13:1 ratio typical)
+- **Format**: consistent SQLite backup snapshot, optionally index-stripped and compacted, then zstd 1.5.7 compressed (8–13:1 ratio typical)
 - **Two tiers**:
-  - **Best** (`zstd -9` + index strip + `VACUUM INTO`) — written on explicit `index_repository`
+  - **Best** (`zstd -9` + checked index strip + `VACUUM`) — written on explicit `index_repository`
   - **Fast** (`zstd -3`) — written by the watcher for low-latency incremental updates
 - **Bootstrap**: when no local DB exists but the artifact is present, `index_repository` imports the artifact first, then runs incremental indexing — avoiding the full reindex cost
-- **No merge pain**: a `.gitattributes` line with `merge=ours` is auto-created on first export, so concurrent edits don't produce conflicts on the binary artifact
+- **Merge helper**: the first export attempts to create `.gitattributes` rules and configures the repository-local `merge.ours` driver when trusted Git resolution succeeds. Because Git config is clone-local, each clone must run an export and verify those settings before relying on automatic manifest conflict resolution.
 - **Optional**: never committed unless you want it. Add `.codebase-memory/` to `.gitignore` if you prefer everyone to reindex from scratch.
 
-The result is similar in spirit to graphify's `graphify-out/` directory, but as a single compressed file with explicit two-tier export, integrity-checked import, and zero merge friction.
+The result is similar in spirit to graphify's `graphify-out/` directory, but with generation-addressed compressed snapshots, explicit two-tier export, integrity-checked import, and optional repository-local merge assistance.
 
 ## How It Works
 
@@ -266,17 +278,17 @@ Indexing, querying, diagnostics, and Global Memory storage run **locally and col
 
 ### Capture a diagnostics log
 
-Set `CBM_DIAGNOSTICS=1` before the MCP server starts, then reproduce the problem (let it run as long as it takes — a slow leak needs time to show in the trend). The server writes two files to your system temp directory (`$TMPDIR` or `/tmp` on macOS/Linux, `%TEMP%` on Windows):
+Set `CBM_DIAGNOSTICS=1` before the MCP server starts, then reproduce the problem (let it run as long as it takes — a slow leak needs time to show in the trend). The server creates a private, randomly named directory under your system temp directory (`$TMPDIR` or `/tmp` on macOS/Linux, `%TEMP%` on Windows) and writes two files inside it:
 
 | File | What it is |
 |------|------------|
-| `cbm-diagnostics-<pid>.ndjson` | **The memory trajectory** — one JSON line every 5 s with `rss`, `committed` (Windows commit charge), `peak_*`, `page_faults`, `fd`, and `queries`. **This is the file we need for memory/leak reports** — the *trend over time* is what pinpoints a leak. It is **kept on disk after the server exits** (so you can grab it post-mortem) and rotates to `.ndjson.1` past ~8 MB. |
-| `cbm-diagnostics-<pid>.json` | The latest snapshot only — handy for a quick live check. Removed on clean exit. |
+| `trajectory.ndjson` | **The memory trajectory** — one JSON line every 5 s with `rss`, `committed` (Windows commit charge), `peak_*`, `page_faults`, `fd`, and `queries`. **This is the file we need for memory/leak reports** — the *trend over time* is what pinpoints a leak. It is **kept on disk after the server exits** (so you can grab it post-mortem) and rotates to `.ndjson.1` past ~8 MB. |
+| `latest.json` | The latest snapshot only — handy for a quick live check. Removed on clean exit. |
 
 The startup log prints both paths, e.g.:
 
 ```
-level=info msg=diagnostics.start snapshot=/tmp/cbm-diagnostics-12345.json trajectory=/tmp/cbm-diagnostics-12345.ndjson interval=5s
+level=info msg=diagnostics.start snapshot=/tmp/cbm-diagnostics-a1B2c3/latest.json trajectory=/tmp/cbm-diagnostics-a1B2c3/trajectory.ndjson interval=5s
 ```
 
 Set the variable in the `env` block of your agent's MCP server config, or export it before launching the server.
@@ -293,11 +305,14 @@ When you open a memory/performance issue, **attach the `.ndjson` trajectory** �
 |----------|----------|---------------|
 | macOS (Apple Silicon) | `codebase-memory-mcp-darwin-arm64.tar.gz` | `codebase-memory-mcp-ui-darwin-arm64.tar.gz` |
 | macOS (Intel) | `codebase-memory-mcp-darwin-amd64.tar.gz` | `codebase-memory-mcp-ui-darwin-amd64.tar.gz` |
-| Linux (x86_64) | `codebase-memory-mcp-linux-amd64.tar.gz` | `codebase-memory-mcp-ui-linux-amd64.tar.gz` |
-| Linux (ARM64) | `codebase-memory-mcp-linux-arm64.tar.gz` | `codebase-memory-mcp-ui-linux-arm64.tar.gz` |
+| Linux (x86_64, portable) | `codebase-memory-mcp-linux-amd64-portable.tar.gz` | `codebase-memory-mcp-ui-linux-amd64-portable.tar.gz` |
+| Linux (ARM64, portable) | `codebase-memory-mcp-linux-arm64-portable.tar.gz` | `codebase-memory-mcp-ui-linux-arm64-portable.tar.gz` |
+| Linux (x86_64, glibc 2.38+) | `codebase-memory-mcp-linux-amd64.tar.gz` | `codebase-memory-mcp-ui-linux-amd64.tar.gz` |
+| Linux (ARM64, glibc 2.38+) | `codebase-memory-mcp-linux-arm64.tar.gz` | `codebase-memory-mcp-ui-linux-arm64.tar.gz` |
 | Windows (x86_64) | `codebase-memory-mcp-windows-amd64.zip` | `codebase-memory-mcp-ui-windows-amd64.zip` |
+| Windows (ARM64) | `codebase-memory-mcp-windows-arm64.zip` | `codebase-memory-mcp-ui-windows-arm64.zip` |
 
-Every release includes `checksums.txt` with SHA-256 hashes. All binaries are statically linked — no shared library dependencies.
+Every fork release includes `checksums.txt` with SHA-256 hashes. The Linux `-portable` archives are the variants explicitly built and verified as fully static; other platform archives are self-contained executables that may use operating-system libraries.
 
 > **Windows note**: SmartScreen may show a warning for unsigned software. Click **"More info"** → **"Run anyway"**. Verify integrity with `checksums.txt`.
 
@@ -602,8 +617,10 @@ codebase-memory-mcp config reset auto_index              # reset to default
 | `CBM_MEMORY_HOME` | *(platform user-data directory)* | Override the Global Memory root containing immutable `raw/` sources, materialized `wiki/` pages, its hidden database, exports, and Git sync worktree. This is intentionally separate from the disposable project-index cache. |
 | `CBM_MEMORY_INGEST_ROOTS` | *(unset; path ingest disabled)* | Platform path-list (`:` on POSIX, `;` on Windows) of roots from which `memory_ingest` may read a regular, non-symlink file by `path`. Inline `content` ingest is unaffected. |
 | `CBM_MEMORY_ALLOW_UNSAFE_PATH_INGEST` | `false` | Set to `1`/`true` only as an operator-level opt-in to allow `memory_ingest` path reads outside an allowlist. Canonicalization and regular non-symlink checks still apply. |
-| `CBM_GIT_BIN` | trusted `git` from `PATH` | On POSIX, select an absolute executable for `memory_sync`; relative/current-directory executable lookup is rejected. |
-| `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable periodic diagnostics output to `/tmp/cbm-diagnostics-<pid>.json`. |
+| `CBM_GIT_BIN` | trusted `git` from the platform search path | Select an absolute Git executable for repository probes and `memory_sync`; relative/current-directory executable lookup is rejected. |
+| `CBM_CURL_BIN` | trusted `curl` from the platform search path | Select an absolute curl executable for release checks and downloads; relative/current-directory executable lookup is rejected. |
+| `CBM_DISABLE_UPDATE_CHECK` | `false` | Set to `1` or `true` to disable the bounded background GitHub release-metadata check performed after MCP initialization. Explicit `update` commands are unaffected. |
+| `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable periodic diagnostics output in a private, randomly named system-temp directory. |
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
 | `CBM_LOG_LEVEL` | `info` | Set the minimum log level. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none` — or their numeric equivalents `0`–`4` matching the internal enum. Logs go to stderr; stdout is reserved for MCP JSON-RPC. |
 | `CBM_WORKERS` | *(detected)* | Override the parallel-indexing worker count returned by `cbm_default_worker_count`. Useful inside containers where `sysconf(_SC_NPROCESSORS_ONLN)` reports host CPUs rather than the cgroup's effective quota. Range 1–256; invalid values are ignored with a warning. |
@@ -663,7 +680,7 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 
 Tree-sitter alone gives a syntactic AST. That handles naming, structure, and call sites well, but it can't tell you that `user.profile.display_name()` resolves to `Profile.display_name` declared three modules away — tree-sitter doesn't track imports, generics, inheritance, or stdlib types.
 
-codebase-memory-mcp ships a **lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers** (tsserver / typescript-go, pyright, gopls, Roslyn, Eclipse JDT, rust-analyzer), embedded directly into the static binary. No language server process, no per-project setup, no API key. We call this layer **Hybrid LSP**: it runs alongside tree-sitter on every parse and refines `CALLS`, `USAGE`, and `RESOLVED_CALLS` edges with type information, so the resulting graph mirrors what an IDE "Go to Definition" would resolve.
+codebase-memory-mcp ships a **lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers** (tsserver / typescript-go, pyright, gopls, Roslyn, Eclipse JDT, rust-analyzer), embedded directly into the native executable. No language server process, no per-project setup, no API key. We call this layer **Hybrid LSP**: it runs alongside tree-sitter on every parse and refines `CALLS`, `USAGE`, and `RESOLVED_CALLS` edges with type information, so the resulting graph mirrors what an IDE "Go to Definition" would resolve.
 
 **Languages with full Hybrid LSP:**
 
@@ -720,32 +737,23 @@ internal/cbm/         Vendored tree-sitter grammars (158 languages) + AST extrac
 
 ## Security
 
-The fork release workflow builds the cross-platform archives in GitHub Actions and
-publishes `checksums.txt`; both installers verify the selected archive against that
-file. The stronger controls and scan results below describe the upstream DeusData
-release pipeline and are retained as provenance information for the code this fork
-is based on. They do not automatically apply to fork releases.
+The current fork workflow gates new releases on lint, the repository security checks, the core
+cross-platform test matrix, and archive smoke tests. GitHub Actions then publishes
+the exact archives together with `checksums.txt`; both installers fail closed unless
+the selected archive has a matching checksum entry and digest.
 
-Upstream release binaries are verified through a multi-layer pipeline before publication:
+This stronger gate is not retroactive. Fork releases through `v0.9.0` were built
+and checksum-published by the earlier build-only workflow; inspect the workflow
+run attached to a release before attributing the current gate to an older asset.
 
-- **VirusTotal** — all binaries scanned by 70+ antivirus engines (zero detections required to publish)
-- **SLSA Level 3** — cryptographic build provenance generated by the trusted GitHub Actions build workflow; verify with `gh attestation verify <file> --repo DeusData/codebase-memory-mcp --signer-workflow DeusData/codebase-memory-mcp/.github/workflows/_build.yml`
-- **Sigstore cosign** — keyless signatures on all artifacts; bundles included in every release
-- **SHA-256 checksums** — `checksums.txt` published with every release; both official install scripts fail closed unless the exact archive entry is verified before extraction
-- **CodeQL SAST** — blocks release pipeline if any open alerts remain
-- **Zero runtime dependencies** — no transitive supply chain; all libraries vendored at compile time
+The fork release workflow currently does **not** publish SLSA attestations, Sigstore
+bundles, SBOM attestations, or VirusTotal results. Do not infer those properties from
+the upstream repository or from historical upstream scan links. See
+[SECURITY.md](SECURITY.md#release-time) for the release contract and manual
+verification instructions.
 
-### v0.7.0 VirusTotal scans
-
-| Binary | SHA-256 | VirusTotal |
-|--------|---------|-----------|
-| `linux-amd64` | `8e12bb2d6ead7f20a6d3...` | [0/72 ✅](https://www.virustotal.com/gui/file/8e12bb2d6ead7f20a6d3bf2be1e51f978c38acce810f0734f510d134b039d152/detection) |
-| `linux-arm64` | `10f7136bfbf3950c6b2a...` | [0/72 ✅](https://www.virustotal.com/gui/file/10f7136bfbf3950c6b2a1a950bbf85e88b97ee55ab00b4dfbc2a5e9c2ede8672/detection) |
-| `darwin-arm64` | `7062a7408906344bf4f8...` | [0/72 ✅](https://www.virustotal.com/gui/file/7062a7408906344bf4f835e9580048af85d12dd2b7cec0edf869df93ad9a0592/detection) |
-| `darwin-amd64` | `28c6d640e1a0ac7bfcab...` | [0/72 ✅](https://www.virustotal.com/gui/file/28c6d640e1a0ac7bfcab5094c2186eced5264a20dcdffcb4455a1b28c5df2171/detection) |
-| `windows-amd64` | `9c3ddcf78368fd4fa891...` | [0/72 ✅](https://www.virustotal.com/gui/file/9c3ddcf78368fd4fa89156a553641bf1e03640b4fb6dd29a12c84aa5bc98cd86/detection) |
-
-Scan links for every release are also included in the GitHub Release notes automatically.
+The runtime is self-contained: its C/C++ libraries and tree-sitter grammars are
+vendored into the release binary rather than downloaded at startup.
 
 ## License
 

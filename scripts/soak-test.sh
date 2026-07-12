@@ -2,7 +2,8 @@
 # soak-test.sh — Endurance test for codebase-memory-mcp.
 #
 # Runs compressed workload cycles: queries, file mutations, reindexes, idle periods.
-# Reads diagnostics from /tmp/cbm-diagnostics-<pid>.json (requires CBM_DIAGNOSTICS=1).
+# Discovers the private diagnostics snapshot path from the server's
+# diagnostics.start log record (requires CBM_DIAGNOSTICS=1).
 # Outputs metrics to soak-results/ and exits 0 (pass) or 1 (fail).
 #
 # Usage:
@@ -46,6 +47,27 @@ echo "timestamp,tool,duration_ms,exit_code" > "$LATENCY_CSV"
 > "$SUMMARY"
 
 DURATION_S=$((DURATION_MIN * 60))
+PASS=true
+
+SOAK_PROJECT=""
+IPC_DIR=""
+SERVER_PID=""
+
+cleanup() {
+    set +e
+    exec 3>&- 2>/dev/null
+    exec 4<&- 2>/dev/null
+    if [ -n "${SERVER_PID:-}" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    [ -z "${IPC_DIR:-}" ] || rm -rf "$IPC_DIR"
+    [ -z "${SOAK_PROJECT:-}" ] || rm -rf "$SOAK_PROJECT"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 echo "=== soak-test: binary=$BINARY duration=${DURATION_MIN}m mode=${CBM_SOAK_MODE} ==="
 
@@ -231,26 +253,84 @@ mcp_call() {
 
 # ── Helper: collect diagnostics snapshot ─────────────────────────
 
+# diagnostics.start is emitted by the server itself, but treat it as structured
+# input anyway: never eval it, accept only an absolute latest.json path inside a
+# cbm-diagnostics-* directory, and reject symlinks before reading the file.
+diagnostics_snapshot_from_log() {
+    local log_file="$1"
+    local line candidate diag_dir
+
+    line=$(grep -a -F 'level=info msg=diagnostics.start snapshot=' "$log_file" 2>/dev/null |
+        tail -n 1) || return 1
+    candidate=${line#* snapshot=}
+    [ "$candidate" != "$line" ] || return 1
+    candidate=${candidate%% trajectory=*}
+    [ -n "$candidate" ] || return 1
+
+    case "$candidate" in
+        /*) ;;
+        [A-Za-z]:[\\/]*)
+            if command -v cygpath >/dev/null 2>&1; then
+                candidate=$(cygpath -u -- "$candidate") || return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+
+    [ "$(basename "$candidate")" = "latest.json" ] || return 1
+    diag_dir=$(dirname "$candidate")
+    case "$(basename "$diag_dir")" in
+        cbm-diagnostics-*) ;;
+        *) return 1 ;;
+    esac
+    [ -d "$diag_dir" ] && [ ! -L "$diag_dir" ] || return 1
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
+    printf '%s\n' "$candidate"
+}
+
+wait_for_diagnostics_snapshot() {
+    local rejected_path="${1:-}"
+    local attempt candidate
+    for attempt in $(seq 1 40); do
+        candidate=$(diagnostics_snapshot_from_log "$RESULTS_DIR/server-stderr.log" || true)
+        if [ -n "$candidate" ] && [ "$candidate" != "$rejected_path" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
 collect_snapshot() {
-    local diag_file="/tmp/cbm-diagnostics-${SERVER_PID}.json"
-    if [ -f "$diag_file" ]; then
-        python3 -c "
-import json, time
-d = json.load(open('$diag_file'))
-# Use heap_committed if available, otherwise RSS (mimalloc may report 0 for committed)
-mem = d.get('heap_committed_bytes', 0)
-if mem == 0: mem = d.get('rss_bytes', 0)
-print(f\"{int(time.time())},{d.get('uptime_s',0)},{d.get('rss_bytes',0)},{mem},{d.get('fd_count',0)},{d.get('query_count',0)},{d.get('query_max_us',0)}\")
-" 2>/dev/null >> "$METRICS_CSV"
+    local diag_file="${DIAG_FILE:-}"
+    if [ -n "$diag_file" ] && [ -f "$diag_file" ] && [ ! -L "$diag_file" ]; then
+        python3 - "$diag_file" <<'PY' >> "$METRICS_CSV" 2>/dev/null || true
+import json
+import sys
+import time
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    data = json.load(stream)
+memory = data.get("heap_committed_bytes", 0)
+if memory == 0:
+    memory = data.get("rss_bytes", 0)
+print(f"{int(time.time())},{data.get('uptime_s', 0)},{data.get('rss_bytes', 0)},{memory},{data.get('fd_count', 0)},{data.get('query_count', 0)},{data.get('query_max_us', 0)}")
+PY
     fi
 }
 
 # ── Phase 1: Start MCP server with diagnostics ──────────────────
 
 echo "--- Phase 1: start server ---"
-# Bidirectional pipes: fd3 = server stdin (write), fd4 = server stdout (read)
-SERVER_IN=$(mktemp -u).in
-SERVER_OUT=$(mktemp -u).out
+# Bidirectional pipes: fd3 = server stdin (write), fd4 = server stdout (read).
+# Keep both names in one mode-0700 directory so another local user cannot win a
+# mktemp -u / mkfifo race or replace either endpoint.
+TMP_BASE=${TMPDIR:-/tmp}
+IPC_DIR=$(mktemp -d "${TMP_BASE%/}/cbm-soak-ipc.XXXXXX")
+chmod 700 "$IPC_DIR"
+SERVER_IN="$IPC_DIR/server.in"
+SERVER_OUT="$IPC_DIR/server.out"
 mkfifo "$SERVER_IN" "$SERVER_OUT"
 
 CBM_DIAGNOSTICS=1 "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" 2>"$RESULTS_DIR/server-stderr.log" &
@@ -263,11 +343,16 @@ sleep 3
 
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "FAIL: server did not start"
-    exec 3>&- 4<&-
-    rm -f "$SERVER_IN" "$SERVER_OUT"
     exit 1
 fi
 echo "OK: server running (pid=$SERVER_PID)"
+
+if ! DIAG_FILE=$(wait_for_diagnostics_snapshot); then
+    echo "FAIL: server did not publish a safe diagnostics.start snapshot path"
+    tail -n 20 "$RESULTS_DIR/server-stderr.log" 2>/dev/null || true
+    exit 1
+fi
+echo "OK: diagnostics snapshot=$DIAG_FILE"
 
 # Send initialize handshake
 echo '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{}}}' >&3
@@ -283,9 +368,18 @@ collect_snapshot
 # Derive project name (same logic as cbm_project_name_from_path)
 PROJ_NAME=$(echo "$SOAK_PROJECT" | sed 's|^/||; s|/|-|g')
 
-DIAG_FILE="/tmp/cbm-diagnostics-${SERVER_PID}.json"
-BASELINE_RSS=$(cat "$DIAG_FILE" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('rss_bytes',0))" 2>/dev/null || echo "0")
-BASELINE_FDS=$(cat "$DIAG_FILE" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('fd_count',0))" 2>/dev/null || echo "0")
+BASELINE=$(python3 - "$DIAG_FILE" <<'PY' 2>/dev/null || echo "0 0"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    data = json.load(stream)
+print(data.get("rss_bytes", 0), data.get("fd_count", 0))
+PY
+)
+read -r BASELINE_RSS BASELINE_FDS <<EOF
+$BASELINE
+EOF
 echo "OK: baseline RSS=${BASELINE_RSS} FDs=${BASELINE_FDS}"
 
 # ── Phase 3: Compressed workload loop ────────────────────────────
@@ -366,6 +460,7 @@ if [ "$SKIP_CRASH" != "--skip-crash-test" ] && [ "$CBM_SOAK_MODE" != "query-leak
     exec 3>&- 4<&-
 
     # Restart server
+    PREVIOUS_DIAG_FILE=$DIAG_FILE
     CBM_DIAGNOSTICS=1 "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" 2>>"$RESULTS_DIR/server-stderr.log" &
     SERVER_PID=$!
     exec 3>"$SERVER_IN"
@@ -374,11 +469,17 @@ if [ "$SKIP_CRASH" != "--skip-crash-test" ] && [ "$CBM_SOAK_MODE" != "query-leak
 
     if kill -0 "$SERVER_PID" 2>/dev/null; then
         echo "OK: server restarted after kill -9"
+        if ! DIAG_FILE=$(wait_for_diagnostics_snapshot "$PREVIOUS_DIAG_FILE"); then
+            echo "FAIL: restarted server did not publish a new safe diagnostics path"
+            PASS=false
+        fi
         echo '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{}}}' >&3
         read -t 10 INIT_RESP <&4 || true
 
         # Verify clean re-index works
         mcp_call index_repository "{\"repo_path\":\"$SOAK_PROJECT\"}"
+        sleep 6
+        collect_snapshot
         echo "OK: clean re-index after crash recovery"
     else
         echo "FAIL: server did not restart after kill -9"
@@ -394,14 +495,11 @@ sleep 2
 exec 4<&-  # close stdout reader
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
-rm -f "$SERVER_IN" "$SERVER_OUT"
-
-# Final diagnostics (written by thread before exit)
-FINAL_DIAG="/tmp/cbm-diagnostics-${SERVER_PID}.json"
+SERVER_PID=""
+rm -rf "$IPC_DIR"
+IPC_DIR=""
 
 # ── Analysis ─────────────────────────────────────────────────────
-
-PASS=true
 
 # Check 1: Memory leak detection via RSS trend
 # This is the primary leak detector on ALL platforms (including Windows
@@ -412,6 +510,11 @@ MAX_RSS=$(awk -F, 'NR>1 && $3>0 { if ($3>max) max=$3 } END { printf "%.0f", max/
 FIRST_RSS=$(awk -F, 'NR==2 && $3>0 { printf "%.0f", $3/1024/1024 }' "$METRICS_CSV")
 LAST_RSS=$(awk -F, '$3>0 { last=$3 } END { printf "%.0f", last/1024/1024 }' "$METRICS_CSV")
 echo "RSS: first=${FIRST_RSS}MB last=${LAST_RSS}MB max=${MAX_RSS}MB (${TOTAL_SAMPLES} samples)" | tee -a "$SUMMARY"
+
+if [ "$TOTAL_SAMPLES" -eq 0 ]; then
+    echo "FAIL: diagnostics produced zero usable samples" | tee -a "$SUMMARY"
+    PASS=false
+fi
 
 # Absolute ceiling — catches catastrophic leaks on any run length
 if [ "${MAX_RSS:-0}" -gt 200 ] 2>/dev/null; then
@@ -481,6 +584,7 @@ echo "Total queries: $TOTAL_QUERIES" | tee -a "$SUMMARY"
 # ── Cleanup ──────────────────────────────────────────────────────
 
 rm -rf "$SOAK_PROJECT"
+SOAK_PROJECT=""
 
 echo ""
 if $PASS; then

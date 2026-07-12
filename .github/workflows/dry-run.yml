@@ -35,8 +35,11 @@ permissions:
 jobs:
   # ── Security (independent island — does not block main pipeline) ──
   security:
+    permissions:
+      actions: read
+      contents: read
+      security-events: read
     uses: ./.github/workflows/_security.yml
-    secrets: inherit
 
   # ── Lint (cppcheck + clang-format) ────────────────────────────
   lint:
