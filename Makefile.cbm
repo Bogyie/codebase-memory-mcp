@@ -114,7 +114,8 @@ FOUNDATION_SRCS = \
     src/foundation/dump_verify.c \
     src/foundation/limits.c \
     src/foundation/subprocess.c \
-    src/foundation/sha256.c
+    src/foundation/sha256.c \
+    src/foundation/rooted_file.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \
@@ -319,7 +320,15 @@ TEST_FOUNDATION_SRCS = \
     tests/test_str_util.c \
     tests/test_platform.c \
     tests/test_dump_verify.c \
-    tests/test_subprocess.c
+    tests/test_subprocess.c \
+    tests/test_rooted_file.c
+
+# The full test_main references every suite and production worker hook, so it
+# cannot link against the foundation-only source set. Keep the suite list shared
+# while giving `test-foundation` a deliberately small entry point.
+TEST_FOUNDATION_ONLY_SRCS = \
+    tests/test_foundation_main.c \
+    $(filter-out tests/test_main.c,$(TEST_FOUNDATION_SRCS))
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
@@ -522,8 +531,10 @@ $(BUILD_DIR):
 
 # ── Foundation-only test (fast, no extraction) ───────────────────
 
-$(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(LDFLAGS_TEST)
+$(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_ONLY_SRCS) $(FOUNDATION_SRCS) \
+                              $(BUILD_DIR)/mimalloc.o $(TS_RUNTIME_OBJ_TEST) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_ONLY_SRCS) $(FOUNDATION_SRCS) \
+		$(MIMALLOC_OBJ_TEST) $(TS_RUNTIME_OBJ_TEST) $(LDFLAGS_TEST)
 
 test-foundation: $(BUILD_DIR)/test-foundation
 	cd $(CURDIR) && $(BUILD_DIR)/test-foundation

@@ -893,7 +893,7 @@
             </div>
             <div class="feature">
                 <h3>Stale-source warnings</h3>
-                <p><code>get_code_snippet</code> identifies its line range as graph-derived and reports <code>source_state</code> as <code>current</code>, <code>stale_worktree</code>, <code>missing_worktree</code>, <code>range_unavailable</code>, <code>metadata_match</code>, or <code>unknown</code>. Only <code>current</code> proves that the live content hash matches the index. Source payloads are capped at 16 KiB and report truncation explicitly.</p>
+                <p><code>get_code_snippet</code> identifies its line range as graph-derived and reports <code>source_state</code> as <code>current</code>, <code>stale_worktree</code>, <code>missing_worktree</code>, <code>range_unavailable</code>, <code>metadata_match</code>, or <code>unknown</code>. Only <code>current</code> proves that the live content hash matches the index. Source payloads are capped at 16 KiB and stable reads at 16 MiB; oversized, non-regular, or unstable sources fail closed as <code>range_unavailable</code>.</p>
             </div>
         </div>
         <p style="margin-top: 16px;">

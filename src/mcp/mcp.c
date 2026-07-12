@@ -63,8 +63,11 @@ enum {
 #include "pipeline/artifact.h"
 #include "memory/memory.h"
 #include "memory/memory_share.h"
+#include "foundation/rooted_file.h"
+#include "foundation/sha256.h"
 
 #ifdef _WIN32
+#include "foundation/win_utf8.h"
 #include <direct.h>
 #include <io.h>
 #include <process.h>
@@ -636,30 +639,37 @@ static const tool_def_t TOOLS[] = {
 
     {"memory_commit", "Commit Global Memory proposal",
      "Atomically commit a proposal using entity revision compare-and-swap and an idempotent "
-     "operation ID. Semantic conflicts are rejected; last-write-wins is not used.",
+     "operation ID. Requires explicit user_approved=true authorization from the current task. "
+     "Semantic conflicts are rejected; last-write-wins is not used.",
      "{\"type\":\"object\",\"properties\":{\"proposal_id\":{\"type\":\"string\"},"
      "\"operation_id\":{\"type\":\"string\"},\"agent_id\":{\"type\":\"string\"},"
      "\"session_id\":{\"type\":\"string\"},\"user_approved\":{\"type\":\"boolean\"}},"
-     "\"required\":[\"proposal_id\",\"operation_id\"]}"},
+     "\"required\":[\"proposal_id\",\"operation_id\",\"user_approved\"]}"},
 
     {"memory_lint", "Lint Global Memory",
      "Audit unsupported or stale claims, epistemic confusion, source lineage, contradictions, "
      "temporal overlap, retrieval concentration, proposal conflicts, outbox state, and CodeRefs.",
      "{\"type\":\"object\",\"properties\":{\"checks\":{\"type\":\"array\",\"items\":{"
      "\"type\":\"string\"}},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000},"
-     "\"apply\":{\"type\":\"boolean\",\"default\":false},\"current_project\":{"
-     "\"type\":\"string\"}}}"},
+     "\"current_project\":{\"type\":\"string\"}}}"},
 
     {"memory_export", "Export Global Memory",
-     "Write a deterministic logical bundle containing canonical rows and immutable raw objects.",
-     "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}"},
+     "Write a deterministic logical bundle containing canonical rows and immutable raw objects. "
+     "Paths outside Memory home require explicit path authority and user approval; replacing an "
+     "existing bundle also requires explicit overwrite approval.",
+     "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
+     "\"allow_external_path\":{\"type\":\"boolean\",\"default\":false},"
+     "\"overwrite\":{\"type\":\"boolean\",\"default\":false},"
+     "\"user_approved\":{\"type\":\"boolean\",\"default\":false}}}"},
 
     {"memory_import", "Import Global Memory",
      "Transactionally merge a logical bundle; the live database is never swapped. Semantic "
-     "conflicts remain proposals rather than being resolved by last-write-wins.",
+     "conflicts remain proposals rather than being resolved by last-write-wins. Paths outside "
+     "Memory home require explicit path authority and user approval.",
      "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"policy\":{"
      "\"type\":\"string\",\"enum\":[\"reject\",\"keep_local\",\"keep_remote\",\"newest\"],"
-     "\"default\":\"reject\"}}}"},
+     "\"default\":\"reject\"},\"allow_external_path\":{\"type\":\"boolean\","
+     "\"default\":false},\"user_approved\":{\"type\":\"boolean\",\"default\":false}}}"},
 
     {"memory_sync", "Synchronize Global Memory",
      "Use Git, including an optional GitHub HTTPS/SSH remote, only as transport for the "
@@ -1203,6 +1213,37 @@ static int64_t mcp_stat_mtime_ns(const struct stat *st) {
 
 static bool read_store_identity(const char *path, uint64_t *device, uint64_t *inode,
                                 int64_t *mtime_ns, int64_t *size) {
+#ifdef _WIN32
+    if (!path) {
+        return false;
+    }
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return false;
+    }
+    HANDLE handle = CreateFileW(wide, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wide);
+    BY_HANDLE_FILE_INFORMATION info;
+    bool ok = handle != INVALID_HANDLE_VALUE && GetFileType(handle) == FILE_TYPE_DISK &&
+              GetFileInformationByHandle(handle, &info) &&
+              !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+    if (ok) {
+        *device = (uint64_t)info.dwVolumeSerialNumber;
+        *inode = ((uint64_t)info.nFileIndexHigh << 32U) | info.nFileIndexLow;
+        uint64_t ticks = ((uint64_t)info.ftLastWriteTime.dwHighDateTime << 32U) |
+                         info.ftLastWriteTime.dwLowDateTime;
+        const uint64_t windows_to_unix_epoch_100ns = 116444736000000000ULL;
+        *mtime_ns = ticks >= windows_to_unix_epoch_100ns
+                        ? (int64_t)((ticks - windows_to_unix_epoch_100ns) * 100U)
+                        : 0;
+        *size = (int64_t)(((uint64_t)info.nFileSizeHigh << 32U) | info.nFileSizeLow);
+    }
+    if (handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle);
+    }
+    return ok;
+#else
     struct stat st;
     if (!path || stat(path, &st) != 0) {
         return false;
@@ -1212,6 +1253,7 @@ static bool read_store_identity(const char *path, uint64_t *device, uint64_t *in
     *mtime_ns = mcp_stat_mtime_ns(&st);
     *size = (int64_t)st.st_size;
     return true;
+#endif
 }
 
 static void remember_store_identity(cbm_mcp_server_t *srv, const char *path) {
@@ -1221,9 +1263,8 @@ static void remember_store_identity(cbm_mcp_server_t *srv, const char *path) {
     if (path != srv->current_store_path) {
         snprintf(srv->current_store_path, sizeof(srv->current_store_path), "%s", path);
     }
-    srv->store_identity_valid =
-        read_store_identity(path, &srv->store_device, &srv->store_inode, &srv->store_mtime_ns,
-                            &srv->store_size);
+    srv->store_identity_valid = read_store_identity(path, &srv->store_device, &srv->store_inode,
+                                                    &srv->store_mtime_ns, &srv->store_size);
 }
 
 static bool cached_store_file_changed(cbm_mcp_server_t *srv) {
@@ -1423,7 +1464,14 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
         }
         count++;
     }
+    bool enumeration_failed = cbm_dir_had_error(d);
     cbm_closedir(d);
+    if (enumeration_failed) {
+        if (out_sz > 0) {
+            out[0] = '\0';
+        }
+        return -1;
+    }
     return count;
 }
 
@@ -1468,7 +1516,13 @@ static char *build_project_list_error(const char *reason) {
 
     enum { ERR_BUF_SZ = 5120 };
     char buf[ERR_BUF_SZ];
-    if (count > 0) {
+    if (count < 0) {
+        snprintf(buf, sizeof(buf),
+                 "{\"error\":\"%s\",\"hint\":\"The cache directory could not be fully "
+                 "enumerated. Retry, then check its permissions and filesystem health.\","
+                 "\"project_list_unavailable\":true}",
+                 reason);
+    } else if (count > 0) {
         snprintf(buf, sizeof(buf),
                  "{\"error\":\"%s\",\"hint\":\"Use list_projects to see all indexed projects, "
                  "then pass it as the \\\"project\\\" "
@@ -1624,7 +1678,15 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project) {
             cbm_store_close(st);
         }
     }
+    bool enumeration_failed = cbm_dir_had_error(d);
     cbm_closedir(d);
+    if (enumeration_failed && found) {
+        cbm_store_close(found);
+        found = NULL;
+    }
+    if (enumeration_failed) {
+        cbm_log_warn("mcp.cache_scan_failed", "operation", "resolve_store_fallback");
+    }
     return found;
 }
 
@@ -1722,7 +1784,16 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         }
         build_project_json_entry(doc, arr, dir_path, name, len, size_bytes);
     }
+    bool enumeration_failed = cbm_dir_had_error(d);
     cbm_closedir(d);
+
+    if (enumeration_failed) {
+        yyjson_mut_doc_free(doc);
+        return cbm_mcp_text_result(
+            "{\"error\":\"cannot fully enumerate cache directory\",\"hint\":"
+            "\"Retry, then check cache directory permissions and filesystem health.\"}",
+            true);
+    }
 
     yyjson_mut_obj_add_val(doc, root, "projects", arr);
 
@@ -2139,8 +2210,8 @@ static char *handle_get_design_context(cbm_mcp_server_t *srv, const char *args) 
     int relation_count = 0;
     int filtered_relations = 0;
     int relation_skip = relation_offset;
-    static const char *const core_types[] = {"ALIASES_TO", "OVERRIDES", "PROVIDES", "GENERATED_AS",
-                                             "IMPLEMENTED_BY"};
+    static const char *const core_types[] = {"ALIASES_TO",    "OVERRIDES",    "PROVIDES",
+                                             "DEFINES_TOKEN", "GENERATED_AS", "IMPLEMENTED_BY"};
     for (int i = 0; i < (int)(sizeof(core_types) / sizeof(core_types[0])); i++) {
         relation_count += design_add_relations(
             doc, relations, store, project, core_types[i], scope, relation_filter, &relation_skip,
@@ -4634,73 +4705,71 @@ static void free_node_contents(cbm_node_t *n) {
 
 /* ── Helper: read lines [start, end] from a file ─────────────── */
 
-enum { SNIPPET_SOURCE_MAX_BYTES = 16 * 1024 };
+enum {
+    SNIPPET_SOURCE_MAX_BYTES = 16 * 1024,
+    SNIPPET_HASH_MAX_BYTES = 16 * 1024 * 1024,
+};
 
-static char *read_file_lines_ex(const char *path, int start, int end, bool *truncated,
-                                size_t *bytes_read) {
+bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
+
+/* Extract an inclusive graph line range from bytes that were read and hashed
+ * from one stable file handle. This binds a `current` freshness result to the
+ * source payload actually returned, rather than to a second pathname read. */
+static char *copy_file_lines_from_bytes(const char *data, size_t data_len, int start, int end,
+                                        bool *truncated, size_t *bytes_read) {
     if (truncated) {
         *truncated = false;
     }
     if (bytes_read) {
         *bytes_read = 0;
     }
-    FILE *fp = cbm_fopen(path, "r");
-    if (!fp) {
+    if (!data || data_len == 0 || start < 1 || end < start) {
         return NULL;
     }
-
-    size_t cap = CBM_SZ_4K;
-    char *buf = malloc(cap);
-    size_t len = 0;
-    buf[0] = '\0';
-
-    char line[CBM_SZ_2K];
-    int lineno = 1;
-    while (fgets(line, sizeof(line), fp)) {
-        if (lineno > end) {
-            break;
-        }
-        size_t ll = strlen(line);
-        if (lineno >= start) {
-            size_t remaining = SNIPPET_SOURCE_MAX_BYTES - len;
-            size_t copy_len = ll < remaining ? ll : remaining;
-            while (len + copy_len + SKIP_ONE > cap) {
-                cap *= PAIR_LEN;
-                if (cap > SNIPPET_SOURCE_MAX_BYTES + SKIP_ONE) {
-                    cap = SNIPPET_SOURCE_MAX_BYTES + SKIP_ONE;
+    char *out = (char *)malloc(SNIPPET_SOURCE_MAX_BYTES + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    size_t out_len = 0;
+    size_t offset = 0;
+    int line = 1;
+    while (offset < data_len && line <= end) {
+        const char *newline = (const char *)memchr(data + offset, '\n', data_len - offset);
+        size_t segment_end = newline ? (size_t)(newline - data) + SKIP_ONE : data_len;
+        if (line >= start) {
+            size_t segment_len = segment_end - offset;
+            size_t remaining = SNIPPET_SOURCE_MAX_BYTES - out_len;
+            size_t copy_len = segment_len < remaining ? segment_len : remaining;
+            if (copy_len > 0) {
+                memcpy(out + out_len, data + offset, copy_len);
+                /* JSON strings cannot carry embedded NUL. Preserve range
+                 * shape and let the UTF-8 sanitizer handle other bad bytes. */
+                for (size_t i = 0; i < copy_len; i++) {
+                    if (out[out_len + i] == '\0') {
+                        out[out_len + i] = '?';
+                    }
                 }
-                buf = safe_realloc(buf, cap);
+                out_len += copy_len;
             }
-            memcpy(buf + len, line, copy_len);
-            len += copy_len;
-            buf[len] = '\0';
-            if (copy_len < ll || len == SNIPPET_SOURCE_MAX_BYTES) {
+            if (copy_len < segment_len) {
                 if (truncated) {
                     *truncated = true;
                 }
                 break;
             }
         }
-        /* fgets may return multiple chunks for one physical line. Advance the
-         * line number only after the newline, not once per buffer chunk. */
-        if (ll > 0 && line[ll - SKIP_ONE] == '\n') {
-            lineno++;
-        }
+        offset = segment_end;
+        line++;
     }
-
-    (void)fclose(fp);
-    if (len == 0) {
-        free(buf);
+    if (out_len == 0) {
+        free(out);
         return NULL;
     }
+    out[out_len] = '\0';
     if (bytes_read) {
-        *bytes_read = len;
+        *bytes_read = out_len;
     }
-    return buf;
-}
-
-static char *read_file_lines(const char *path, int start, int end) {
-    return read_file_lines_ex(path, start, end, NULL, NULL);
+    return out;
 }
 
 /* ── Helper: get project root_path from store ─────────────────── */
@@ -5480,8 +5549,6 @@ char *cbm_mcp_index_run_supervised_path(const char *root_path) {
     return index_run_supervised_path(NULL, root_path);
 }
 
-bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
-
 /* A successful explicit index has the same Global Memory semantics as a
  * watcher re-index: symbolic resolution is refreshed against the newly
  * written code DB, and validation writes only when the result changed.
@@ -5758,16 +5825,9 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
     return props_doc; /* caller frees after serialization */
 }
 
-/* Resolve an absolute path from root_path + file_path, verify containment,
- * and read source lines. Sets *out_abs_path (caller frees). Returns source
- * string (caller frees) or NULL if path is invalid/unreadable. */
-/* True only when abs_path, after realpath/_fullpath resolution (which collapses
- * `..` and resolves symlinks/junctions), stays within root_path. This is the
- * single containment guard every MCP file-read sink must pass before reading a
- * file into a tool response: both the snippet path (resolve_snippet_source) and
- * the search path (attach_result_source) route through it, so a result whose
- * indexed path escapes the project root — via a `..` segment, or a symlink /
- * Windows junction picked up during discovery — is never read back out. */
+/* Compatibility/administrative containment helper. Source-response reads do
+ * not use this pathname precheck as authority: they use rooted_file so an
+ * opened descriptor/handle, its bytes, and its root containment are bound. */
 /* Canonicalize `path` (resolve symlinks/junctions and `..`) into `out`
  * (>= CBM_SZ_4K bytes); returns true on success. Isolating the per-OS resolver
  * keeps cbm_path_within_root's control flow unconditional: the previous `#ifdef`
@@ -5776,10 +5836,10 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
  * across preprocessor branches, which defeats source-level tooling that parses
  * without the preprocessor (and left this function unindexed in the graph). */
 static bool resolve_canonical_path(const char *path, char *out, size_t out_sz) {
-    /* cbm_canonical_path: realpath on POSIX; wide existence check +
-     * GetFullPathNameW on Windows (the old bare _fullpath was ANSI —
-     * CJK-locale corruption, #973 — and, unlike POSIX realpath, resolved
-     * nonexistent paths too; requiring existence aligns the platforms). */
+    /* cbm_canonical_path: realpath on POSIX; a wide handle plus
+     * GetFinalPathNameByHandleW on Windows. The old bare _fullpath was ANSI
+     * (CJK-locale corruption, #973) and lexical-only, so it neither aligned
+     * with POSIX realpath nor resolved junctions for containment checks. */
     if (!cbm_canonical_path(path, out, out_sz)) {
         return false;
     }
@@ -5798,30 +5858,71 @@ bool cbm_path_within_root(const char *root_path, const char *abs_path) {
     if (resolve_canonical_path(root_path, real_root, sizeof(real_root)) &&
         resolve_canonical_path(abs_path, real_file, sizeof(real_file))) {
         size_t root_len = strlen(real_root);
-        if (strncmp(real_file, real_root, root_len) == 0 &&
-            (real_file[root_len] == '/' || real_file[root_len] == '\0')) {
+        size_t file_len = strlen(real_file);
+        if (root_len == 0 || file_len < root_len) {
+            return false;
+        }
+        bool prefix = false;
+#ifdef _WIN32
+        prefix = _strnicmp(real_file, real_root, root_len) == 0;
+#else
+        prefix = strncmp(real_file, real_root, root_len) == 0;
+#endif
+        bool root_has_separator = root_len > 0 && real_root[root_len - SKIP_ONE] == '/';
+        bool next_is_separator = real_file[root_len] == '/';
+#ifdef _WIN32
+        root_has_separator =
+            root_has_separator || (root_len > 0 && real_root[root_len - SKIP_ONE] == '\\');
+        next_is_separator = next_is_separator || real_file[root_len] == '\\';
+#endif
+        if (prefix && (root_has_separator || next_is_separator || real_file[root_len] == '\0')) {
             return true;
         }
     }
     return false;
 }
 
-static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,
-                                    int end, char **out_abs_path, bool *truncated,
-                                    size_t *bytes_read) {
-    *out_abs_path = NULL;
-    if (!root_path || !file_path) {
-        return NULL;
-    }
-    size_t apsz = strlen(root_path) + strlen(file_path) + MCP_SEPARATOR;
-    char *abs_path = malloc(apsz);
-    snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
+typedef struct {
+    char *source;
+    char *abs_path; /* display only; never used as read authority */
+    bool truncated;
+    size_t bytes_read;
+    cbm_rooted_file_t file;
+    cbm_rooted_file_status_t status;
+} snippet_source_result_t;
 
-    *out_abs_path = abs_path;
-    if (cbm_path_within_root(root_path, abs_path)) {
-        return read_file_lines_ex(abs_path, start, end, truncated, bytes_read);
+static void resolve_snippet_source(const char *root_path, const char *file_path, int start, int end,
+                                   snippet_source_result_t *result) {
+    memset(result, 0, sizeof(*result));
+    result->file.size = -1;
+    result->status = CBM_ROOTED_FILE_INVALID;
+    if (!root_path || !file_path || !cbm_rooted_relative_path_valid(file_path)) {
+        return;
     }
-    return NULL;
+
+    /* Build a human-readable absolute path independently of authorization.
+     * The source read below receives only root + validated relative path. */
+    size_t root_len = strlen(root_path);
+    size_t file_len = strlen(file_path);
+    if (file_len > SIZE_MAX - MCP_SEPARATOR || root_len > SIZE_MAX - file_len - MCP_SEPARATOR) {
+        return;
+    }
+    size_t apsz = root_len + file_len + MCP_SEPARATOR;
+    char *abs_path = malloc(apsz);
+    if (abs_path) {
+        int written = snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
+        if (written < 0 || (size_t)written >= apsz) {
+            free(abs_path);
+            abs_path = NULL;
+        }
+    }
+    result->abs_path = abs_path;
+    result->status =
+        cbm_rooted_file_read(root_path, file_path, SNIPPET_HASH_MAX_BYTES, &result->file);
+    if (result->status == CBM_ROOTED_FILE_OK) {
+        result->source = copy_file_lines_from_bytes(result->file.data, result->file.len, start, end,
+                                                    &result->truncated, &result->bytes_read);
+    }
 }
 
 static bool utf8_is_cont(unsigned char c) {
@@ -5946,11 +6047,9 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 
     int start = node->start_line > 0 ? node->start_line : SKIP_ONE;
     int end = node->end_line > start ? node->end_line : start + SNIPPET_DEFAULT_LINES;
-    char *abs_path = NULL;
-    bool source_truncated = false;
-    size_t source_bytes = 0;
-    char *source = resolve_snippet_source(root_path, node->file_path, start, end, &abs_path,
-                                          &source_truncated, &source_bytes);
+    snippet_source_result_t resolved;
+    resolve_snippet_source(root_path, node->file_path, start, end, &resolved);
+    char *source = resolved.source;
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
@@ -5962,36 +6061,47 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_mut_obj_add_str(doc, root_obj, "label", node->label ? node->label : "");
 
     const char *display_path = "";
-    if (abs_path) {
-        display_path = abs_path;
+    if (resolved.abs_path) {
+        display_path = resolved.abs_path;
     } else if (node->file_path) {
         display_path = node->file_path;
     }
     yyjson_mut_obj_add_str(doc, root_obj, "file_path", display_path);
     yyjson_mut_obj_add_int(doc, root_obj, "start_line", start);
     yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
-    yyjson_mut_obj_add_bool(doc, root_obj, "source_truncated", source_truncated);
-    yyjson_mut_obj_add_uint(doc, root_obj, "source_bytes", source_bytes);
+    yyjson_mut_obj_add_bool(doc, root_obj, "source_truncated", resolved.truncated);
+    yyjson_mut_obj_add_uint(doc, root_obj, "source_bytes", resolved.bytes_read);
     yyjson_mut_obj_add_str(doc, root_obj, "line_range_source", "indexed_graph");
 
     int64_t indexed_mtime_ns = 0;
     int64_t indexed_size = 0;
-    struct stat live_stat;
+    char *indexed_hash = NULL;
     bool indexed_version =
         node->project && node->file_path &&
         cbm_store_get_file_version(srv->store, node->project, node->file_path, &indexed_mtime_ns,
-                                   &indexed_size, NULL) == CBM_STORE_OK;
-    bool live_version = abs_path && stat(abs_path, &live_stat) == 0;
-    bool stale_source = indexed_version && live_version &&
-                        (indexed_mtime_ns != mcp_stat_mtime_ns(&live_stat) ||
-                         indexed_size != (int64_t)live_stat.st_size);
+                                   &indexed_size, &indexed_hash) == CBM_STORE_OK;
+    int64_t live_mtime_ns = resolved.file.mtime_ns;
+    int64_t live_size = resolved.file.size;
+    bool live_version = resolved.file.metadata_valid;
+    bool live_path_exists = resolved.status != CBM_ROOTED_FILE_NOT_FOUND;
+    bool metadata_changed = indexed_version && live_version &&
+                            (indexed_mtime_ns != live_mtime_ns || indexed_size != live_size);
+    bool hash_available = live_version && resolved.status == CBM_ROOTED_FILE_OK && indexed_hash &&
+                          indexed_hash[0];
+    bool hash_changed = hash_available && strcmp(indexed_hash, resolved.file.sha256) != 0;
+    bool stale_source = hash_available ? hash_changed : metadata_changed;
     const char *source_state = "unknown";
-    if (indexed_version && (!live_version || !source)) {
+    if (indexed_version && resolved.status == CBM_ROOTED_FILE_NOT_FOUND) {
         source_state = "missing_worktree";
     } else if (stale_source) {
         source_state = "stale_worktree";
-    } else if (indexed_version) {
+    } else if (indexed_version && hash_available && source) {
         source_state = "current";
+    } else if (indexed_version && live_path_exists &&
+               (!live_version || resolved.status != CBM_ROOTED_FILE_OK || !source)) {
+        source_state = "range_unavailable";
+    } else if (indexed_version && live_version) {
+        source_state = "metadata_match";
     }
     yyjson_mut_obj_add_str(doc, root_obj, "source_state", source_state);
     if (stale_source) {
@@ -5999,11 +6109,23 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
             doc, root_obj, "source_warning",
             "The graph line range comes from an older file version. Source is read from the live "
             "worktree and may no longer correspond to this symbol; re-index before relying on it.");
-    } else if (indexed_version && (!live_version || !source)) {
+    } else if (indexed_version && resolved.status == CBM_ROOTED_FILE_NOT_FOUND) {
         yyjson_mut_obj_add_str(
             doc, root_obj, "source_warning",
             "The indexed file is missing or unreadable in the live worktree. Re-index before "
             "relying on this symbol.");
+    } else if (indexed_version && live_path_exists &&
+               (!live_version || resolved.status != CBM_ROOTED_FILE_OK || !source)) {
+        yyjson_mut_obj_add_str(
+            doc, root_obj, "source_warning",
+            "The indexed line range could not be read from one stable regular-file generation "
+            "within the 16 MiB interactive limit. Re-index before relying on this symbol.");
+    } else if (indexed_version && live_version && !hash_available) {
+        yyjson_mut_obj_add_str(
+            doc, root_obj, "source_warning",
+            "Only file metadata could be compared because the indexed or live content hash is "
+            "unavailable. Re-index legacy rows to establish a digest; oversized files remain "
+            "metadata-only so interactive requests stay bounded.");
     }
 
     if (source) {
@@ -6077,8 +6199,11 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     free(nb_callers);
     free(nb_callees);
     free(root_path);
-    free(abs_path);
+    free(resolved.abs_path);
     free(source);
+    resolved.source = NULL;
+    cbm_rooted_file_free(&resolved.file);
+    free(indexed_hash);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -6349,66 +6474,113 @@ static yyjson_mut_val *build_dedup_files_array(yyjson_mut_doc *doc, search_resul
     return files_arr;
 }
 
-/* Attach source or context lines to a search result JSON item. */
-static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, search_result_t *r,
-                                 int mode, int context_lines, const char *root_path) {
+typedef struct {
+    bool prepared;
+    char *text;
+    int start_line;
+    bool truncated;
+} search_source_excerpt_t;
+
+/* Read each distinct result file once, then derive all requested excerpts from
+ * those descriptor-bound bytes. This avoids N×16 MiB reads for N symbols in
+ * one file while retaining result order in the caller. */
+static search_source_excerpt_t *prepare_result_sources(search_result_t *results, int count,
+                                                       int mode, int context_lines,
+                                                       const char *root_path) {
+    enum { MODE_FULL = 1, SC_FULL_MAX_LINES = 60, SC_FULL_LEAD = 5 };
+    search_source_excerpt_t *excerpts = calloc((size_t)count, sizeof(*excerpts));
+    if (!excerpts || !root_path || (mode != MODE_FULL && context_lines <= 0)) {
+        return excerpts;
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (excerpts[i].prepared) {
+            continue;
+        }
+        for (int j = i; j < count; j++) {
+            if (strcmp(results[i].file, results[j].file) == 0) {
+                excerpts[j].prepared = true;
+            }
+        }
+        if (!cbm_rooted_relative_path_valid(results[i].file)) {
+            continue;
+        }
+        cbm_rooted_file_t file = {0};
+        if (cbm_rooted_file_read(root_path, results[i].file, SNIPPET_HASH_MAX_BYTES, &file) !=
+            CBM_ROOTED_FILE_OK) {
+            cbm_rooted_file_free(&file);
+            continue;
+        }
+
+        for (int j = i; j < count; j++) {
+            search_result_t *result = &results[j];
+            if (strcmp(results[i].file, result->file) != 0 || result->start_line <= 0 ||
+                result->end_line <= 0) {
+                continue;
+            }
+            int start = result->start_line;
+            int end = result->end_line;
+            bool range_truncated = false;
+            if (mode == MODE_FULL) {
+                int64_t span = (int64_t)end - start + 1;
+                if (span > SC_FULL_MAX_LINES) {
+                    if (result->match_count > 0 &&
+                        (int64_t)result->match_lines[0] - SC_FULL_LEAD > start) {
+                        start = result->match_lines[0] - SC_FULL_LEAD;
+                    }
+                    int64_t capped_end = (int64_t)start + SC_FULL_MAX_LINES - 1;
+                    end = capped_end < result->end_line ? (int)capped_end : result->end_line;
+                    range_truncated = true;
+                }
+            } else if (result->match_count > 0) {
+                int64_t first = (int64_t)result->match_lines[0] - context_lines;
+                int64_t last = (int64_t)result->match_lines[result->match_count - SKIP_ONE] +
+                               context_lines;
+                start = first < SKIP_ONE ? SKIP_ONE : (first > INT32_MAX ? INT32_MAX : (int)first);
+                end = last > INT32_MAX ? INT32_MAX : (int)last;
+            } else {
+                continue;
+            }
+            bool byte_truncated = false;
+            excerpts[j].text = copy_file_lines_from_bytes(file.data, file.len, start, end,
+                                                          &byte_truncated, NULL);
+            excerpts[j].start_line = start;
+            excerpts[j].truncated = range_truncated || byte_truncated;
+            if (excerpts[j].text) {
+                sanitize_ascii(excerpts[j].text);
+            }
+        }
+        cbm_rooted_file_free(&file);
+    }
+    return excerpts;
+}
+
+static void free_result_sources(search_source_excerpt_t *excerpts, int count) {
+    if (!excerpts) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(excerpts[i].text);
+    }
+    free(excerpts);
+}
+
+/* Attach an already-authorized excerpt to a search result JSON item. */
+static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item,
+                                 const search_source_excerpt_t *excerpt, int mode) {
     enum { MODE_FULL = 1 };
-    if (r->start_line <= 0 || r->end_line <= 0) {
+    if (!excerpt || !excerpt->text) {
         return;
     }
-    char abs_path[CBM_SZ_1K];
-    snprintf(abs_path, sizeof(abs_path), "%s/%s", root_path, r->file);
-
-    /* Containment: a search result whose indexed path resolves outside the
-     * project root (a `..` segment, or a symlink/junction that discovery
-     * followed) must not be read back into the response. Same guard the
-     * snippet path already uses. */
-    if (!cbm_path_within_root(root_path, abs_path)) {
-        return;
-    }
-
     if (mode == MODE_FULL) {
-        /* Cap each hit's source at a match-anchored window: uncapped
-         * whole-symbol dumps ran to 5.7KB × N hits (142KB responses). The
-         * complete symbol stays one get_code_snippet call away;
-         * source_start/source_truncated make the cut explicit. */
-        enum { SC_FULL_MAX_LINES = 60, SC_FULL_LEAD = 5 };
-        int s = r->start_line;
-        int e = r->end_line;
-        bool truncated = false;
-        if (e - s + 1 > SC_FULL_MAX_LINES) {
-            if (r->match_count > 0 && r->match_lines[0] - SC_FULL_LEAD > s) {
-                s = r->match_lines[0] - SC_FULL_LEAD;
-            }
-            e = s + SC_FULL_MAX_LINES - 1;
-            if (e > r->end_line) {
-                e = r->end_line;
-            }
-            truncated = true;
+        yyjson_mut_obj_add_strcpy(doc, item, "source", excerpt->text);
+        if (excerpt->truncated) {
+            yyjson_mut_obj_add_int(doc, item, "source_start", excerpt->start_line);
+            yyjson_mut_obj_add_bool(doc, item, "source_truncated", true);
         }
-        char *source = read_file_lines(abs_path, s, e);
-        if (source) {
-            sanitize_ascii(source);
-            yyjson_mut_obj_add_strcpy(doc, item, "source", source);
-            free(source);
-            if (truncated) {
-                yyjson_mut_obj_add_int(doc, item, "source_start", s);
-                yyjson_mut_obj_add_bool(doc, item, "source_truncated", true);
-            }
-        }
-    } else if (context_lines > 0 && r->match_count > 0) {
-        int ctx_start = r->match_lines[0] - context_lines;
-        int ctx_end = r->match_lines[r->match_count - SKIP_ONE] + context_lines;
-        if (ctx_start < SKIP_ONE) {
-            ctx_start = SKIP_ONE;
-        }
-        char *ctx = read_file_lines(abs_path, ctx_start, ctx_end);
-        if (ctx) {
-            sanitize_ascii(ctx);
-            yyjson_mut_obj_add_strcpy(doc, item, "context", ctx);
-            yyjson_mut_obj_add_int(doc, item, "context_start", ctx_start);
-            free(ctx);
-        }
+    } else {
+        yyjson_mut_obj_add_strcpy(doc, item, "context", excerpt->text);
+        yyjson_mut_obj_add_int(doc, item, "context_start", excerpt->start_line);
     }
 }
 
@@ -6566,6 +6738,10 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     yyjson_mut_doc_set_root(doc, root_obj);
 
     int output_count = sr_count < limit ? sr_count : limit;
+    search_source_excerpt_t *excerpts =
+        mode == MODE_FILES ? NULL
+                           : prepare_result_sources(sr, output_count, mode, context_lines,
+                                                    root_path);
 
     if (mode == MODE_FILES) {
         yyjson_mut_obj_add_val(doc, root_obj, "files",
@@ -6590,7 +6766,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
                 yyjson_mut_arr_add_int(doc, ml, r->match_lines[j]);
             }
             yyjson_mut_obj_add_val(doc, item, "match_lines", ml);
-            attach_result_source(doc, item, r, mode, context_lines, root_path);
+            attach_result_source(doc, item, excerpts ? &excerpts[ri] : NULL, mode);
             yyjson_mut_arr_add_val(results_arr, item);
         }
         yyjson_mut_obj_add_val(doc, root_obj, "results", results_arr);
@@ -6649,6 +6825,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
         sanitize_ascii(json);
     }
     yyjson_mut_doc_free(doc);
+    free_result_sources(excerpts, output_count);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
@@ -6724,6 +6901,83 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
 
     *out_count = gm_count;
     return gm;
+}
+
+static int grep_match_path_line_cmp(const void *left, const void *right) {
+    const grep_match_t *a = (const grep_match_t *)left;
+    const grep_match_t *b = (const grep_match_t *)right;
+    int path_order = strcmp(a->file, b->file);
+    if (path_order != 0) {
+        return path_order;
+    }
+    return (a->line > b->line) - (a->line < b->line);
+}
+
+/* External grep is only a candidate finder. Its pathname read can race a
+ * symlink/junction replacement, so never return its bytes directly. Re-open
+ * each distinct relative path through rooted_file, reconstruct the indicated
+ * line from those authorized bytes, and retain only exact matches. */
+static int authorize_grep_matches(const char *root_path, grep_match_t *matches, int count) {
+    if (!root_path || !matches || count <= 0) {
+        return 0;
+    }
+    qsort(matches, (size_t)count, sizeof(*matches), grep_match_path_line_cmp);
+    int kept = 0;
+    int group = 0;
+    while (group < count) {
+        int group_end = group + 1;
+        while (group_end < count && strcmp(matches[group].file, matches[group_end].file) == 0) {
+            group_end++;
+        }
+        cbm_rooted_file_t file = {0};
+        cbm_rooted_file_status_t status =
+            cbm_rooted_file_read(root_path, matches[group].file, SNIPPET_HASH_MAX_BYTES, &file);
+        if (status == CBM_ROOTED_FILE_OK) {
+            size_t offset = 0;
+            int current_line = 1;
+            for (int i = group; i < group_end; i++) {
+                int target_line = matches[i].line;
+                while (current_line < target_line && offset < file.len) {
+                    const char *newline = memchr(file.data + offset, '\n', file.len - offset);
+                    if (!newline) {
+                        offset = file.len;
+                        break;
+                    }
+                    offset = (size_t)(newline - file.data) + SKIP_ONE;
+                    current_line++;
+                }
+                if (target_line < 1 || current_line != target_line || offset >= file.len) {
+                    continue;
+                }
+                const char *newline = memchr(file.data + offset, '\n', file.len - offset);
+                size_t line_end = newline ? (size_t)(newline - file.data) : file.len;
+                size_t line_len = line_end - offset;
+                if (line_len >= sizeof(matches[i].content)) {
+                    line_len = sizeof(matches[i].content) - SKIP_ONE;
+                }
+                char authorized[CBM_SZ_1K];
+                memcpy(authorized, file.data + offset, line_len);
+                for (size_t j = 0; j < line_len; j++) {
+                    if (authorized[j] == '\0') {
+                        authorized[j] = '?';
+                    }
+                }
+                authorized[line_len] = '\0';
+                sanitize_ascii(authorized);
+                if (strcmp(authorized, matches[i].content) != 0) {
+                    continue;
+                }
+                if (kept != i) {
+                    matches[kept] = matches[i];
+                }
+                snprintf(matches[kept].content, sizeof(matches[kept].content), "%s", authorized);
+                kept++;
+            }
+        }
+        cbm_rooted_file_free(&file);
+        group = group_end;
+    }
+    return kept;
 }
 
 /* Find the tightest node containing a line in a file. Returns index or -1. */
@@ -6807,7 +7061,7 @@ static void free_file_nodes(cbm_node_t *nodes, int count) {
 static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *store,
                                    const char *project, search_result_t **sr, int *sr_count,
                                    int *sr_cap, grep_match_t **raw, int *raw_count, int *raw_cap) {
-    qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
+    qsort(gm, (size_t)gm_count, sizeof(grep_match_t), grep_match_path_line_cmp);
     int i = 0;
     while (i < gm_count) {
         const char *cur_file = gm[i].file;
@@ -6986,6 +7240,16 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     int limit = cbm_mcp_get_int_arg(args, "limit", MCP_DEFAULT_LIMIT);
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
+    if (limit < 1) {
+        limit = 1;
+    } else if (limit > MCP_MAX_ROWS) {
+        limit = MCP_MAX_ROWS;
+    }
+    if (context_lines < 0) {
+        context_lines = 0;
+    } else if (context_lines > SNIPPET_DEFAULT_LINES) {
+        context_lines = SNIPPET_DEFAULT_LINES;
+    }
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
     uint64_t search_t0 = cbm_now_ms();
     /* In literal (non-regex) mode a '|' is matched as a byte, not alternation —
@@ -7163,6 +7427,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
             cbm_unlink(filelist);
         }
     }
+    gm_count = authorize_grep_matches(root_path, gm, gm_count);
 
     /* ── Phase 2+3: Block expansion + graph ranking ──────────── */
     /* Sort grep matches by file for contiguous processing.
@@ -7179,7 +7444,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     grep_match_t *raw = malloc(raw_cap * sizeof(grep_match_t));
 
     /* Sort matches by file path for contiguous per-file processing */
-    qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
+    qsort(gm, (size_t)gm_count, sizeof(grep_match_t), grep_match_path_line_cmp);
 
     classify_all_grep_hits(gm, gm_count, store, project, &sr, &sr_count, &sr_cap, &raw, &raw_count,
                            &raw_cap);

@@ -13,7 +13,7 @@
 - Safe retrieval: current-context applicability, bitemporal history, freshness and conflict warnings, evidence lineage, and a risk-adaptive route. Opposing-view search is not statically required.
 - Multi-agent updates: reasoning outside transactions, revision-aware proposals, idempotent operation IDs, entity compare-and-swap, explicit `user_approved:true` on `memory_commit`, and no last-write-wins.
 - Maintenance and sharing: epistemic/temporal/bias/CodeRef lint; deterministic export/import; optional Git or GitHub transport with explicit merge policy. External export/import paths require `allow_external_path:true` plus `user_approved:true`; replacing an export also requires `overwrite:true`.
-- Snippet freshness: `get_code_snippet.source_state` is one of `current`, `stale_worktree`, `missing_worktree`, `range_unavailable`, `metadata_match`, or `unknown`; only `current` proves a live content-hash match.
+- Snippet freshness: `get_code_snippet.source_state` is one of `current`, `stale_worktree`, `missing_worktree`, `range_unavailable`, `metadata_match`, or `unknown`; only `current` proves a live content-hash match, and interactive freshness hashing is capped at 16 MiB.
 - Graph publication: completed staging generations are installed into the live destination through a SQLite backup transaction, preserving consistent readers without pathname replacement.
 - Semantic search: natural-language code discovery via bundled nomic-embed-code embeddings (768-dim, compiled into the binary); 11-signal combined scoring; fully local, no API key.
 - Semantic & similarity edges: SEMANTICALLY_RELATED (vocabulary-mismatch matches) and SIMILAR_TO (MinHash + LSH near-clone / duplicate detection).

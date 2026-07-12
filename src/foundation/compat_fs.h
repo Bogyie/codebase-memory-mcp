@@ -13,14 +13,16 @@
 
 /* ── Directory iteration ──────────────────────────────────────── */
 
-/* Max filename length (MAX_PATH on Windows, NAME_MAX on POSIX). */
-#define CBM_DIRENT_NAME_MAX 260
+/* A Windows filename may contain 255 UTF-16 code units, which can require up
+ * to 1020 UTF-8 bytes. Keep the converted name lossless. */
+#define CBM_DIRENT_NAME_MAX 1024
 
 typedef struct cbm_dir cbm_dir_t;
 
 typedef struct {
     char name[CBM_DIRENT_NAME_MAX];
     bool is_dir;
+    bool is_reparse;      /* Windows junction/symlink; POSIX symbolic link */
     unsigned char d_type; /* DT_REG, DT_DIR, DT_LNK, etc. (POSIX only, 0 on Windows) */
 } cbm_dirent_t;
 
@@ -30,6 +32,10 @@ cbm_dir_t *cbm_opendir(const char *path);
 /* Read next entry. Returns NULL when done. The returned pointer is
  * valid until the next cbm_readdir call on the same handle. */
 cbm_dirent_t *cbm_readdir(cbm_dir_t *d);
+
+/* Distinguish a clean end-of-directory from conversion, allocation, or OS
+ * iteration failure after cbm_readdir() returns NULL. */
+bool cbm_dir_had_error(const cbm_dir_t *d);
 
 /* Close directory handle. */
 void cbm_closedir(cbm_dir_t *d);
@@ -53,10 +59,15 @@ void cbm_remove_db_sidecars(const char *db_path);
 /* rename() that replaces an existing destination on every platform
  * (Windows rename fails with EEXIST; this uses MoveFileExW there). */
 int cbm_rename_replace(const char *src, const char *dst);
-/* Canonicalize an EXISTING path (realpath / wide GetFullPathNameW). Locale-
- * independent on Windows — never routes UTF-8 through the ANSI CRT (#973).
- * out must be >= 4096 bytes. Returns 1 on success, 0 otherwise. */
+/* Canonicalize an EXISTING path (realpath / wide handle final path), resolving
+ * symlinks and Windows reparse points. Locale-independent on Windows — never
+ * routes UTF-8 through the ANSI CRT (#973). The output size is checked against
+ * out_sz; small buffers fail without writing past the end. */
 int cbm_canonical_path(const char *path, char *out, size_t out_sz);
+bool cbm_path_is_reparse_point(const char *path);
+/* UTF-8-safe existence probe: 1 exists, 0 definitely absent, -1 for invalid
+ * input, permission, conversion, or other OS errors. */
+int cbm_path_probe(const char *path);
 
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);

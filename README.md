@@ -561,8 +561,8 @@ worktree:
 - `current`: the live file content hash matches the indexed hash and the requested range was read.
 - `stale_worktree`: the content hash differs, or a legacy index without a hash has different file metadata; the returned live range may no longer represent the symbol.
 - `missing_worktree`: the indexed file is no longer available in the live worktree.
-- `range_unavailable`: the file exists, but the indexed range could not be returned.
-- `metadata_match`: the file and range are available and legacy metadata matches, but no content-hash proof is available; re-index to establish `current`.
+- `range_unavailable`: the file exists, but one stable regular-file generation could not be read within the 16 MiB interactive limit (including oversized or non-regular replacements).
+- `metadata_match`: the file and range are available and metadata matches, but the indexed row has no digest (for example, a legacy empty digest). Re-indexing establishes the missing digest.
 - `unknown`: the index has no usable file-version record, so freshness cannot be established.
 
 ### Supported Cypher (openCypher read subset)

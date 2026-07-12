@@ -6,8 +6,10 @@
 #include "../src/foundation/compat.h"
 #include <sqlite3.h>
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
+#include "../src/foundation/compat_fs_internal.h"
 #include "../src/foundation/constants.h"
 #include "../src/foundation/log.h"
+#include "../src/foundation/sha256.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
@@ -241,6 +243,11 @@ TEST(mcp_initialize_response) {
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *tools = yyjson_obj_get(yyjson_doc_get_root(doc), "tools");
+    ASSERT_TRUE(yyjson_is_arr(tools));
+    ASSERT_EQ(yyjson_arr_size(tools), 24);
     /* Should contain all repository and Global Memory tools. */
     ASSERT_NOT_NULL(strstr(json, "index_repository"));
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
@@ -259,12 +266,14 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "ingest_traces"));
     ASSERT_NOT_NULL(strstr(json, "memory_ingest"));
     ASSERT_NOT_NULL(strstr(json, "memory_query"));
+    ASSERT_NOT_NULL(strstr(json, "memory_status"));
     ASSERT_NOT_NULL(strstr(json, "memory_propose"));
     ASSERT_NOT_NULL(strstr(json, "memory_commit"));
     ASSERT_NOT_NULL(strstr(json, "memory_lint"));
     ASSERT_NOT_NULL(strstr(json, "memory_export"));
     ASSERT_NOT_NULL(strstr(json, "memory_import"));
     ASSERT_NOT_NULL(strstr(json, "memory_sync"));
+    yyjson_doc_free(doc);
     free(json);
     PASS();
 }
@@ -322,6 +331,12 @@ TEST(tool_get_design_context_returns_curated_graph) {
                         .type = "USES_TOKEN",
                         .properties_json = "{\"line\":3}"};
     ASSERT_GT(cbm_store_insert_edge(store, &usage), 0);
+    cbm_edge_t definition = {.project = project,
+                             .source_id = file_id,
+                             .target_id = token_id,
+                             .type = "DEFINES_TOKEN",
+                             .properties_json = "{\"canonical\":true}"};
+    ASSERT_GT(cbm_store_insert_edge(store, &definition), 0);
 
     char *response = cbm_mcp_handle_tool(
         srv, "get_design_context", "{\"project\":\"design-tool-test\",\"token\":\"color.action\"}");
@@ -330,6 +345,7 @@ TEST(tool_get_design_context_returns_curated_graph) {
     ASSERT_TRUE(response_contains_json_fragment(response, "\"status\":\"ready\""));
     ASSERT_TRUE(response_contains_json_fragment(response, "color.action"));
     ASSERT_TRUE(response_contains_json_fragment(response, "USES_TOKEN"));
+    ASSERT_TRUE(response_contains_json_fragment(response, "DEFINES_TOKEN"));
     ASSERT_TRUE(response_contains_json_fragment(response, "project-local"));
     free(response);
     cbm_mcp_server_free(srv);
@@ -3279,7 +3295,12 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     cbm_store_upsert_project(st, proj_name, proj_dir);
     struct stat source_stat;
     if (stat(src_path, &source_stat) == 0) {
-        cbm_store_upsert_file_hash(st, proj_name, "main.go", "",
+        char digest[CBM_SHA256_HEX_LEN + 1];
+        if (cbm_sha256_file_hex(src_path, digest) != 0) {
+            cbm_mcp_server_free(srv);
+            return NULL;
+        }
+        cbm_store_upsert_file_hash(st, proj_name, "main.go", digest,
                                    snippet_test_mtime_ns(&source_stat), source_stat.st_size);
     }
 
@@ -3775,6 +3796,243 @@ TEST(snippet_stale_worktree_is_explicit) {
     ASSERT_NOT_NULL(strstr(resp, "\"source_warning\""));
     ASSERT_NOT_NULL(strstr(resp, "re-index before relying on it"));
     ASSERT_NOT_NULL(strstr(resp, "\"line_range_source\":\"indexed_graph\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(snippet_hash_detects_same_metadata_edit) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    char *old_hash = NULL;
+    int64_t old_mtime = 0;
+    int64_t old_size = 0;
+    ASSERT_EQ(cbm_store_get_file_version(store, "test-project", "main.go", &old_mtime, &old_size,
+                                         &old_hash),
+              CBM_STORE_OK);
+    ASSERT_NOT_NULL(old_hash);
+
+    FILE *fp = fopen(src_path, "r+");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(fseek(fp, 0, SEEK_SET), 0);
+    /* Same byte length as "package main". */
+    ASSERT_TRUE(fputs("package lain", fp) >= 0);
+    ASSERT_EQ(fclose(fp), 0);
+    struct stat current;
+    ASSERT_EQ(stat(src_path, &current), 0);
+    ASSERT_EQ(current.st_size, old_size);
+    /* Simulate a filesystem/copy tool preserving metadata while retaining the
+     * hash recorded for the previously indexed bytes. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", old_hash,
+                                         snippet_test_mtime_ns(&current), current.st_size),
+              CBM_STORE_OK);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"source_state\":\"stale_worktree\""));
+    free(resp);
+    free(old_hash);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(snippet_shortened_file_is_stale_not_missing) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_TRUE(fputs("package main\n", fp) >= 0);
+    ASSERT_EQ(fclose(fp), 0);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"source_state\":\"stale_worktree\""));
+    ASSERT_NULL(strstr(resp, "\"source_state\":\"missing_worktree\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(snippet_oversized_freshness_check_is_bounded) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    char *indexed_hash = NULL;
+    int64_t indexed_mtime = 0;
+    int64_t indexed_size = 0;
+    ASSERT_EQ(cbm_store_get_file_version(store, "test-project", "main.go", &indexed_mtime,
+                                         &indexed_size, &indexed_hash),
+              CBM_STORE_OK);
+    ASSERT_NOT_NULL(indexed_hash);
+
+    FILE *fp = fopen(src_path, "r+b");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(fseek(fp, 16L * 1024L * 1024L, SEEK_SET), 0);
+    ASSERT_NEQ(fputc('\n', fp), EOF);
+    ASSERT_EQ(fclose(fp), 0);
+    struct stat current;
+    ASSERT_EQ(stat(src_path, &current), 0);
+    ASSERT_GT(current.st_size, 16 * 1024 * 1024);
+    /* Model a completed legacy/imported row whose metadata is available but
+     * whose digest cannot be proven within the interactive 16 MiB budget. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", indexed_hash,
+                                         snippet_test_mtime_ns(&current), current.st_size),
+              CBM_STORE_OK);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"source_state\":\"range_unavailable\""));
+    ASSERT_NOT_NULL(strstr(resp, "16 MiB interactive limit"));
+
+    free(resp);
+    free(indexed_hash);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(snippet_nonregular_replacement_fails_closed_without_blocking) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX FIFO regression; Windows handle code rejects non-disk files");
+#else
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    ASSERT_EQ(cbm_unlink(src_path), 0);
+    /* No writer is opened. A plain fopen("r") would hang the MCP event loop;
+     * the stable regular-file reader opens nonblocking and rejects the FIFO. */
+    ASSERT_EQ(mkfifo(src_path, 0600), 0);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"source_state\":\"range_unavailable\""));
+    ASSERT_NOT_NULL(strstr(resp, "stable regular-file generation"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+#endif
+}
+
+TEST(snippet_symlink_replacement_never_returns_outside_bytes) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink fixture; Windows HANDLE containment is covered separately");
+#else
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    char outside_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    snprintf(outside_path, sizeof(outside_path), "%s/outside.go", tmp);
+    FILE *fp = fopen(outside_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_TRUE(fputs("OUTSIDE_SECRET\nfunc HandleRequest() {}\n", fp) >= 0);
+    ASSERT_EQ(fclose(fp), 0);
+    ASSERT_EQ(cbm_unlink(src_path), 0);
+    ASSERT_EQ(symlink(outside_path, src_path), 0);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "OUTSIDE_SECRET"));
+    ASSERT_NOT_NULL(strstr(resp, "\"source_state\":\"range_unavailable\""));
+
+    free(resp);
+    ASSERT_EQ(cbm_unlink(outside_path), 0);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+#endif
+}
+
+TEST(search_code_symlink_candidate_never_returns_outside_bytes) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink fixture; Windows HANDLE containment is covered separately");
+#else
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    char outside_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    snprintf(outside_path, sizeof(outside_path), "%s/outside.go", tmp);
+    FILE *fp = fopen(outside_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_TRUE(fputs("OUTSIDE_SEARCH_SECRET\n", fp) >= 0);
+    ASSERT_EQ(fclose(fp), 0);
+    ASSERT_EQ(cbm_unlink(src_path), 0);
+    ASSERT_EQ(symlink(outside_path, src_path), 0);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_code",
+        "{\"pattern\":\"OUTSIDE_SEARCH_SECRET\",\"project\":\"test-project\","
+        "\"format\":\"json\",\"mode\":\"full\"}");
+    ASSERT_NOT_NULL(raw);
+    char *resp = extract_text_content(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "OUTSIDE_SEARCH_SECRET"));
+
+    free(resp);
+    free(raw);
+    ASSERT_EQ(cbm_unlink(outside_path), 0);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+#endif
+}
+
+TEST(snippet_empty_file_has_no_available_range) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    FILE *fp = fopen(src_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(fclose(fp), 0);
+    struct stat current;
+    ASSERT_EQ(stat(src_path, &current), 0);
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    ASSERT_EQ(cbm_sha256_file_hex(src_path, digest), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(cbm_mcp_server_store(srv), "test-project", "main.go",
+                                         digest, snippet_test_mtime_ns(&current), current.st_size),
+              CBM_STORE_OK);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"source_state\":\"range_unavailable\""));
+    ASSERT_NULL(strstr(resp, "\"source_state\":\"current\""));
+
     free(resp);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
@@ -4434,6 +4692,70 @@ static bool issue704_make_db(const char *dir, const char *filename, const char *
     }
     cbm_store_close(st);
     return ok;
+}
+
+TEST(mcp_cache_enumeration_errors_fail_closed) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-direrr-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(cache)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    ASSERT_TRUE(issue704_make_db(cache, "drifted.db", "inside-name", "OnlyIfScanCompletes"));
+
+    /* collect_db_project_names: an error must not be reported as an empty,
+     * successfully enumerated registry. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_dir_set_test_fail_after(0);
+    char *missing = cbm_mcp_handle_tool(srv, "search_code", "{\"pattern\":\"x\"}");
+    cbm_dir_set_test_fail_after(-1);
+    ASSERT_NOT_NULL(missing);
+    ASSERT_NOT_NULL(strstr(missing, "project_list_unavailable"));
+    free(missing);
+    cbm_mcp_server_free(srv);
+
+    /* list_projects: discard the partial JSON array and return an explicit
+     * tool error. */
+    srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_dir_set_test_fail_after(0);
+    char *listed = cbm_mcp_handle_tool(srv, "list_projects", "{}");
+    cbm_dir_set_test_fail_after(-1);
+    ASSERT_NOT_NULL(listed);
+    ASSERT_NOT_NULL(strstr(listed, "cannot fully enumerate cache directory"));
+    ASSERT_NOT_NULL(strstr(listed, "\"isError\":true"));
+    free(listed);
+    cbm_mcp_server_free(srv);
+
+    /* resolve_store_fallback_scan: a drifted filename normally resolves by
+     * internal name, but a partial scan must never adopt a result. */
+    srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_dir_set_test_fail_after(0);
+    char *query = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"inside-name\",\"name_pattern\":\"OnlyIfScanCompletes\"}");
+    cbm_dir_set_test_fail_after(-1);
+    ASSERT_NOT_NULL(query);
+    ASSERT_NULL(strstr(query, "OnlyIfScanCompletes"));
+    ASSERT_NOT_NULL(strstr(query, "\"isError\":true"));
+    free(query);
+    cbm_mcp_server_free(srv);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/drifted.db", cache);
+    cbm_unlink(db_path);
+    snprintf(db_path, sizeof(db_path), "%s/drifted.db-wal", cache);
+    cbm_unlink(db_path);
+    snprintf(db_path, sizeof(db_path), "%s/drifted.db-shm", cache);
+    cbm_unlink(db_path);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    ASSERT_EQ(cbm_rmdir(cache), 0);
+    PASS();
 }
 
 TEST(tool_resolve_store_by_internal_name_issue704) {
@@ -5990,7 +6312,7 @@ extern bool cbm_path_within_root(const char *root_path, const char *abs_path);
 
 TEST(mcp_path_within_root_rejects_escape) {
 #ifdef _WIN32
-    SKIP_PLATFORM("POSIX realpath repro; the Windows _fullpath branch is the same guard");
+    SKIP_PLATFORM("POSIX fixture; Windows uses a final-path handle for the same guard");
 #else
     char root[512];
     snprintf(root, sizeof(root), "%s/cbm_pwr_XXXXXX", cbm_tmpdir());
@@ -6010,6 +6332,7 @@ TEST(mcp_path_within_root_rejects_escape) {
     char escape[900];
     snprintf(escape, sizeof(escape), "%s/../../../../etc/hosts", root);
     ASSERT_TRUE(cbm_path_within_root(root, inside));
+    ASSERT_TRUE(cbm_path_within_root("/", inside));
     ASSERT_FALSE(cbm_path_within_root(root, escape));
     ASSERT_FALSE(cbm_path_within_root(root, "/etc/hosts"));
 
@@ -6150,6 +6473,23 @@ TEST(global_memory_tool_schemas_are_registered) {
     ASSERT_NOT_NULL(strstr(query_schema, "\"impact\""));
     ASSERT_NOT_NULL(strstr(query_schema, "\"reversible\""));
     ASSERT_NOT_NULL(strstr(query_schema, "\"valid_at\""));
+    const char *commit_schema = cbm_mcp_tool_input_schema("memory_commit");
+    ASSERT_NOT_NULL(commit_schema);
+    ASSERT_NOT_NULL(strstr(commit_schema, "\"user_approved\""));
+    ASSERT_NOT_NULL(strstr(commit_schema, "\"required\":[\"proposal_id\",\"operation_id\","
+                                          "\"user_approved\"]"));
+    const char *lint_schema = cbm_mcp_tool_input_schema("memory_lint");
+    ASSERT_NOT_NULL(lint_schema);
+    ASSERT_NULL(strstr(lint_schema, "\"apply\""));
+    const char *export_schema = cbm_mcp_tool_input_schema("memory_export");
+    ASSERT_NOT_NULL(export_schema);
+    ASSERT_NOT_NULL(strstr(export_schema, "\"allow_external_path\""));
+    ASSERT_NOT_NULL(strstr(export_schema, "\"overwrite\""));
+    ASSERT_NOT_NULL(strstr(export_schema, "\"user_approved\""));
+    const char *import_schema = cbm_mcp_tool_input_schema("memory_import");
+    ASSERT_NOT_NULL(import_schema);
+    ASSERT_NOT_NULL(strstr(import_schema, "\"allow_external_path\""));
+    ASSERT_NOT_NULL(strstr(import_schema, "\"user_approved\""));
     PASS();
 }
 
@@ -6347,10 +6687,18 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(snippet_stale_worktree_is_explicit);
+    RUN_TEST(snippet_hash_detects_same_metadata_edit);
+    RUN_TEST(snippet_shortened_file_is_stale_not_missing);
+    RUN_TEST(snippet_oversized_freshness_check_is_bounded);
+    RUN_TEST(snippet_nonregular_replacement_fails_closed_without_blocking);
+    RUN_TEST(snippet_symlink_replacement_never_returns_outside_bytes);
+    RUN_TEST(search_code_symlink_candidate_never_returns_outside_bytes);
+    RUN_TEST(snippet_empty_file_has_no_available_range);
     RUN_TEST(snippet_missing_worktree_is_not_current);
     RUN_TEST(snippet_long_physical_lines_are_counted_once_and_bounded);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
+    RUN_TEST(mcp_cache_enumeration_errors_fail_closed);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
     RUN_TEST(active_store_refresh_waits_for_completed_snapshot);
 
