@@ -748,6 +748,165 @@ static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
     acc->count++;
 }
 
+static void cbm_error_regions_push_lines(cbm_error_regions_t *acc, uint32_t start, uint32_t end) {
+    if (!acc || start == 0 || end < start) {
+        return;
+    }
+    for (int i = 0; i < acc->count; i++) {
+        if (end + 1 < acc->starts[i] || start > acc->ends[i] + 1) {
+            continue;
+        }
+        if (start < acc->starts[i]) {
+            acc->starts[i] = start;
+        }
+        if (end > acc->ends[i]) {
+            acc->ends[i] = end;
+        }
+        return;
+    }
+    if (acc->count >= CBM_MAX_ERROR_REGIONS) {
+        return;
+    }
+    acc->starts[acc->count] = start;
+    acc->ends[acc->count] = end;
+    acc->count++;
+}
+
+typedef enum {
+    CBM_PP_NONE = 0,
+    CBM_PP_IF,
+    CBM_PP_BRANCH,
+    CBM_PP_END,
+} cbm_pp_directive_t;
+
+static bool cbm_pp_word(const char *start, const char *end, const char *word) {
+    size_t length = strlen(word);
+    return (size_t)(end - start) >= length && strncmp(start, word, length) == 0 &&
+           (start + length == end || start[length] == ' ' || start[length] == '\t');
+}
+
+static cbm_pp_directive_t cbm_pp_directive(const char *start, const char *end) {
+    while (start < end && (*start == ' ' || *start == '\t')) {
+        start++;
+    }
+    if (start == end || *start != '#') {
+        return CBM_PP_NONE;
+    }
+    start++;
+    while (start < end && (*start == ' ' || *start == '\t')) {
+        start++;
+    }
+    if (cbm_pp_word(start, end, "if") || cbm_pp_word(start, end, "ifdef") ||
+        cbm_pp_word(start, end, "ifndef")) {
+        return CBM_PP_IF;
+    }
+    if (cbm_pp_word(start, end, "else") || cbm_pp_word(start, end, "elif")) {
+        return CBM_PP_BRANCH;
+    }
+    return cbm_pp_word(start, end, "endif") ? CBM_PP_END : CBM_PP_NONE;
+}
+
+/* Count braces outside strings and comments. Preprocessor branches that each
+ * open (or close) syntax completed after #endif are valid after preprocessing
+ * but can look balanced to tree-sitter while still swallowing an enclosing
+ * function definition. Record those ranges as best-effort misses even when
+ * the parse tree itself does not expose an ERROR node. */
+static int cbm_c_line_brace_delta(const char *start, const char *end, bool *in_block_comment) {
+    int delta = 0;
+    char quote = '\0';
+    bool escaped = false;
+    for (const char *p = start; p < end; p++) {
+        if (*in_block_comment) {
+            if (*p == '*' && p + 1 < end && p[1] == '/') {
+                *in_block_comment = false;
+                p++;
+            }
+            continue;
+        }
+        if (quote) {
+            if (escaped) {
+                escaped = false;
+            } else if (*p == '\\') {
+                escaped = true;
+            } else if (*p == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+        if (*p == '/' && p + 1 < end && p[1] == '/') {
+            break;
+        }
+        if (*p == '/' && p + 1 < end && p[1] == '*') {
+            *in_block_comment = true;
+            p++;
+            continue;
+        }
+        if (*p == '\'' || *p == '"') {
+            quote = *p;
+        } else if (*p == '{') {
+            delta++;
+        } else if (*p == '}') {
+            delta--;
+        }
+    }
+    return delta;
+}
+
+static void cbm_collect_c_preprocessor_hazards(const char *source, int source_len,
+                                               cbm_error_regions_t *acc) {
+    enum { PP_STACK_MAX = 64 };
+    typedef struct {
+        uint32_t start_line;
+        int branch_delta;
+        bool hazard;
+    } pp_frame_t;
+    pp_frame_t stack[PP_STACK_MAX];
+    int depth = 0;
+    uint32_t line = 1;
+    bool in_block_comment = false;
+    const char *cursor = source;
+    const char *limit = source + source_len;
+    while (cursor < limit) {
+        const char *end = memchr(cursor, '\n', (size_t)(limit - cursor));
+        if (!end) {
+            end = limit;
+        }
+        cbm_pp_directive_t directive =
+            in_block_comment ? CBM_PP_NONE : cbm_pp_directive(cursor, end);
+        if (directive == CBM_PP_IF) {
+            if (depth < PP_STACK_MAX) {
+                stack[depth++] = (pp_frame_t){line, 0, false};
+            }
+        } else if (directive == CBM_PP_BRANCH && depth > 0) {
+            pp_frame_t *frame = &stack[depth - 1];
+            frame->hazard |= frame->branch_delta != 0;
+            frame->branch_delta = 0;
+        } else if (directive == CBM_PP_END && depth > 0) {
+            pp_frame_t frame = stack[--depth];
+            frame.hazard |= frame.branch_delta != 0;
+            if (frame.hazard) {
+                cbm_error_regions_push_lines(acc, frame.start_line, line);
+            }
+        } else {
+            int delta = cbm_c_line_brace_delta(cursor, end, &in_block_comment);
+            if (depth > 0) {
+                stack[depth - 1].branch_delta += delta;
+            }
+        }
+        if (end == limit) {
+            break;
+        }
+        cursor = end + 1;
+        line++;
+    }
+    while (depth > 0) {
+        pp_frame_t frame = stack[--depth];
+        if (frame.hazard || frame.branch_delta != 0) {
+            cbm_error_regions_push_lines(acc, frame.start_line, line);
+        }
+    }
+}
+
 static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc) {
     if (acc->count >= CBM_MAX_ERROR_REGIONS) {
         return;
@@ -1215,12 +1374,18 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
      * subtracted first — a region fully re-extracted as definitions is not a
      * miss, and a fully recovered file is not flagged at all. Detection aid
      * only: the absence of this flag is NOT a completeness guarantee. */
-    if (ts_node_has_error(root)) {
+    {
         cbm_error_regions_t regs = {{0}, {0}, 0};
-        if (strcmp(ts_node_type(root), "ERROR") == 0) {
-            cbm_error_regions_push(&regs, root); /* whole file unparseable */
-        } else {
-            cbm_collect_error_regions(root, &regs);
+        if (ts_node_has_error(root)) {
+            if (strcmp(ts_node_type(root), "ERROR") == 0) {
+                cbm_error_regions_push(&regs, root); /* whole file unparseable */
+            } else {
+                cbm_collect_error_regions(root, &regs);
+            }
+        }
+        if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_OBJC ||
+            language == CBM_LANG_CUDA) {
+            cbm_collect_c_preprocessor_hazards(source, source_len, &regs);
         }
         cbm_subtract_recovered_regions(&regs, &result->defs);
         if (regs.count > 0) {

@@ -599,11 +599,16 @@ static void handle_process_kill(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     int target_pid = (int)yyjson_get_int(v_pid);
     yyjson_doc_free(doc);
 
+    /* Keep the conditional compilation outside the `if` expression. Raw C
+     * parsers see every preprocessor branch at once; splitting one control
+     * statement across branches makes the file syntactically unbalanced and
+     * can hide this security-sensitive handler from the code graph. */
 #ifdef _WIN32
-    if (target_pid == (int)_getpid()) {
+    int self_pid = (int)_getpid();
 #else
-    if (target_pid == (int)getpid()) {
+    int self_pid = (int)getpid();
 #endif
+    if (target_pid == self_pid) {
         cbm_http_replyf(c, 400, g_cors_json,
                         "{\"error\":\"cannot kill self (use the UI server's own shutdown)\"}");
         return;
