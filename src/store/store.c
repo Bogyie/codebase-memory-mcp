@@ -57,6 +57,7 @@ enum {
     ST_METHOD_PROP_LEN = 8,
     ST_PATH_PROP_LEN = 6,
     ST_HANDLER_PROP_LEN = 9,
+    ST_BACKUP_BUSY_RETRIES = 5000,
 };
 
 #define SLEN(s) (sizeof(s) - 1)
@@ -1077,16 +1078,16 @@ int cbm_store_checkpoint(cbm_store_t *s) {
 
 /* ── Dump ───────────────────────────────────────────────────────── */
 
-/* Dump entire in-memory database to a file via sqlite3_backup.
- * Writes to a temp file first, then atomically renames for crash safety.
- * sqlite3_backup_step(-1) copies ALL B-tree pages in one call —
- * the file on disk is an exact replica of the in-memory page layout. */
-int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
-    if (!s || !dest_path) {
+/* Publish a store through SQLite's backup transaction. The destination is
+ * updated atomically at commit without replacing its pathname or unlinking
+ * WAL/SHM files that may still belong to active readers. */
+static int store_install_snapshot_db(cbm_store_t *owner, sqlite3 *source_db,
+                                     const char *dest_path) {
+    if (!source_db || !dest_path || !dest_path[0]) {
         return CBM_STORE_ERR;
     }
 
-    /* Ensure parent directory exists */
+    /* Ensure parent directory exists. */
     char dir[CBM_SZ_1K];
     snprintf(dir, sizeof(dir), "%s", dest_path);
     char *sl = strrchr(dir, '/');
@@ -1095,52 +1096,95 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
         (void)cbm_mkdir(dir);
     }
 
-    /* Write to temp file for atomic swap */
-    char tmp_path[CBM_SZ_1K];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dest_path);
-    (void)unlink(tmp_path);
-
     sqlite3 *dest_db = NULL;
-    int rc = sqlite3_open(tmp_path, &dest_db);
+    bool dest_existed = access(dest_path, F_OK) == 0;
+    int rc = sqlite3_open_v2(dest_path, &dest_db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             NULL);
     if (rc != SQLITE_OK) {
-        store_set_error(s, "dump: cannot open temp file");
+        if (owner) {
+            store_set_error(owner, "snapshot install: cannot open destination");
+        }
+        if (dest_db) {
+            sqlite3_close(dest_db);
+        }
         return CBM_STORE_ERR;
     }
+    (void)sqlite3_busy_timeout(dest_db, ST_BACKUP_BUSY_RETRIES);
 
-    sqlite3_backup *bk = sqlite3_backup_init(dest_db, "main", s->db, "main");
+    sqlite3_backup *bk = sqlite3_backup_init(dest_db, "main", source_db, "main");
     if (!bk) {
-        store_set_error(s, "dump: backup init failed");
+        if (owner) {
+            store_set_error(owner, "snapshot install: backup init failed");
+        }
         sqlite3_close(dest_db);
-        (void)unlink(tmp_path);
+        if (!dest_existed) {
+            (void)unlink(dest_path);
+            cbm_remove_db_sidecars(dest_path);
+        }
         return CBM_STORE_ERR;
     }
 
-    rc = sqlite3_backup_step(bk, CBM_NOT_FOUND); /* copy ALL pages in one shot */
-    sqlite3_backup_finish(bk);
+    for (int attempt = 0; attempt <= ST_BACKUP_BUSY_RETRIES; attempt++) {
+        rc = sqlite3_backup_step(bk, CBM_NOT_FOUND); /* copy ALL pages in one shot */
+        if (rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
+            break;
+        }
+        cbm_usleep(ST_RETRY_WAIT_US);
+    }
+    int finish_rc = sqlite3_backup_finish(bk);
 
-    if (rc != SQLITE_DONE) {
-        store_set_error(s, "dump: backup step failed");
+    if (rc != SQLITE_DONE || finish_rc != SQLITE_OK) {
+        if (owner) {
+            store_set_error(owner, "snapshot install: backup transaction failed");
+        }
         sqlite3_close(dest_db);
-        (void)unlink(tmp_path);
+        if (!dest_existed) {
+            (void)unlink(dest_path);
+            cbm_remove_db_sidecars(dest_path);
+        }
         return CBM_STORE_ERR;
     }
 
-    /* Enable WAL on the dumped file so readers can connect concurrently */
-    sqlite3_exec(dest_db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
+    /* New destinations start in SQLite's default rollback mode. Switch them
+     * to WAL only after the backup commit. Existing graph stores are already
+     * WAL-backed, so this is a no-op that does not invalidate live readers. */
+    if (sqlite3_exec(dest_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL) != SQLITE_OK) {
+        if (owner) {
+            store_set_error(owner, "snapshot install: cannot enable WAL");
+        }
+        sqlite3_close(dest_db);
+        return CBM_STORE_ERR;
+    }
     sqlite3_close(dest_db);
 
-    /* Remove the DESTINATION's leftover sidecars before installing: a
-     * stale WAL from a crashed session would be replayed on top of the
-     * fresh file at the next open — SQLite validates the WAL against its
-     * own header/checksums, not against the main file (#897). */
-    cbm_remove_db_sidecars(dest_path);
-    if (cbm_rename_replace(tmp_path, dest_path) != 0) {
-        store_set_error(s, "dump: rename failed");
-        (void)unlink(tmp_path);
+    return CBM_STORE_OK;
+}
+
+int cbm_store_install_snapshot_file(const char *source_path, const char *dest_path) {
+    if (!source_path || !source_path[0] || !dest_path || !dest_path[0] ||
+        strcmp(source_path, dest_path) == 0) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3 *source_db = NULL;
+    if (sqlite3_open_v2(source_path, &source_db,
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
+        if (source_db) {
+            sqlite3_close(source_db);
+        }
+        return CBM_STORE_ERR;
+    }
+    int rc = store_install_snapshot_db(NULL, source_db, dest_path);
+    sqlite3_close(source_db);
+    return rc;
+}
+
+int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
+    if (!s || !dest_path) {
         return CBM_STORE_ERR;
     }
 
-    return CBM_STORE_OK;
+    return store_install_snapshot_db(s, s->db, dest_path);
 }
 
 /* ── Project CRUD ───────────────────────────────────────────────── */

@@ -117,12 +117,11 @@ TEST(index_snapshot_generation_is_published_explicitly) {
 }
 
 
-/* #897: any code path installing a fresh DB file must delete the
- * destination's -wal/-shm first. SQLite decides whether to replay a WAL
- * purely from the sidecar's own header/checksums — a leftover WAL from a
- * crashed previous session is recovered ON TOP of the freshly installed
- * file at the next open, splicing old-generation pages into it (short
- * indexes, btreeInitPage failures, or resurrected stale rows).
+/* #897: any code path installing a fresh snapshot must consume or supersede
+ * the destination's WAL through SQLite rather than replacing the main file
+ * underneath it. SQLite decides whether to replay a WAL from its own
+ * header/checksums, so pathname-only replacement can splice old-generation
+ * pages into the new main file.
  *
  * Repro (per the issue): hot-copy a live WAL aside, close cleanly, restore
  * the copy as the crashed-session leftover, install a fresh generation via
@@ -225,8 +224,79 @@ TEST(dump_install_ignores_stale_wal_sidecar) {
     PASS();
 }
 
+TEST(snapshot_install_is_atomic_for_live_reader) {
+    char *td = th_mktempdir("cbm_live_snapshot");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/live.db", td);
+
+    cbm_store_t *old = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(old);
+    ASSERT_EQ(cbm_store_upsert_project(old, "live", "/tmp/live"), CBM_STORE_OK);
+    cbm_node_t stale = {.project = "live",
+                        .label = "Function",
+                        .name = "old_snapshot",
+                        .qualified_name = "live.mod.old_snapshot",
+                        .file_path = "mod.c",
+                        .start_line = 1,
+                        .end_line = 2};
+    ASSERT_TRUE(cbm_store_upsert_node(old, &stale) > 0);
+    cbm_store_close(old);
+
+    cbm_store_t *reader = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(reader);
+    ASSERT_EQ(cbm_store_exec(reader, "BEGIN;"), CBM_STORE_OK);
+    cbm_node_t *hits = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(reader, "live", "old_snapshot", &hits, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    cbm_store_free_nodes(hits, count);
+
+    cbm_store_t *fresh = cbm_store_open_memory();
+    ASSERT_NOT_NULL(fresh);
+    ASSERT_EQ(cbm_store_upsert_project(fresh, "live", "/tmp/live"), CBM_STORE_OK);
+    cbm_node_t replacement = {.project = "live",
+                              .label = "Function",
+                              .name = "new_snapshot",
+                              .qualified_name = "live.mod.new_snapshot",
+                              .file_path = "mod.c",
+                              .start_line = 1,
+                              .end_line = 2};
+    ASSERT_TRUE(cbm_store_upsert_node(fresh, &replacement) > 0);
+
+    /* Publishing must succeed without deleting sidecars or invalidating the
+     * reader's already-open transaction. */
+    ASSERT_EQ(cbm_store_dump_to_file(fresh, db_path), CBM_STORE_OK);
+    hits = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(reader, "live", "old_snapshot", &hits, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    cbm_store_free_nodes(hits, count);
+
+    ASSERT_EQ(cbm_store_exec(reader, "COMMIT;"), CBM_STORE_OK);
+    hits = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(reader, "live", "new_snapshot", &hits, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    cbm_store_free_nodes(hits, count);
+    hits = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(reader, "live", "old_snapshot", &hits, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_nodes(hits, count);
+
+    cbm_store_close(fresh);
+    cbm_store_close(reader);
+    th_rmtree(td);
+    PASS();
+}
+
 SUITE(store_checkpoint) {
     RUN_TEST(checkpoint_does_not_truncate_wal);
     RUN_TEST(index_snapshot_generation_is_published_explicitly);
     RUN_TEST(dump_install_ignores_stale_wal_sidecar);
+    RUN_TEST(snapshot_install_is_atomic_for_live_reader);
 }

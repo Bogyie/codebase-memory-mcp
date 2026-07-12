@@ -277,6 +277,13 @@ int64_t cbm_store_resolve_mmap_size(void);
 /* Dump in-memory database to a file. */
 int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path);
 
+/* Atomically publish a completed file-backed snapshot into dest_path using
+ * SQLite's backup transaction. Unlike pathname replacement, this is safe
+ * while other processes keep read-only connections to dest_path open: their
+ * current read transaction keeps the old snapshot and the next transaction
+ * observes the newly committed generation. */
+int cbm_store_install_snapshot_file(const char *source_path, const char *dest_path);
+
 /* ── Project CRUD ───────────────────────────────────────────────── */
 
 int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path);

@@ -716,14 +716,14 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         cbm_store_close(hash_store);
     }
 
-    cbm_remove_db_sidecars(staged_path);
-    cbm_remove_db_sidecars(db_path);
-    if (cbm_rename_replace(staged_path, db_path) != 0) {
+    if (cbm_store_install_snapshot_file(staged_path, db_path) != CBM_STORE_OK) {
         cbm_log_error("incremental.err", "msg", "install_snapshot", "project", project);
         cbm_unlink(staged_path);
         cbm_remove_db_sidecars(staged_path);
         return CBM_STORE_ERR;
     }
+    cbm_unlink(staged_path);
+    cbm_remove_db_sidecars(staged_path);
 
     /* Auto-update artifact if one already exists (persistence was enabled previously) */
     if (repo_path && cbm_artifact_exists(repo_path)) {

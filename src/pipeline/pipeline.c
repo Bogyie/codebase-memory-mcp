@@ -1257,9 +1257,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         }
 
         cbm_store_close(hash_store);
-        cbm_remove_db_sidecars(staged_path);
-        cbm_remove_db_sidecars(db_path);
-        if (cbm_rename_replace(staged_path, db_path) != 0) {
+        if (cbm_store_install_snapshot_file(staged_path, db_path) != CBM_STORE_OK) {
             cbm_log_error("pipeline.err", "phase", "install_snapshot", "project",
                           p->project_name);
             cbm_unlink(staged_path);
@@ -1268,6 +1266,8 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
             p->saved_adr = NULL;
             return CBM_STORE_ERR;
         }
+        cbm_unlink(staged_path);
+        cbm_remove_db_sidecars(staged_path);
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
     } else {
         cbm_log_error("pipeline.err", "phase", "reopen_persisted_db", "project",
