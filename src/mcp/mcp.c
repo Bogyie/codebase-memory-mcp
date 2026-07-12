@@ -5294,12 +5294,56 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
                                          yyjson_mut_val *root, const char *project_name,
                                          const char *repo_path, bool persistence, cbm_pipeline_t *p,
                                          char **excluded_dirs, int excluded_count,
-                                         const cbm_file_error_t *file_errors, int file_error_count,
-                                         const char *logfile) {
+                                         const cbm_file_error_t *file_errors,
+                                         int file_error_count) {
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
-    add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
-    add_parse_partial_summary(doc, root, file_errors, file_error_count);
     add_not_indexed_files_summary(doc, root, p);
+
+    /* Incremental runs only re-extract changed files, so p->file_errors is a
+     * per-run delta.  Reporting that delta made a no-change reindex claim zero
+     * parse misses even though index_status correctly retained the persisted
+     * coverage for unchanged files.  Build the response and its logfile from
+     * the installed snapshot's authoritative coverage rows when available. */
+    cbm_store_t *store = resolve_store(srv, project_name);
+    cbm_coverage_row_t *coverage_rows = NULL;
+    cbm_file_error_t *persisted_errors = NULL;
+    const cbm_file_error_t *reported_errors = file_errors;
+    int coverage_count = 0;
+    int reported_error_count = file_error_count;
+    if (store && cbm_store_coverage_get(store, project_name, &coverage_rows, &coverage_count) ==
+                     CBM_STORE_OK) {
+        if (coverage_count == 0) {
+            reported_errors = NULL;
+            reported_error_count = 0;
+        } else if ((size_t)coverage_count <= SIZE_MAX / sizeof(*persisted_errors)) {
+            persisted_errors =
+                (cbm_file_error_t *)malloc((size_t)coverage_count * sizeof(*persisted_errors));
+            if (persisted_errors) {
+                int n = 0;
+                for (int i = 0; i < coverage_count; i++) {
+                    const char *kind = coverage_rows[i].kind ? coverage_rows[i].kind : "";
+                    if (strncmp(kind, "not_indexed", 11) == 0) {
+                        continue;
+                    }
+                    persisted_errors[n].path = (char *)coverage_rows[i].rel_path;
+                    persisted_errors[n].reason = (char *)coverage_rows[i].detail;
+                    persisted_errors[n].phase = (char *)coverage_rows[i].kind;
+                    n++;
+                }
+                reported_errors = persisted_errors;
+                reported_error_count = n;
+            }
+        }
+    }
+    char logfile_path[CBM_SZ_1K];
+    logfile_path[0] = '\0';
+    bool has_logfile = write_skip_logfile(project_name, reported_errors, reported_error_count,
+                                          logfile_path, sizeof(logfile_path));
+    add_skipped_summary(doc, root, reported_errors, reported_error_count,
+                        has_logfile ? logfile_path : NULL);
+    add_parse_partial_summary(doc, root, reported_errors, reported_error_count);
+    free(persisted_errors);
+    cbm_store_free_coverage(coverage_rows, coverage_count);
 
     int exp_nodes = -1;
     int exp_edges = -1;
@@ -5308,7 +5352,6 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     const double ratio = cbm_dump_verify_min_ratio();
     const int min_floor = CBM_DUMP_VERIFY_MIN_FLOOR;
 
-    cbm_store_t *store = resolve_store(srv, project_name);
     int nodes = 0;
     int edges = 0;
     bool degraded = false;
@@ -5936,15 +5979,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
 
     if (rc == 0) {
-        /* Write the per-run logfile ONLY when there were skips (no logfile on a
-         * clean run). The FULL list goes to the file; the JSON caps at 50. */
-        char logfile_path[CBM_SZ_1K];
-        logfile_path[0] = '\0';
-        bool has_logfile = write_skip_logfile(project_name, file_errors, file_error_count,
-                                              logfile_path, sizeof(logfile_path));
-        bool degraded = build_index_success_response(
-            srv, doc, root, project_name, repo_path, persistence, p, excluded_dirs, excluded_count,
-            file_errors, file_error_count, has_logfile ? logfile_path : NULL);
+        bool degraded = build_index_success_response(srv, doc, root, project_name, repo_path,
+                                                     persistence, p, excluded_dirs, excluded_count,
+                                                     file_errors, file_error_count);
         yyjson_mut_obj_add_str(doc, root, "status", degraded ? "degraded" : "indexed");
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
