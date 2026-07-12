@@ -19,6 +19,10 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+extern bool cbm_watcher_build_db_paths_for_test(const char *cache_dir, const char *project_name,
+                                                char *path, size_t path_size, char *wal,
+                                                size_t wal_size, char *shm, size_t shm_size);
+
 /* Portable git: `git -C "<dir>" <args>` with identity + non-interactive
  * config injected via -c, so it needs no global config and no POSIX shell
  * (runs under cmd.exe on Windows). Returns the git exit status. */
@@ -347,6 +351,19 @@ TEST(watcher_prunes_sustained_missing_root) {
     cbm_watcher_free(w);
     cbm_store_close(store);
     prune_fixture_teardown(&f);
+    PASS();
+}
+
+TEST(watcher_rejects_truncated_database_sidecar_paths) {
+    char cache[1024];
+    memset(cache, 'c', sizeof(cache) - 1U);
+    cache[0] = '/';
+    cache[sizeof(cache) - 1U] = '\0';
+    char db[1024] = "unchanged-db";
+    char wal[1024] = "unchanged-wal";
+    char shm[1024] = "unchanged-shm";
+    ASSERT_FALSE(cbm_watcher_build_db_paths_for_test(cache, "stale-project", db, sizeof(db), wal,
+                                                     sizeof(wal), shm, sizeof(shm)));
     PASS();
 }
 
@@ -2195,6 +2212,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_poll_no_projects);
     RUN_TEST(watcher_poll_nonexistent_path);
     RUN_TEST(watcher_prunes_sustained_missing_root);
+    RUN_TEST(watcher_rejects_truncated_database_sidecar_paths);
     RUN_TEST(watcher_grace_window_blocks_prune);
     RUN_TEST(watcher_root_missing_errno_classification);
     RUN_TEST(watcher_root_restore_resets_prune_streak);

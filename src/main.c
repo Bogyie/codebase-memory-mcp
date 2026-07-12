@@ -782,11 +782,13 @@ int main(int argc, char **argv) {
 
     /* Open config store for runtime settings */
     char config_dir[CBM_SZ_1K];
-    const char *cfg_home = cbm_get_home_dir();
     cbm_config_t *runtime_config = NULL;
-    if (cfg_home) {
-        snprintf(config_dir, sizeof(config_dir), "%s", cbm_resolve_cache_dir());
+    const char *cache_dir = cbm_resolve_cache_dir();
+    int config_dir_len = cache_dir ? snprintf(config_dir, sizeof(config_dir), "%s", cache_dir) : -1;
+    if (config_dir_len > 0 && config_dir_len < (int)sizeof(config_dir)) {
         runtime_config = cbm_config_open(config_dir);
+    } else {
+        cbm_log_warn("config.cache_dir_unavailable");
     }
 
     /* Create MCP server */

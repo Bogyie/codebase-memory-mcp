@@ -13,11 +13,13 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
+#include <git/git_context.h>
 #include <mcp/index_supervisor.h> /* spawn-count hook — #845 in-process guard */
 #include <mcp/mcp.h>
 #include <pipeline/pipeline.h>
 #include <store/store.h>
 #include <watcher/watcher.h>
+#include <cbm.h>
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
@@ -34,6 +36,8 @@
 #define cbm_chdir chdir
 #define cbm_getcwd getcwd
 #endif
+
+extern int cbm_mcp_fetch_update_for_test(char **out_response, size_t *out_len);
 
 static char mcp_log_buf[4096];
 
@@ -1188,10 +1192,9 @@ TEST(tool_search_graph_bm25_soft_source_first_ranking) {
               CBM_STORE_OK);
 
     char *resp = cbm_mcp_server_handle(
-        srv,
-        "{\"jsonrpc\":\"2.0\",\"id\":553,\"method\":\"tools/call\",\"params\":{"
-        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"bm25-source-first\","
-        "\"query\":\"hydrate cache\",\"limit\":10}}}");
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":553,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"search_graph\",\"arguments\":{\"project\":\"bm25-source-first\","
+             "\"query\":\"hydrate cache\",\"limit\":10}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -1210,10 +1213,9 @@ TEST(tool_search_graph_bm25_soft_source_first_ranking) {
     free(resp);
 
     resp = cbm_mcp_server_handle(
-        srv,
-        "{\"jsonrpc\":\"2.0\",\"id\":554,\"method\":\"tools/call\",\"params\":{"
-        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"bm25-source-first\","
-        "\"query\":\"sentinel gamma\",\"limit\":10}}}");
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":554,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"search_graph\",\"arguments\":{\"project\":\"bm25-source-first\","
+             "\"query\":\"sentinel gamma\",\"limit\":10}}}");
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -1249,11 +1251,10 @@ TEST(tool_search_graph_filters_dotted_config_path) {
     ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
 
     char *resp = cbm_mcp_server_handle(
-        srv,
-        "{\"jsonrpc\":\"2.0\",\"id\":555,\"method\":\"tools/call\",\"params\":{"
-        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"config-path-search\","
-        "\"config_path\":\"services\\\\.api\\\\.timeout\","
-        "\"fields\":[\"config_path\"],\"limit\":10}}}");
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":555,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"search_graph\",\"arguments\":{\"project\":\"config-path-search\","
+             "\"config_path\":\"services\\\\.api\\\\.timeout\","
+             "\"fields\":[\"config_path\"],\"limit\":10}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -2573,6 +2574,141 @@ TEST(search_code_ampersand_accepted_issue272) {
     PASS();
 }
 
+TEST(search_code_reports_index_scope_and_match_cap) {
+    char root[512];
+    snprintf(root, sizeof(root), "%s/cbm-search-cap-XXXXXX", cbm_tmpdir());
+    bool setup_ok = cbm_mkdtemp(root) != NULL;
+    char source_path[1024];
+    snprintf(source_path, sizeof(source_path), "%s/capped.c", root);
+    FILE *source = setup_ok ? fopen(source_path, "wb") : NULL;
+    setup_ok = setup_ok && source != NULL;
+    for (int i = 0; setup_ok && i < 501; i++) {
+        setup_ok = fprintf(source, "CAP_MATCH_%03d\n", i) > 0;
+    }
+    if (source) {
+        setup_ok = fclose(source) == 0 && setup_ok;
+    }
+
+    cbm_mcp_server_t *srv = setup_ok ? cbm_mcp_server_new(NULL) : NULL;
+    cbm_store_t *store = srv ? cbm_mcp_server_store(srv) : NULL;
+    setup_ok = setup_ok && store && cbm_store_upsert_project(store, "search-cap", root) == 0;
+    if (setup_ok) {
+        cbm_mcp_server_set_project(srv, "search-cap");
+    }
+    cbm_node_t node = {.project = "search-cap",
+                       .label = "Function",
+                       .name = "Capped",
+                       .qualified_name = "search-cap.Capped",
+                       .file_path = "capped.c",
+                       .start_line = 1,
+                       .end_line = 501};
+    setup_ok = setup_ok && cbm_store_upsert_node(store, &node) > 0;
+    char *raw = setup_ok
+                    ? cbm_mcp_handle_tool(srv, "search_code",
+                                          "{\"pattern\":\"CAP_MATCH_\",\"project\":\"search-cap\","
+                                          "\"format\":\"json\"}")
+                    : NULL;
+    char *inner = raw ? extract_text_content(raw) : NULL;
+
+    cbm_mcp_server_free(srv);
+    free(raw);
+    cbm_unlink(source_path);
+    cbm_rmdir(root);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":500"));
+    ASSERT_NOT_NULL(strstr(inner, "\"scan_truncated\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "partial scan: truncated=true"));
+    free(inner);
+    PASS();
+}
+
+TEST(search_code_no_indexed_files_never_falls_back_to_recursive_scan) {
+    char root[512];
+    snprintf(root, sizeof(root), "%s/cbm-search-empty-XXXXXX", cbm_tmpdir());
+    bool setup_ok = cbm_mkdtemp(root) != NULL;
+    char source_path[1024];
+    snprintf(source_path, sizeof(source_path), "%s/unindexed.c", root);
+    setup_ok = setup_ok && th_write_file(source_path, "UNINDEXED_SECRET\n") == 0;
+    cbm_mcp_server_t *srv = setup_ok ? cbm_mcp_server_new(NULL) : NULL;
+    cbm_store_t *store = srv ? cbm_mcp_server_store(srv) : NULL;
+    setup_ok = setup_ok && store && cbm_store_upsert_project(store, "search-empty", root) == 0;
+    if (setup_ok) {
+        cbm_mcp_server_set_project(srv, "search-empty");
+    }
+    char *raw =
+        setup_ok
+            ? cbm_mcp_handle_tool(srv, "search_code",
+                                  "{\"pattern\":\"UNINDEXED_SECRET\",\"project\":\"search-empty\","
+                                  "\"format\":\"json\"}")
+            : NULL;
+    char *inner = raw ? extract_text_content(raw) : NULL;
+
+    cbm_mcp_server_free(srv);
+    free(raw);
+    cbm_unlink(source_path);
+    cbm_rmdir(root);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":0"));
+    ASSERT_NOT_NULL(strstr(inner, "project has no indexed files"));
+    ASSERT_NULL(strstr(inner, "unindexed.c"));
+    free(inner);
+    PASS();
+}
+
+#ifndef _WIN32
+TEST(search_code_does_not_execute_search_tools_from_path) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    const char *prior_path = getenv("PATH");
+    char *saved_path = prior_path ? strdup(prior_path) : NULL;
+    char fake_dir[512];
+    snprintf(fake_dir, sizeof(fake_dir), "%s/fake-bin", tmp);
+    bool setup_ok = cbm_mkdir(fake_dir) == 0;
+    char marker[1024];
+    snprintf(marker, sizeof(marker), "%s/search-tool-ran", tmp);
+    const char *names[] = {"grep", "xargs", "powershell"};
+    for (size_t i = 0; setup_ok && i < sizeof(names) / sizeof(*names); i++) {
+        char executable[1024];
+        char script[2048];
+        snprintf(executable, sizeof(executable), "%s/%s", fake_dir, names[i]);
+        snprintf(script, sizeof(script), "#!/bin/sh\n: > '%s'\n", marker);
+        setup_ok = th_write_file(executable, script) == 0 && chmod(executable, 0700) == 0;
+    }
+    setup_ok = setup_ok && cbm_setenv("PATH", fake_dir, 1) == 0;
+    char *raw =
+        setup_ok
+            ? cbm_mcp_handle_tool(srv, "search_code",
+                                  "{\"pattern\":\"HandleRequest\",\"project\":\"test-project\"}")
+            : NULL;
+    struct stat marker_st;
+    bool marker_absent = stat(marker, &marker_st) != 0;
+    if (saved_path) {
+        (void)cbm_setenv("PATH", saved_path, 1);
+    } else {
+        (void)cbm_unsetenv("PATH");
+    }
+    free(saved_path);
+    free(raw);
+    for (size_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
+        char executable[1024];
+        snprintf(executable, sizeof(executable), "%s/%s", fake_dir, names[i]);
+        cbm_unlink(executable);
+    }
+    cbm_rmdir(fake_dir);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(marker_absent);
+    PASS();
+}
+#endif
+
 TEST(tool_detect_changes_no_project) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -2658,6 +2794,48 @@ TEST(tool_manage_adr_get_with_existing_adr) {
     rmdir(adr_dir);
     rmdir(tmp_dir);
     PASS();
+}
+
+TEST(tool_manage_adr_legacy_migration_rejects_symlink) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink semantics");
+#else
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-adr-rooted-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp_dir));
+    char adr_dir[512];
+    char adr_path[512];
+    char victim[512];
+    snprintf(adr_dir, sizeof(adr_dir), "%s/.codebase-memory", tmp_dir);
+    snprintf(adr_path, sizeof(adr_path), "%s/adr.md", adr_dir);
+    snprintf(victim, sizeof(victim), "%s/secret.txt", tmp_dir);
+    ASSERT_EQ(cbm_mkdir(adr_dir), 0);
+    FILE *fp = fopen(victim, "w");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_TRUE(fputs("ROOTED_ADR_SECRET", fp) >= 0);
+    ASSERT_EQ(fclose(fp), 0);
+    ASSERT_EQ(symlink(victim, adr_path), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "adr-rooted", tmp_dir), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, "adr-rooted");
+    char *resp =
+        cbm_mcp_handle_tool(srv, "manage_adr", "{\"project\":\"adr-rooted\",\"mode\":\"get\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "ROOTED_ADR_SECRET"));
+    cbm_adr_t stored = {0};
+    ASSERT_NEQ(cbm_store_adr_get(store, "adr-rooted", &stored), CBM_STORE_OK);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(cbm_unlink(adr_path), 0);
+    ASSERT_EQ(cbm_unlink(victim), 0);
+    ASSERT_EQ(cbm_rmdir(adr_dir), 0);
+    ASSERT_EQ(cbm_rmdir(tmp_dir), 0);
+    PASS();
+#endif
 }
 
 /* issue #256: manage_adr (MCP) and the UI /api/adr endpoints must share ONE
@@ -3991,14 +4169,16 @@ TEST(search_code_symlink_candidate_never_returns_outside_bytes) {
     ASSERT_EQ(cbm_unlink(src_path), 0);
     ASSERT_EQ(symlink(outside_path, src_path), 0);
 
-    char *raw = cbm_mcp_handle_tool(
-        srv, "search_code",
-        "{\"pattern\":\"OUTSIDE_SEARCH_SECRET\",\"project\":\"test-project\","
-        "\"format\":\"json\",\"mode\":\"full\"}");
+    char *raw =
+        cbm_mcp_handle_tool(srv, "search_code",
+                            "{\"pattern\":\"OUTSIDE_SEARCH_SECRET\",\"project\":\"test-project\","
+                            "\"format\":\"json\",\"mode\":\"full\"}");
     ASSERT_NOT_NULL(raw);
     char *resp = extract_text_content(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "OUTSIDE_SEARCH_SECRET"));
+    ASSERT_NOT_NULL(strstr(resp, "\"scan_skipped_unavailable\":1"));
+    ASSERT_NOT_NULL(strstr(resp, "partial scan:"));
 
     free(resp);
     free(raw);
@@ -4756,6 +4936,156 @@ TEST(mcp_cache_enumeration_errors_fail_closed) {
     free(saved_copy);
     ASSERT_EQ(cbm_rmdir(cache), 0);
     PASS();
+}
+
+TEST(mcp_cache_unavailable_never_scans_shared_tmp_fallback) {
+    const char *saved_cache_env = getenv("CBM_CACHE_DIR");
+    const char *saved_home_env = getenv("HOME");
+    const char *saved_profile_env = getenv("USERPROFILE");
+    char *saved_cache = saved_cache_env ? strdup(saved_cache_env) : NULL;
+    char *saved_home = saved_home_env ? strdup(saved_home_env) : NULL;
+    char *saved_profile = saved_profile_env ? strdup(saved_profile_env) : NULL;
+
+    char project[128];
+    char filename[160];
+    snprintf(project, sizeof(project), "tmp-fallback-sentinel-%d", (int)getpid());
+    snprintf(filename, sizeof(filename), "%s.db", project);
+    const char *shared_tmp = cbm_tmpdir();
+    bool setup_ok = shared_tmp && issue704_make_db(shared_tmp, filename, project, "PlantedTmpNode");
+
+    (void)cbm_unsetenv("CBM_CACHE_DIR");
+    (void)cbm_unsetenv("HOME");
+    (void)cbm_unsetenv("USERPROFILE");
+    cbm_mcp_server_t *srv = setup_ok ? cbm_mcp_server_new(NULL) : NULL;
+    char *listed = srv ? cbm_mcp_handle_tool(srv, "list_projects", "{}") : NULL;
+    char query_args[512];
+    snprintf(query_args, sizeof(query_args),
+             "{\"project\":\"%s\",\"name_pattern\":\"PlantedTmpNode\"}", project);
+    char *queried = srv ? cbm_mcp_handle_tool(srv, "search_graph", query_args) : NULL;
+    cbm_mcp_server_free(srv);
+
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_home) {
+        (void)cbm_setenv("HOME", saved_home, 1);
+    } else {
+        (void)cbm_unsetenv("HOME");
+    }
+    if (saved_profile) {
+        (void)cbm_setenv("USERPROFILE", saved_profile, 1);
+    } else {
+        (void)cbm_unsetenv("USERPROFILE");
+    }
+    free(saved_cache);
+    free(saved_home);
+    free(saved_profile);
+
+    char db_path[CBM_SZ_4K];
+    snprintf(db_path, sizeof(db_path), "%s/%s", shared_tmp ? shared_tmp : "", filename);
+    cbm_unlink(db_path);
+    snprintf(db_path, sizeof(db_path), "%s/%s-wal", shared_tmp ? shared_tmp : "", filename);
+    cbm_unlink(db_path);
+    snprintf(db_path, sizeof(db_path), "%s/%s-shm", shared_tmp ? shared_tmp : "", filename);
+    cbm_unlink(db_path);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_NOT_NULL(listed);
+    ASSERT_NOT_NULL(queried);
+    ASSERT_NOT_NULL(strstr(listed, "cache directory unavailable"));
+    ASSERT_NOT_NULL(strstr(listed, "\"isError\":true"));
+    ASSERT_NULL(strstr(listed, project));
+    ASSERT_NULL(strstr(queried, "PlantedTmpNode"));
+    ASSERT_NOT_NULL(strstr(queried, "private cache directory is unavailable"));
+    ASSERT_NOT_NULL(strstr(queried, "\"isError\":true"));
+    free(listed);
+    free(queried);
+    PASS();
+}
+
+TEST(index_supervisor_cache_unavailable_fails_before_worker_spawn) {
+    const char *saved_cache_env = getenv("CBM_CACHE_DIR");
+    const char *saved_home_env = getenv("HOME");
+    const char *saved_profile_env = getenv("USERPROFILE");
+    char *saved_cache = saved_cache_env ? strdup(saved_cache_env) : NULL;
+    char *saved_home = saved_home_env ? strdup(saved_home_env) : NULL;
+    char *saved_profile = saved_profile_env ? strdup(saved_profile_env) : NULL;
+    (void)cbm_unsetenv("CBM_CACHE_DIR");
+    (void)cbm_unsetenv("HOME");
+    (void)cbm_unsetenv("USERPROFILE");
+
+    char cwd_response[256];
+    char cwd_log[256];
+    snprintf(cwd_response, sizeof(cwd_response), ".worker-%d.response", (int)getpid());
+    snprintf(cwd_log, sizeof(cwd_log), ".worker-%d.log", (int)getpid());
+    (void)cbm_unlink(cwd_response);
+    (void)cbm_unlink(cwd_log);
+    cbm_index_worker_result_t worker = {0};
+    int rc = cbm_index_spawn_worker("{\"repo_path\":\"\"}", false, NULL, NULL, &worker);
+    cbm_proc_outcome_t outcome = worker.outcome;
+    bool response_absent = access(cwd_response, F_OK) != 0;
+    bool log_absent = access(cwd_log, F_OK) != 0;
+    cbm_index_worker_result_free(&worker);
+
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_home) {
+        (void)cbm_setenv("HOME", saved_home, 1);
+    } else {
+        (void)cbm_unsetenv("HOME");
+    }
+    if (saved_profile) {
+        (void)cbm_setenv("USERPROFILE", saved_profile, 1);
+    } else {
+        (void)cbm_unsetenv("USERPROFILE");
+    }
+    free(saved_cache);
+    free(saved_home);
+    free(saved_profile);
+
+    ASSERT_EQ(rc, -1);
+    ASSERT_EQ(outcome, CBM_PROC_SPAWN_FAILED);
+    ASSERT_TRUE(response_absent);
+    ASSERT_TRUE(log_absent);
+    PASS();
+}
+
+TEST(index_quarantine_binary_records_preserve_long_control_paths) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork isolates the quarantine once-state");
+#else
+    char journal[256];
+    snprintf(journal, sizeof(journal), "/tmp/cbm-quarantine-%d.bin", (int)getpid());
+    (void)cbm_unlink(journal);
+    size_t path_len = 5000;
+    char *path = malloc(path_len + 1U);
+    ASSERT_NOT_NULL(path);
+    memset(path, 'a', path_len);
+    memcpy(path, "dir/with\ttab\nand-newline/", sizeof("dir/with\ttab\nand-newline/") - 1U);
+    path[path_len] = '\0';
+    ASSERT_TRUE(cbm_index_journal_append(journal, 'H', path));
+    pid_t child = fork();
+    ASSERT_TRUE(child >= 0);
+    if (child == 0) {
+        cbm_index_quarantine_reset_for_test();
+        (void)cbm_setenv("CBM_INDEX_QUARANTINE_FILE", journal, 1);
+        bool found = cbm_index_is_quarantined(path);
+        const char *phase = cbm_index_quarantine_phase(path);
+        _exit(found && phase && strcmp(phase, "hang") == 0 ? 0 : 1);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    ASSERT_EQ(cbm_unlink(journal), 0);
+    free(path);
+    PASS();
+#endif
 }
 
 TEST(tool_resolve_store_by_internal_name_issue704) {
@@ -6252,7 +6582,9 @@ TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853) {
     }
 
     const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_git = getenv("CBM_GIT_BIN");
     char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    char *saved_git_copy = saved_git ? strdup(saved_git) : NULL;
     cbm_setenv("CBM_CACHE_DIR", cache, 1); /* inherited by the worker child */
 
     char src_path[512];
@@ -6261,6 +6593,15 @@ TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853) {
     ASSERT_NOT_NULL(fp);
     fputs("def idx853_fn():\n    return 'ok'\n", fp);
     fclose(fp);
+
+    (void)cbm_unsetenv("CBM_GIT_BIN");
+    char git_path[CBM_SZ_4K];
+    ASSERT_TRUE(cbm_git_resolve_binary(git_path, sizeof(git_path)));
+    ASSERT_EQ(cbm_setenv("CBM_GIT_BIN", git_path, 1), 0);
+    const char *init_argv[] = {git_path, "init", "-q", tmp_dir, NULL};
+    const char *add_argv[] = {git_path, "-C", tmp_dir, "add", "--", "main.py", NULL};
+    ASSERT_EQ(cbm_exec_no_shell(init_argv), 0);
+    ASSERT_EQ(cbm_exec_no_shell(add_argv), 0);
 
     int code = -1;
     bool signalled = false;
@@ -6286,6 +6627,12 @@ TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853) {
     free(project);
     restore_cache_dir(saved_cache_copy);
     free(saved_cache_copy);
+    if (saved_git_copy) {
+        (void)cbm_setenv("CBM_GIT_BIN", saved_git_copy, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_GIT_BIN");
+    }
+    free(saved_git_copy);
     remove(src_path);
     cbm_rmdir(cache);
     cbm_rmdir(tmp_dir);
@@ -6358,6 +6705,338 @@ TEST(detect_changes_rejects_option_like_base_branch) {
     cbm_mcp_server_free(srv);
     PASS();
 }
+
+#ifndef _WIN32
+static bool mcp_init_git_fixture(const char *git_path, const char *root) {
+    const char *init_argv[] = {git_path, "init", "-q", root, NULL};
+    if (cbm_exec_no_shell(init_argv) != 0) {
+        return false;
+    }
+    char tracked[1024];
+    snprintf(tracked, sizeof(tracked), "%s/both.c", root);
+    if (th_write_file(tracked, "int base;\n") != 0) {
+        return false;
+    }
+    const char *add_argv[] = {git_path, "-C", root, "add", "--", "both.c", NULL};
+    const char *commit_argv[] = {git_path,
+                                 "-C",
+                                 root,
+                                 "-c",
+                                 "user.name=CBM Test",
+                                 "-c",
+                                 "user.email=cbm@example.invalid",
+                                 "-c",
+                                 "commit.gpgsign=false",
+                                 "commit",
+                                 "-q",
+                                 "--no-verify",
+                                 "-m",
+                                 "base",
+                                 NULL};
+    return cbm_exec_no_shell(add_argv) == 0 && cbm_exec_no_shell(commit_argv) == 0;
+}
+
+TEST(detect_changes_argv_z_union_preserves_newline_names) {
+    const char *prior_git = getenv("CBM_GIT_BIN");
+    char *saved_git = prior_git ? strdup(prior_git) : NULL;
+    (void)cbm_unsetenv("CBM_GIT_BIN");
+    char git_path[4096];
+    bool setup_ok = cbm_git_resolve_binary(git_path, sizeof(git_path));
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/cbm-detect-z-XXXXXX", cbm_tmpdir());
+    setup_ok = setup_ok && cbm_mkdtemp(root) != NULL && mcp_init_git_fixture(git_path, root);
+    if (setup_ok) {
+        (void)cbm_setenv("CBM_GIT_BIN", git_path, 1);
+        char tracked[1024];
+        snprintf(tracked, sizeof(tracked), "%s/both.c", root);
+        setup_ok = th_write_file(tracked, "int staged;\n") == 0;
+        const char *add_argv[] = {git_path, "-C", root, "add", "--", "both.c", NULL};
+        setup_ok = setup_ok && cbm_exec_no_shell(add_argv) == 0;
+        FILE *append = setup_ok ? fopen(tracked, "ab") : NULL;
+        bool append_ok = append && fputs("int unstaged;\n", append) >= 0;
+        if (append) {
+            append_ok = fclose(append) == 0 && append_ok;
+        }
+        setup_ok = append_ok;
+        char newline_path[1024];
+        snprintf(newline_path, sizeof(newline_path), "%s/line\nbreak.c", root);
+        setup_ok = setup_ok && th_write_file(newline_path, "int fresh;\n") == 0;
+    }
+
+    cbm_mcp_server_t *srv = setup_ok ? cbm_mcp_server_new(NULL) : NULL;
+    cbm_store_t *store = srv ? cbm_mcp_server_store(srv) : NULL;
+    setup_ok = setup_ok && store && cbm_store_upsert_project(store, "detect-z", root) == 0;
+    if (setup_ok) {
+        cbm_mcp_server_set_project(srv, "detect-z");
+    }
+    char *raw = setup_ok ? cbm_mcp_handle_tool(srv, "detect_changes",
+                                               "{\"project\":\"detect-z\",\"base_branch\":\"HEAD\","
+                                               "\"scope\":\"files\"}")
+                         : NULL;
+    char *inner = raw ? extract_text_content(raw) : NULL;
+
+    cbm_mcp_server_free(srv);
+    free(raw);
+    if (saved_git) {
+        (void)cbm_setenv("CBM_GIT_BIN", saved_git, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_GIT_BIN");
+    }
+    free(saved_git);
+    th_rmtree(root);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"changed_count\":2"));
+    const char *both = strstr(inner, "both.c");
+    ASSERT_NOT_NULL(both);
+    ASSERT_NULL(strstr(both + strlen("both.c"), "both.c"));
+    ASSERT_NOT_NULL(strstr(inner, "line\\nbreak.c"));
+    free(inner);
+    PASS();
+}
+
+TEST(detect_changes_invalid_override_never_falls_through_malicious_path) {
+    const char *prior_git = getenv("CBM_GIT_BIN");
+    const char *prior_path = getenv("PATH");
+    char *saved_git = prior_git ? strdup(prior_git) : NULL;
+    char *saved_path = prior_path ? strdup(prior_path) : NULL;
+    char root[512];
+    snprintf(root, sizeof(root), "%s/cbm-detect-path-XXXXXX", cbm_tmpdir());
+    bool setup_ok = cbm_mkdtemp(root) != NULL;
+    char fake_git[1024];
+    char marker[1024];
+    snprintf(fake_git, sizeof(fake_git), "%s/git", root);
+    snprintf(marker, sizeof(marker), "%s/ran", root);
+    char script[2048];
+    snprintf(script, sizeof(script), "#!/bin/sh\n: > '%s'\n", marker);
+    setup_ok = setup_ok && th_write_file(fake_git, script) == 0 && chmod(fake_git, 0700) == 0 &&
+               cbm_setenv("PATH", root, 1) == 0 && cbm_setenv("CBM_GIT_BIN", "git", 1) == 0;
+
+    cbm_mcp_server_t *srv = setup_ok ? cbm_mcp_server_new(NULL) : NULL;
+    cbm_store_t *store = srv ? cbm_mcp_server_store(srv) : NULL;
+    setup_ok = setup_ok && store && cbm_store_upsert_project(store, "detect-path", root) == 0;
+    if (setup_ok) {
+        cbm_mcp_server_set_project(srv, "detect-path");
+    }
+    char *response =
+        setup_ok ? cbm_mcp_handle_tool(srv, "detect_changes",
+                                       "{\"project\":\"detect-path\",\"base_branch\":\"HEAD\"}")
+                 : NULL;
+    struct stat marker_st;
+    bool marker_absent = stat(marker, &marker_st) != 0;
+    cbm_mcp_server_free(srv);
+    if (saved_git) {
+        (void)cbm_setenv("CBM_GIT_BIN", saved_git, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_GIT_BIN");
+    }
+    if (saved_path) {
+        (void)cbm_setenv("PATH", saved_path, 1);
+    } else {
+        (void)cbm_unsetenv("PATH");
+    }
+    free(saved_git);
+    free(saved_path);
+    th_rmtree(root);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "trusted absolute git"));
+    ASSERT_TRUE(marker_absent);
+    free(response);
+    PASS();
+}
+#endif
+
+#ifndef _WIN32
+TEST(update_check_capture_is_bounded_and_invalid_override_is_fail_closed) {
+    const char *prior_curl = getenv("CBM_CURL_BIN");
+    const char *prior_path = getenv("PATH");
+    char *saved_curl = prior_curl ? strdup(prior_curl) : NULL;
+    char *saved_path = prior_path ? strdup(prior_path) : NULL;
+    char root[512];
+    snprintf(root, sizeof(root), "%s/cbm-update-cap-XXXXXX", cbm_tmpdir());
+    bool setup_ok = cbm_mkdtemp(root) != NULL;
+    char fake_curl[1024];
+    char marker[1024];
+    snprintf(fake_curl, sizeof(fake_curl), "%s/curl", root);
+    snprintf(marker, sizeof(marker), "%s/ran", root);
+    const char *large_script =
+        "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 5000 ]; do\n"
+        "  printf '0123456789abcdef0123456789abcdef'\n  i=$((i + 1))\ndone\n";
+    setup_ok = setup_ok && th_write_file(fake_curl, large_script) == 0 &&
+               chmod(fake_curl, 0700) == 0 && cbm_setenv("CBM_CURL_BIN", fake_curl, 1) == 0;
+    char *captured = NULL;
+    size_t captured_len = 0;
+    int capped_rc = setup_ok ? cbm_mcp_fetch_update_for_test(&captured, &captured_len) : 0;
+    free(captured);
+
+    char marker_script[2048];
+    snprintf(marker_script, sizeof(marker_script), "#!/bin/sh\n: > '%s'\n", marker);
+    setup_ok = setup_ok && th_write_file(fake_curl, marker_script) == 0 &&
+               chmod(fake_curl, 0700) == 0 && cbm_setenv("PATH", root, 1) == 0 &&
+               cbm_setenv("CBM_CURL_BIN", "curl", 1) == 0;
+    captured = NULL;
+    captured_len = 0;
+    int invalid_rc = setup_ok ? cbm_mcp_fetch_update_for_test(&captured, &captured_len) : 0;
+    struct stat marker_st;
+    bool marker_absent = stat(marker, &marker_st) != 0;
+    free(captured);
+
+    if (saved_curl) {
+        (void)cbm_setenv("CBM_CURL_BIN", saved_curl, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CURL_BIN");
+    }
+    if (saved_path) {
+        (void)cbm_setenv("PATH", saved_path, 1);
+    } else {
+        (void)cbm_unsetenv("PATH");
+    }
+    free(saved_curl);
+    free(saved_path);
+    th_rmtree(root);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_NEQ(capped_rc, 0);
+    ASSERT_EQ(captured_len, 0);
+    ASSERT_NEQ(invalid_rc, 0);
+    ASSERT_TRUE(marker_absent);
+    PASS();
+}
+
+TEST(update_check_opt_out_starts_no_resolver_or_thread) {
+    const char *prior_disable = getenv("CBM_DISABLE_UPDATE_CHECK");
+    const char *prior_curl = getenv("CBM_CURL_BIN");
+    char *saved_disable = prior_disable ? strdup(prior_disable) : NULL;
+    char *saved_curl = prior_curl ? strdup(prior_curl) : NULL;
+    char root[512];
+    snprintf(root, sizeof(root), "%s/cbm-update-off-XXXXXX", cbm_tmpdir());
+    bool setup_ok = cbm_mkdtemp(root) != NULL;
+    char fake_curl[1024];
+    char marker[1024];
+    snprintf(fake_curl, sizeof(fake_curl), "%s/curl", root);
+    snprintf(marker, sizeof(marker), "%s/ran", root);
+    char script[2048];
+    snprintf(script, sizeof(script), "#!/bin/sh\n: > '%s'\n", marker);
+    setup_ok = setup_ok && th_write_file(fake_curl, script) == 0 && chmod(fake_curl, 0700) == 0 &&
+               cbm_setenv("CBM_CURL_BIN", fake_curl, 1) == 0 &&
+               cbm_setenv("CBM_DISABLE_UPDATE_CHECK", "true", 1) == 0;
+    cbm_mcp_server_t *srv = setup_ok ? cbm_mcp_server_new(NULL) : NULL;
+    char *true_response =
+        srv ? cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+                                         "\"params\":{}}")
+            : NULL;
+    cbm_mcp_server_free(srv);
+    setup_ok = setup_ok && cbm_setenv("CBM_DISABLE_UPDATE_CHECK", "1", 1) == 0;
+    srv = setup_ok ? cbm_mcp_server_new(NULL) : NULL;
+    char *one_response =
+        srv ? cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\","
+                                         "\"params\":{}}")
+            : NULL;
+    cbm_mcp_server_free(srv);
+    struct stat marker_st;
+    bool marker_absent = stat(marker, &marker_st) != 0;
+
+    if (saved_disable) {
+        (void)cbm_setenv("CBM_DISABLE_UPDATE_CHECK", saved_disable, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_DISABLE_UPDATE_CHECK");
+    }
+    if (saved_curl) {
+        (void)cbm_setenv("CBM_CURL_BIN", saved_curl, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CURL_BIN");
+    }
+    free(saved_disable);
+    free(saved_curl);
+    th_rmtree(root);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_NOT_NULL(true_response);
+    ASSERT_NOT_NULL(one_response);
+    ASSERT_TRUE(marker_absent);
+    free(true_response);
+    free(one_response);
+    PASS();
+}
+
+TEST(update_notice_publication_is_race_free_and_one_shot) {
+    const char *prior_disable = getenv("CBM_DISABLE_UPDATE_CHECK");
+    const char *prior_curl = getenv("CBM_CURL_BIN");
+    const char *prior_cache = getenv("CBM_CACHE_DIR");
+    char *saved_disable = prior_disable ? strdup(prior_disable) : NULL;
+    char *saved_curl = prior_curl ? strdup(prior_curl) : NULL;
+    char *saved_cache = prior_cache ? strdup(prior_cache) : NULL;
+    char root[512];
+    snprintf(root, sizeof(root), "%s/cbm-update-race-XXXXXX", cbm_tmpdir());
+    bool setup_ok = cbm_mkdtemp(root) != NULL;
+    char fake_curl[1024];
+    snprintf(fake_curl, sizeof(fake_curl), "%s/curl", root);
+    const char *script = "#!/bin/sh\nprintf '%s' '{\"tag_name\":\"v999.0.0\"}'\n";
+    setup_ok = setup_ok && th_write_file(fake_curl, script) == 0 && chmod(fake_curl, 0700) == 0 &&
+               cbm_setenv("CBM_CURL_BIN", fake_curl, 1) == 0 &&
+               cbm_setenv("CBM_CACHE_DIR", root, 1) == 0 &&
+               cbm_unsetenv("CBM_DISABLE_UPDATE_CHECK") == 0;
+    cbm_mcp_server_t *srv = setup_ok ? cbm_mcp_server_new(NULL) : NULL;
+    char *initialized =
+        srv ? cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+                                         "\"params\":{}}")
+            : NULL;
+    bool calls_ok = initialized != NULL;
+    int notices = 0;
+    int calls_after_notice = 0;
+    for (int i = 0; srv && calls_ok && i < 1000 && calls_after_notice < 5; i++) {
+        char request[256];
+        snprintf(request, sizeof(request),
+                 "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"__update_notice_probe__\",\"arguments\":{}}}",
+                 i + 2);
+        char *response = cbm_mcp_server_handle(srv, request);
+        calls_ok = response != NULL;
+        if (response && strstr(response, "Update available:")) {
+            notices++;
+        } else if (notices > 0) {
+            calls_after_notice++;
+        }
+        free(response);
+        if (notices == 0) {
+            usleep(1000);
+        }
+    }
+    cbm_mcp_server_free(srv); /* joins the publisher before destroying its mutex */
+
+    if (saved_disable) {
+        (void)cbm_setenv("CBM_DISABLE_UPDATE_CHECK", saved_disable, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_DISABLE_UPDATE_CHECK");
+    }
+    if (saved_curl) {
+        (void)cbm_setenv("CBM_CURL_BIN", saved_curl, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CURL_BIN");
+    }
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_disable);
+    free(saved_curl);
+    free(saved_cache);
+    free(initialized);
+    cbm_unlink(fake_curl);
+    cbm_rmdir(root);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(calls_ok);
+    ASSERT_EQ(notices, 1);
+    ASSERT_EQ(calls_after_notice, 5);
+    PASS();
+}
+#endif
 
 /* Opt-in workspace boundary: when CBM_ALLOWED_ROOT is set, index_repository
  * must refuse a repo_path that resolves outside it. Unset (the default) imposes
@@ -6498,10 +7177,18 @@ TEST(global_memory_tool_schemas_are_registered) {
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(mcp) {
+    RUN_TEST(index_quarantine_binary_records_preserve_long_control_paths);
     RUN_TEST(global_memory_tools_and_graph_need_no_project);
     RUN_TEST(global_memory_tool_schemas_are_registered);
     RUN_TEST(mcp_path_within_root_rejects_escape);
     RUN_TEST(detect_changes_rejects_option_like_base_branch);
+#ifndef _WIN32
+    RUN_TEST(detect_changes_argv_z_union_preserves_newline_names);
+    RUN_TEST(detect_changes_invalid_override_never_falls_through_malicious_path);
+    RUN_TEST(update_check_capture_is_bounded_and_invalid_override_is_fail_closed);
+    RUN_TEST(update_check_opt_out_starts_no_resolver_or_thread);
+    RUN_TEST(update_notice_publication_is_race_free_and_one_shot);
+#endif
     RUN_TEST(index_repository_honors_allowed_root);
     /* JSON-RPC parsing */
     RUN_TEST(jsonrpc_parse_request);
@@ -6624,9 +7311,15 @@ SUITE(mcp) {
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);
+    RUN_TEST(search_code_reports_index_scope_and_match_cap);
+    RUN_TEST(search_code_no_indexed_files_never_falls_back_to_recursive_scan);
+#ifndef _WIN32
+    RUN_TEST(search_code_does_not_execute_search_tools_from_path);
+#endif
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
+    RUN_TEST(tool_manage_adr_legacy_migration_rejects_symlink);
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
@@ -6699,6 +7392,8 @@ SUITE(mcp) {
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(mcp_cache_enumeration_errors_fail_closed);
+    RUN_TEST(mcp_cache_unavailable_never_scans_shared_tmp_fallback);
+    RUN_TEST(index_supervisor_cache_unavailable_fails_before_worker_spawn);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
     RUN_TEST(active_store_refresh_waits_for_completed_snapshot);
 

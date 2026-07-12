@@ -375,22 +375,31 @@ static const char *itoa_buf(int v) {
     return buf;
 }
 
+bool cbm_watcher_build_db_paths_for_test(const char *cache_dir, const char *project_name,
+                                         char *path, size_t path_size, char *wal, size_t wal_size,
+                                         char *shm, size_t shm_size) {
+    if (!cache_dir || !cache_dir[0] || !cbm_validate_project_name(project_name) || !path ||
+        path_size == 0 || !wal || wal_size == 0 || !shm || shm_size == 0) {
+        return false;
+    }
+    int path_n = snprintf(path, path_size, "%s/%s.db", cache_dir, project_name);
+    if (path_n <= 0 || (size_t)path_n >= path_size) {
+        return false;
+    }
+    int wal_n = snprintf(wal, wal_size, "%s-wal", path);
+    int shm_n = snprintf(shm, shm_size, "%s-shm", path);
+    return wal_n > 0 && (size_t)wal_n < wal_size && shm_n > 0 && (size_t)shm_n < shm_size;
+}
+
 static void delete_cached_project_db(const char *project_name) {
-    if (!cbm_validate_project_name(project_name)) {
-        return;
-    }
-
     const char *cache_dir = cbm_resolve_cache_dir();
-    if (!cache_dir) {
-        return;
-    }
-
     char path[CBM_SZ_1K];
     char wal[CBM_SZ_1K];
     char shm[CBM_SZ_1K];
-    snprintf(path, sizeof(path), "%s/%s.db", cache_dir, project_name);
-    snprintf(wal, sizeof(wal), "%s-wal", path);
-    snprintf(shm, sizeof(shm), "%s-shm", path);
+    if (!cbm_watcher_build_db_paths_for_test(cache_dir, project_name, path, sizeof(path), wal,
+                                             sizeof(wal), shm, sizeof(shm))) {
+        return;
+    }
     (void)cbm_unlink(path);
     (void)cbm_unlink(wal);
     (void)cbm_unlink(shm);

@@ -11,8 +11,8 @@
  * output (a clean pass-through). This is what makes issue #362 structurally
  * impossible to recur — the hook cannot deny a tool.
  *
- * The underlying query is `search_graph` (pure SQLite, shell-free) — chosen
- * over `search_code` (which shells out to grep|xargs) so the hook stays cheap
+ * The underlying query is `search_graph` (pure SQLite) — chosen over the
+ * bounded source scan in `search_code` so the hook stays cheap
  * enough to run before every Grep/Glob.
  */
 

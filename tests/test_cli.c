@@ -10,6 +10,7 @@
  * Total: 47 Go tests → 47 C tests
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
@@ -27,6 +28,8 @@
 extern int cbm_cleanup_legacy_codex_instructions(const char *home, bool dry_run);
 extern int cbm_cli_download_to_fd_for_test(const char *url, int output_fd, size_t max_bytes);
 extern char *cbm_cli_parse_latest_tag_for_test(const char *headers, size_t header_len);
+extern int cbm_cli_publish_verified_for_test(const char *path, const unsigned char *data,
+                                             int length, bool verification_ok);
 #ifdef __APPLE__
 extern int cbm_cli_resolve_apple_tool_for_test(const char *name, const char *env_name, char *out,
                                                size_t out_size);
@@ -1905,6 +1908,96 @@ TEST(cli_index_management_uses_explicit_home_and_preserves_internal_dbs) {
     PASS();
 }
 
+TEST(cli_config_rejects_overlong_cache_directory) {
+    const char *prior_env = getenv("CBM_CACHE_DIR");
+    char *saved_env = prior_env ? strdup(prior_env) : NULL;
+    char overlong[2048];
+    memset(overlong, 'x', sizeof(overlong) - 1U);
+    overlong[sizeof(overlong) - 1U] = '\0';
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", overlong, 1), 0);
+
+    char *args[] = {"list"};
+    int rc = cbm_cmd_config(1, args);
+
+    if (saved_env) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_env, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_env);
+    ASSERT_NEQ(rc, 0);
+    PASS();
+}
+
+TEST(cli_index_management_rejects_overlong_override_without_fallback) {
+    const char *prior_env = getenv("CBM_CACHE_DIR");
+    char *saved_env = prior_env ? strdup(prior_env) : NULL;
+
+    char home[256];
+    snprintf(home, sizeof(home), "/tmp/cli-index-overlong-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(home));
+    char cache[512];
+    char sentinel[640];
+    snprintf(cache, sizeof(cache), "%s/.cache/codebase-memory-mcp", home);
+    snprintf(sentinel, sizeof(sentinel), "%s/must-survive.db", cache);
+    ASSERT_EQ(test_mkdirp(cache), 0);
+    write_test_file(sentinel, "default cache sentinel");
+
+    char overlong[2048];
+    memset(overlong, 'x', sizeof(overlong) - 1U);
+    overlong[sizeof(overlong) - 1U] = '\0';
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", overlong, 1), 0);
+    int listed = cbm_list_indexes(home);
+    int removed = cbm_remove_indexes(home);
+    struct stat st;
+    bool survived = stat(sentinel, &st) == 0;
+
+    if (saved_env) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_env, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_env);
+    test_rmdir_r(home);
+
+    ASSERT_EQ(listed, -1);
+    ASSERT_EQ(removed, -1);
+    ASSERT_TRUE(survived);
+    PASS();
+}
+
+TEST(cli_config_uses_explicit_cache_without_home) {
+    const char *names[] = {"HOME", "USERPROFILE", "CBM_CACHE_DIR"};
+    char *saved[3] = {0};
+    bool was_set[3] = {false};
+    for (size_t i = 0; i < 3; i++) {
+        const char *value = getenv(names[i]);
+        was_set[i] = value != NULL;
+        saved[i] = value ? strdup(value) : NULL;
+    }
+
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cli-config-no-home-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    ASSERT_EQ(cbm_unsetenv("HOME"), 0);
+    ASSERT_EQ(cbm_unsetenv("USERPROFILE"), 0);
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    char *args[] = {"list"};
+    int rc = cbm_cmd_config(1, args);
+
+    for (size_t i = 0; i < 3; i++) {
+        if (was_set[i]) {
+            (void)cbm_setenv(names[i], saved[i], 1);
+        } else {
+            (void)cbm_unsetenv(names[i]);
+        }
+        free(saved[i]);
+    }
+    test_rmdir_r(cache);
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  YAML parser unit tests
  * ═══════════════════════════════════════════════════════════════════ */
@@ -3287,6 +3380,35 @@ TEST(cli_config_persists) {
  *  Group H: cbm_replace_binary (update command helper)
  * ═══════════════════════════════════════════════════════════════════ */
 
+TEST(update_publish_verification_rolls_back_previous_binary) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-update-rollback-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char target[512];
+    char new_target[512];
+    snprintf(target, sizeof(target), "%s/codebase-memory-mcp", tmpdir);
+    snprintf(new_target, sizeof(new_target), "%s/new-codebase-memory-mcp", tmpdir);
+    write_test_file(target, "known-good-old-binary");
+
+    static const unsigned char replacement[] = "broken-new-binary";
+    ASSERT_NEQ(
+        cbm_cli_publish_verified_for_test(target, replacement, (int)sizeof(replacement) - 1, false),
+        0);
+    ASSERT_STR_EQ(read_test_file(target), "known-good-old-binary");
+
+    ASSERT_EQ(
+        cbm_cli_publish_verified_for_test(target, replacement, (int)sizeof(replacement) - 1, true),
+        0);
+    ASSERT_STR_EQ(read_test_file(target), "broken-new-binary");
+
+    ASSERT_NEQ(cbm_cli_publish_verified_for_test(new_target, replacement,
+                                                 (int)sizeof(replacement) - 1, false),
+               0);
+    ASSERT_EQ(cbm_path_probe(new_target), 0);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 #ifndef _WIN32
 
 TEST(replace_binary_overwrites_readonly) {
@@ -3844,6 +3966,9 @@ SUITE(cli) {
     /* Full lifecycle (1 test — cli_test.go) */
     RUN_TEST(cli_install_and_uninstall);
     RUN_TEST(cli_index_management_uses_explicit_home_and_preserves_internal_dbs);
+    RUN_TEST(cli_config_rejects_overlong_cache_directory);
+    RUN_TEST(cli_index_management_rejects_overlong_override_without_fallback);
+    RUN_TEST(cli_config_uses_explicit_cache_without_home);
 
     /* Binary swap on install --force (#472) */
     RUN_TEST(cli_install_copies_binary_to_target_issue472);
@@ -3934,6 +4059,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_persists);
 
     /* Replace binary (update command helper — group H) */
+    RUN_TEST(update_publish_verification_rolls_back_previous_binary);
 #ifndef _WIN32
     RUN_TEST(replace_binary_overwrites_readonly);
     RUN_TEST(replace_binary_creates_new_file);
