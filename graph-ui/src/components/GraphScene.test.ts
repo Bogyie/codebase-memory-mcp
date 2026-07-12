@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { GRAPH_CANVAS_DPR } from "./GraphScene";
+import { GRAPH_CANVAS_DPR } from "../lib/graphLimits";
 
 describe("GraphScene render limits", () => {
   it("caps the high-DPI WebGL backing store below the MSAA failure range", () => {

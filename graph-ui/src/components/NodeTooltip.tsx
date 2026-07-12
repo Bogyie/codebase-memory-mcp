@@ -1,4 +1,4 @@
-import { Html } from "@react-three/drei";
+import { Html } from "@react-three/drei/web/Html.js";
 import type { GraphNode } from "../lib/types";
 import { colorForLabel, colorForStatus } from "../lib/colors";
 
