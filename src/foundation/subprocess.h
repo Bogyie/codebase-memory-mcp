@@ -22,6 +22,8 @@
 
 #include <stdbool.h>
 #include <stddef.h> /* size_t (cbm_build_win_cmdline) */
+#include <stdint.h>
+#include <stdatomic.h>
 
 /* How a supervised child ended. */
 typedef enum {
@@ -30,6 +32,7 @@ typedef enum {
     CBM_PROC_CRASH,        /* died from a fault: POSIX SIGSEGV/BUS/ILL/FPE/ABRT/SYS,
                             * or a Windows NTSTATUS exception exit code (>= 0xC0000000) */
     CBM_PROC_HANG,         /* made no progress within the quiet-timeout; we killed it */
+    CBM_PROC_OUTPUT_LIMIT, /* exceeded the configured output byte ceiling; we killed it */
     CBM_PROC_KILLED,       /* terminated by a non-fault signal we did not initiate */
     CBM_PROC_SPAWN_FAILED  /* fork/exec/CreateProcess failed — no child ever ran */
 } cbm_proc_outcome_t;
@@ -44,6 +47,28 @@ typedef struct {
  * runs. A completed line also resets the quiet-timeout (it is progress). */
 typedef void (*cbm_proc_log_cb)(const char *line, void *ud);
 
+/* Stable control plane for one supervised run. The caller owns this object and
+ * must keep it alive until cbm_subprocess_run() returns. A kill request never
+ * signals a numeric PID directly: the supervisor that still owns the POSIX
+ * child/wait relationship or Windows process HANDLE performs the termination.
+ * This prevents a stale PID from targeting an unrelated reused process. */
+typedef struct {
+    atomic_int state;
+    _Atomic uint64_t pid;
+} cbm_proc_control_t;
+
+/* Initialize before first use (and only while no run is active). A zeroed
+ * static object is also a valid initial state. */
+void cbm_proc_control_init(cbm_proc_control_t *control);
+
+/* Return the PID of the currently supervised child, or 0 when no run is live. */
+uint64_t cbm_proc_control_pid(const cbm_proc_control_t *control);
+
+/* Atomically request that the owning supervisor kill its current child. The
+ * expected PID prevents a stale UI observation from selecting a different run.
+ * Returns false when the control is not live or the PID no longer matches. */
+bool cbm_proc_control_request_kill(cbm_proc_control_t *control, uint64_t expected_pid);
+
 typedef struct {
     const char *bin;             /* executable path; also argv[0] when argv is NULL */
     const char *const *argv;     /* NULL-terminated argv; NULL => { bin, NULL } */
@@ -54,12 +79,30 @@ typedef struct {
     int quiet_timeout_ms;        /* <= 0 => no timeout; else kill+HANG after this many
                                   * ms with no new completed log line */
     bool delete_log_on_exit;     /* unlink log_file after reaping */
+    bool discard_stderr;         /* redirect stderr to the null device instead of log_file */
+    bool use_output_fd;          /* redirect stdout to output_fd without reopening a path */
+    int output_fd;               /* caller-owned descriptor; valid when use_output_fd. When
+                                  * on_log_line is set it must also be readable: supervision
+                                  * tails this exact fd positionally without changing the
+                                  * child's shared append offset. */
+    size_t max_output_bytes;     /* 0 = unlimited; kill if output_fd grows beyond this */
+    cbm_proc_control_t *control; /* optional stable child control; caller-owned and exclusive
+                                  * to this run until cbm_subprocess_run() returns */
 } cbm_proc_opts_t;
 
 /* Spawn opts->bin, supervise (tail + optional quiet-timeout), block until it ends,
  * and classify the result into *out. Returns 0 if a child was spawned and reaped
  * (out filled), or -1 if the spawn itself failed (out->outcome == CBM_PROC_SPAWN_FAILED). */
 int cbm_subprocess_run(const cbm_proc_opts_t *opts, cbm_proc_result_t *out);
+
+/* Run an argv-based subprocess and capture its exact stdout byte stream
+ * through one private temporary-file descriptor (stderr follows the supplied
+ * discard_stderr policy). The process must exit cleanly and the
+ * complete output must fit max_output_bytes; otherwise the call fails and no
+ * partial bytes are returned. Binary output (including NULs) is supported.
+ * out_sha256 is the digest of the logical output bytes. */
+int cbm_subprocess_capture(const cbm_proc_opts_t *opts, size_t max_output_bytes, char **out_data,
+                           size_t *out_len, char out_sha256[65], cbm_proc_result_t *out_result);
 
 /* Pure outcome classifier — exposed so the platform-specific exit-code mapping
  * (notably the Windows NTSTATUS crash codes) is unit-testable on every platform.

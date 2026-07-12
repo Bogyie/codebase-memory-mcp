@@ -443,16 +443,81 @@ FILE *cbm_fopen(const char *path, const char *mode) {
     return f;
 }
 
+static bool cbm_wpath_is_directory(const wchar_t *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    DWORD attrs = GetFileAttributesW(path);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static bool cbm_wmkdir_component(wchar_t *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (_wmkdir(path) == 0) {
+        return true;
+    }
+    /* Preserve the historical symlink/junction policy: an existing reparse
+     * point is accepted when Windows resolves it as a directory. A regular
+     * file (including a file symlink) is never a successful mkdir -p step. */
+    return cbm_wpath_is_directory(path);
+}
+
+static bool cbm_wpath_separator(wchar_t value) {
+    return value == L'/' || value == L'\\';
+}
+
+static wchar_t *cbm_wskip_unc_root(wchar_t *path) {
+    /* path points at the server component. Skip both \\server\share because
+     * \\server by itself is an authority, not a directory that _wmkdir can
+     * validate. */
+    wchar_t *p = path;
+    while (*p && !cbm_wpath_separator(*p)) {
+        p++;
+    }
+    while (cbm_wpath_separator(*p)) {
+        p++;
+    }
+    while (*p && !cbm_wpath_separator(*p)) {
+        p++;
+    }
+    return *p ? p + SKIP_ONE : p;
+}
+
+static wchar_t *cbm_wmkdir_scan_start(wchar_t *path) {
+    if (!path || !path[0]) {
+        return path;
+    }
+    if (path[1] == L':' && cbm_wpath_separator(path[2])) {
+        return path + 3; /* C:\ is an indivisible root. */
+    }
+    if (!cbm_wpath_separator(path[0]) || !cbm_wpath_separator(path[1])) {
+        return path + SKIP_ONE;
+    }
+    wchar_t *p = path + 2;
+    if (p[0] == L'?' && cbm_wpath_separator(p[1])) {
+        p += 2;
+        bool extended_unc = (p[0] == L'U' || p[0] == L'u') && (p[1] == L'N' || p[1] == L'n') &&
+                            (p[2] == L'C' || p[2] == L'c') && cbm_wpath_separator(p[3]);
+        if (extended_unc) {
+            return cbm_wskip_unc_root(p + 4);
+        }
+        if (p[0] && p[1] == L':' && cbm_wpath_separator(p[2])) {
+            return p + 3; /* \\?\C:\ */
+        }
+    }
+    return cbm_wskip_unc_root(p);
+}
+
 bool cbm_mkdir_p(const char *path, int mode) {
     (void)mode;
+    if (!path || !path[0]) {
+        return false;
+    }
     wchar_t *wpath = cbm_utf8_to_wide(path);
     if (!wpath) {
         return false;
-    }
-
-    if (_wmkdir(wpath) == 0) {
-        free(wpath);
-        return true;
     }
     size_t wlen = wcslen(wpath);
     wchar_t *tmp = (wchar_t *)malloc((wlen + 1) * sizeof(wchar_t));
@@ -461,14 +526,20 @@ bool cbm_mkdir_p(const char *path, int mode) {
         return false;
     }
     wmemcpy(tmp, wpath, wlen + 1);
-    for (wchar_t *p = tmp + SKIP_ONE; *p; p++) {
+    for (wchar_t *p = cbm_wmkdir_scan_start(tmp); p && *p; p++) {
         if (*p == L'/' || *p == L'\\') {
+            wchar_t separator = *p;
             *p = L'\0';
-            _wmkdir(tmp);
-            *p = L'\\';
+            bool component_ok = cbm_wmkdir_component(tmp);
+            *p = separator;
+            if (!component_ok) {
+                free(tmp);
+                free(wpath);
+                return false;
+            }
         }
     }
-    bool ok = _wmkdir(tmp) == 0 || GetLastError() == ERROR_ALREADY_EXISTS;
+    bool ok = cbm_wmkdir_component(tmp);
     free(tmp);
     free(wpath);
     return ok;
@@ -743,12 +814,24 @@ FILE *cbm_fopen(const char *path, const char *mode) {
     return fopen(path, mode);
 }
 
-bool cbm_mkdir_p(const char *path, int mode) {
-    /* Try direct mkdir first */
-    if (mkdir(path, (mode_t)mode) == 0) {
+static bool cbm_mkdir_component(char *path, mode_t mode) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (mkdir(path, mode) == 0) {
         return true;
     }
-    /* Walk path and create each component */
+    struct stat st;
+    /* stat() intentionally follows symlinks for compatibility: a symlink to
+     * a directory remains a valid mkdir -p component, while a regular file or
+     * a symlink to one is rejected. */
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+bool cbm_mkdir_p(const char *path, int mode) {
+    if (!path || !path[0]) {
+        return false;
+    }
     char *tmp = strdup(path);
     if (!tmp) {
         return false;
@@ -756,11 +839,15 @@ bool cbm_mkdir_p(const char *path, int mode) {
     for (char *p = tmp + SKIP_ONE; *p; p++) {
         if (*p == '/') {
             *p = '\0';
-            mkdir(tmp, (mode_t)mode); /* ignore intermediate errors */
+            bool component_ok = cbm_mkdir_component(tmp, (mode_t)mode);
             *p = '/';
+            if (!component_ok) {
+                free(tmp);
+                return false;
+            }
         }
     }
-    bool ok = (mkdir(tmp, (mode_t)mode) == 0 || errno == EEXIST) != 0;
+    bool ok = cbm_mkdir_component(tmp, (mode_t)mode);
     free(tmp);
     return ok;
 }
@@ -892,7 +979,7 @@ int cbm_rename_replace(const char *src, const char *dst) {
     wchar_t *wdst = cbm_utf8_to_wide(dst);
     int ret = CBM_NOT_FOUND;
     if (wsrc && wdst) {
-        ret = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)
+        ret = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
                   ? 0
                   : CBM_NOT_FOUND;
     }

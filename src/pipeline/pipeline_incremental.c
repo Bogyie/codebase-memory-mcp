@@ -2,7 +2,9 @@
  * pipeline_incremental.c — Disk-based incremental re-indexing.
  *
  * Operates on the existing SQLite DB directly (not RAM-first graph buffer).
- * Compares file mtime+size against stored hashes to classify changed/unchanged.
+ * Hashes each file once and compares SHA-256 against the stored generation to
+ * classify changed/unchanged, including edits that preserve filesystem
+ * metadata. Once present, the digest is authoritative over mtime/size.
  * Deletes changed files' nodes (edges cascade via ON DELETE CASCADE),
  * re-parses only changed files through passes into a temp graph buffer,
  * then merges new nodes/edges into the disk DB. Persists updated hashes.
@@ -25,13 +27,20 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 /* ── Constants ───────────────────────────────────────────────────── */
 
@@ -58,25 +67,14 @@ static const char *itoa_buf(int v) {
     return buf[idx];
 }
 
-/* ── Platform-portable mtime_ns ──────────────────────────────────── */
-
-static int64_t stat_mtime_ns(const struct stat *st) {
-#ifdef __APPLE__
-    return ((int64_t)st->st_mtimespec.tv_sec * CBM_NS_PER_SEC) + (int64_t)st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * CBM_NS_PER_SEC;
-#else
-    return ((int64_t)st->st_mtim.tv_sec * CBM_NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
-#endif
-}
-
 /* ── File classification ─────────────────────────────────────────── */
 
-/* Classify discovered files against stored hashes using mtime+size.
+/* Classify discovered files against stored metadata and content hashes.
  * Returns a boolean array: changed[i] = true if files[i] needs re-parsing.
  * Caller must free the returned array. */
 static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_hash_t *stored,
-                            int stored_count, int *out_changed, int *out_unchanged) {
+                            int stored_count, const cbm_file_version_snapshot_t *versions,
+                            int *out_changed, int *out_unchanged) {
     bool *changed = calloc((size_t)file_count, sizeof(bool));
     if (!changed) {
         return NULL;
@@ -86,10 +84,19 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
     int n_unchanged = 0;
 
     /* Build lookup: rel_path -> stored hash */
-    CBMHashTable *ht =
-        cbm_ht_create(stored_count > 0 ? (size_t)stored_count * PAIR_LEN : CBM_SZ_64);
+    uint32_t capacity = stored_count > 0 ? (uint32_t)stored_count * PAIR_LEN : CBM_SZ_64;
+    CBMHashTable *ht = cbm_ht_create(capacity);
+    if (!ht) {
+        free(changed);
+        return NULL;
+    }
     for (int i = 0; i < stored_count; i++) {
-        cbm_ht_set(ht, stored[i].rel_path, &stored[i]);
+        (void)cbm_ht_set(ht, stored[i].rel_path, &stored[i]);
+        if (cbm_ht_get(ht, stored[i].rel_path) != &stored[i]) {
+            cbm_ht_free(ht);
+            free(changed);
+            return NULL;
+        }
     }
 
     for (int i = 0; i < file_count; i++) {
@@ -101,14 +108,17 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
             continue;
         }
 
-        struct stat st;
-        if (stat(files[i].path, &st) != 0) {
-            changed[i] = true;
-            n_changed++;
-            continue;
-        }
-
-        if (stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
+        bool missing_digest = !h->sha256 || !h->sha256[0];
+        bool metadata_matches = versions[i].mtime_ns == h->mtime_ns && versions[i].size == h->size;
+        bool stable_oversized = versions[i].content_skipped && missing_digest && metadata_matches;
+        bool content_changed = versions[i].verified && h->sha256 && h->sha256[0] &&
+                               strcmp(versions[i].sha256, h->sha256) != 0;
+        /* Once a digest exists it is authoritative. Classification already
+         * hashed every eligible file, so forcing a parse for a timestamp-only
+         * touch would add work without changing the content-derived graph.
+         * Legacy/read-failed empty rows retry; a still-oversized empty row with
+         * unchanged metadata remains a bounded noop. */
+        if (!stable_oversized && (!versions[i].verified || missing_digest || content_changed)) {
             changed[i] = true;
             n_changed++;
         } else {
@@ -150,10 +160,9 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  * opposed to seeing it as "never existed" → noop → orphaned graph nodes).
  *
  * Fail-safe rules (preserve nodes on uncertainty):
- *   - repo_path NULL → log error and preserve everything (return 0
- *     deletions, empty mode_skipped). The caller contract is that
- *     repo_path is required; a NULL means a misconfigured pipeline,
- *     not a deletion signal.
+ *   - repo_path NULL or any allocation/indexing failure → return -1 and abort
+ *     the incremental publication. Returning a partial preservation list can
+ *     orphan nodes from their hash rows on the next generation.
  *   - snprintf truncation (combined path ≥ CBM_SZ_4K) → preserve. We can't
  *     reliably stat a truncated path. Treat as mode-skipped.
  *   - stat() errno != ENOENT/ENOTDIR (EACCES, EIO, ELOOP, transient NFS,
@@ -172,16 +181,23 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
     *out_mode_skipped_count = 0;
 
     if (!repo_path) {
-        /* Misconfigured pipeline. Preserve everything rather than risk
-         * silently re-introducing the destructive overwrite this function
-         * was rewritten to prevent. */
         cbm_log_error("incremental.err", "msg", "find_deleted_files_null_repo_path");
-        return 0;
+        return CBM_NOT_FOUND;
     }
 
-    CBMHashTable *current = cbm_ht_create((size_t)file_count * PAIR_LEN);
+    uint32_t current_capacity = file_count > 0 ? (uint32_t)file_count * PAIR_LEN : CBM_SZ_64;
+    CBMHashTable *current = cbm_ht_create(current_capacity);
+    if (!current) {
+        cbm_log_error("incremental.err", "msg", "find_deleted_files_oom_index");
+        return CBM_NOT_FOUND;
+    }
     for (int i = 0; i < file_count; i++) {
-        cbm_ht_set(current, files[i].rel_path, &files[i]);
+        (void)cbm_ht_set(current, files[i].rel_path, &files[i]);
+        if (cbm_ht_get(current, files[i].rel_path) != &files[i]) {
+            cbm_log_error("incremental.err", "msg", "find_deleted_files_index_insert_failed");
+            cbm_ht_free(current);
+            return CBM_NOT_FOUND;
+        }
     }
 
     int del_count = 0;
@@ -190,7 +206,7 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
     if (!deleted) {
         cbm_log_error("incremental.err", "msg", "find_deleted_files_oom");
         cbm_ht_free(current);
-        return 0;
+        return CBM_NOT_FOUND;
     }
 
     int ms_count = 0;
@@ -200,7 +216,7 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
         cbm_log_error("incremental.err", "msg", "find_deleted_files_oom_ms");
         free(deleted);
         cbm_ht_free(current);
-        return 0;
+        return CBM_NOT_FOUND;
     }
 
     for (int i = 0; i < stored_count; i++) {
@@ -234,13 +250,19 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
             /* Carry forward the existing hash row so subsequent reindexes
              * can correctly classify this file. */
             if (ms_count >= ms_cap) {
-                ms_cap *= PAIR_LEN;
-                cbm_file_hash_t *tmp = realloc(mode_skipped, (size_t)ms_cap * sizeof(*tmp));
+                if (ms_cap > INT_MAX / PAIR_LEN ||
+                    (size_t)ms_cap * PAIR_LEN > SIZE_MAX / sizeof(*mode_skipped)) {
+                    cbm_log_error("incremental.err", "msg", "find_deleted_files_capacity_ms");
+                    goto fail;
+                }
+                int next_cap = ms_cap * PAIR_LEN;
+                cbm_file_hash_t *tmp = realloc(mode_skipped, (size_t)next_cap * sizeof(*tmp));
                 if (!tmp) {
                     cbm_log_error("incremental.err", "msg", "find_deleted_files_realloc_oom_ms");
-                    break;
+                    goto fail;
                 }
                 mode_skipped = tmp;
+                ms_cap = next_cap;
             }
             char *rp = strdup(stored[i].rel_path);
             char *sh = stored[i].sha256 ? strdup(stored[i].sha256) : NULL;
@@ -253,7 +275,7 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
                               stored[i].rel_path);
                 free(rp);
                 free(sh);
-                break;
+                goto fail;
             }
             mode_skipped[ms_count].project = NULL; /* unused by upsert API */
             mode_skipped[ms_count].rel_path = rp;
@@ -266,15 +288,26 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
 
         /* File is truly gone — record for purge. */
         if (del_count >= del_cap) {
-            del_cap *= PAIR_LEN;
-            char **tmp = realloc(deleted, (size_t)del_cap * sizeof(char *));
+            if (del_cap > INT_MAX / PAIR_LEN ||
+                (size_t)del_cap * PAIR_LEN > SIZE_MAX / sizeof(*deleted)) {
+                cbm_log_error("incremental.err", "msg", "find_deleted_files_capacity");
+                goto fail;
+            }
+            int next_cap = del_cap * PAIR_LEN;
+            char **tmp = realloc(deleted, (size_t)next_cap * sizeof(char *));
             if (!tmp) {
                 cbm_log_error("incremental.err", "msg", "find_deleted_files_realloc_oom");
-                break;
+                goto fail;
             }
             deleted = tmp;
+            del_cap = next_cap;
         }
-        deleted[del_count++] = strdup(stored[i].rel_path);
+        deleted[del_count] = strdup(stored[i].rel_path);
+        if (!deleted[del_count]) {
+            cbm_log_error("incremental.err", "msg", "find_deleted_files_deleted_strdup_oom");
+            goto fail;
+        }
+        del_count++;
     }
 
     cbm_ht_free(current);
@@ -282,6 +315,19 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
     *out_mode_skipped = mode_skipped;
     *out_mode_skipped_count = ms_count;
     return del_count;
+
+fail:
+    cbm_ht_free(current);
+    for (int i = 0; i < del_count; i++) {
+        free(deleted[i]);
+    }
+    free(deleted);
+    for (int i = 0; i < ms_count; i++) {
+        free((void *)mode_skipped[i].rel_path);
+        free((void *)mode_skipped[i].sha256);
+    }
+    free(mode_skipped);
+    return CBM_NOT_FOUND;
 }
 
 /* Free a mode_skipped array allocated by find_deleted_files. */
@@ -334,6 +380,7 @@ typedef struct {
     cbm_saved_edge_t *items;
     int count;
     int cap;
+    bool failed;
 } cbm_edge_capture_t;
 
 /* Edge types that must NOT be re-linked from the pre-purge snapshot, because a
@@ -361,6 +408,9 @@ static bool incr_edge_type_is_recomputed(const char *type) {
  * changed files so they survive the purge and can be re-linked afterward. */
 static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
     cbm_edge_capture_t *cap = (cbm_edge_capture_t *)userdata;
+    if (!cap || cap->failed) {
+        return;
+    }
     if (incr_edge_type_is_recomputed(edge->type)) {
         return;
     }
@@ -378,11 +428,17 @@ static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdat
         return;
     }
     if (cap->count >= cap->cap) {
+        if (cap->cap > INT_MAX / PAIR_LEN ||
+            (cap->cap > 0 && (size_t)cap->cap * PAIR_LEN > SIZE_MAX / sizeof(*cap->items))) {
+            cap->failed = true;
+            return;
+        }
         int ncap = (cap->cap > 0) ? cap->cap * PAIR_LEN : CBM_SZ_64;
         cbm_saved_edge_t *tmp = realloc(cap->items, (size_t)ncap * sizeof(*tmp));
         if (!tmp) {
-            cbm_log_warn("incremental.edge_snapshot_oom", "captured", itoa_buf(cap->count));
-            return; /* best-effort: stop capturing, keep what we have */
+            cbm_log_error("incremental.edge_snapshot_oom", "captured", itoa_buf(cap->count));
+            cap->failed = true;
+            return;
         }
         cap->items = tmp;
         cap->cap = ncap;
@@ -397,6 +453,8 @@ static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdat
         free(s->target_qn);
         free(s->type);
         free(s->props);
+        memset(s, 0, sizeof(*s));
+        cap->failed = true;
         return;
     }
     cap->count++;
@@ -446,23 +504,16 @@ static void incr_free_edge_capture(cbm_edge_capture_t *cap) {
  * potential orphaned-node revival for mode_skipped). The warning surface
  * is the only signal that something went wrong. */
 static int persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
-                          int file_count, const cbm_file_hash_t *mode_skipped,
-                          int mode_skipped_count) {
+                          int file_count, const cbm_file_version_snapshot_t *versions,
+                          const cbm_file_hash_t *mode_skipped, int mode_skipped_count) {
     int current_failed = 0;
     int ms_failed = 0;
 
-    /* Current discovery: re-stat to capture any mtime/size that changed
-     * during the run, and write fresh hash rows for visited files. */
+    /* Current discovery: persist the exact pre-extraction generations after
+     * dump_and_persist has verified the live paths still contain those bytes. */
     for (int i = 0; i < file_count; i++) {
-        struct stat st;
-        if (stat(files[i].path, &st) != 0) {
-            current_failed++;
-            cbm_log_warn("incremental.persist_hash_failed", "scope", "stat", "rel_path",
-                         files[i].rel_path);
-            continue;
-        }
-        int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, "",
-                                            stat_mtime_ns(&st), st.st_size);
+        int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, versions[i].sha256,
+                                            versions[i].mtime_ns, versions[i].size);
         if (rc != CBM_STORE_OK) {
             cbm_log_warn("incremental.persist_hash_failed", "scope", "current", "rel_path",
                          files[i].rel_path, "rc", itoa_buf(rc));
@@ -534,9 +585,16 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     cbm_registry_add(r, node->name, node->qualified_name, node->label);
 }
 
-/* Run parallel or sequential extract+resolve for changed files. */
-static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci) {
+/* Run parallel or sequential extract+resolve for changed files. The digest on
+ * every extraction result must match the generation selected at
+ * classification time; otherwise the caller leaves the completed DB intact. */
+static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
+                               cbm_file_version_snapshot_t *versions) {
     struct timespec t;
+
+    if (ci <= 0) {
+        return CBM_STORE_OK;
+    }
 
     /* Per-file LSP always runs (every mode). Cross-file LSP stays disabled in
      * incremental regardless (cbm_parallel_resolve is called with NULL
@@ -554,45 +612,84 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
         atomic_init(&shared_ids, cbm_gbuf_next_id(ctx->gbuf));
 
         CBMFileResult **cache = (CBMFileResult **)calloc(ci, sizeof(CBMFileResult *));
-        if (cache) {
-            cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-            cbm_parallel_extract(ctx, changed_files, ci, cache, &shared_ids, worker_count);
+        if (!cache) {
+            return CBM_STORE_ERR;
+        }
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        int rc = cbm_parallel_extract(ctx, changed_files, ci, cache, &shared_ids, worker_count);
+        if (rc == 0) {
             cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
             cbm_log_info("pass.timing", "pass", "incr_extract", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t)));
+            rc = cbm_pipeline_verify_extracted_versions(changed_files, ci, versions, cache);
+        }
 
+        if (rc == 0) {
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-            cbm_build_registry_from_cache(ctx, changed_files, ci, cache);
+            rc = cbm_build_registry_from_cache(ctx, changed_files, ci, cache);
             cbm_log_info("pass.timing", "pass", "incr_registry", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t)));
+        }
 
-            /* Incremental skips cross-file LSP precondition build — it
-             * would need all_defs from the full project, not just the
-             * changed slice. Per-file LSP (run inside cbm_extract_file)
-             * still fires; cross-file resolution is deferred to the
-             * next full re-index. Pass NULL/0/NULL to make the fused
-             * step in resolve_worker a no-op. */
+        /* Incremental skips cross-file LSP precondition build — it
+         * would need all_defs from the full project, not just the
+         * changed slice. Per-file LSP (run inside cbm_extract_file)
+         * still fires; cross-file resolution is deferred to the
+         * next full re-index. Pass NULL/0/NULL to make the fused
+         * step in resolve_worker a no-op. */
+        if (rc == 0) {
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-            cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count, NULL, 0,
-                                 NULL, NULL /* module_def_index */,
-                                 NULL /* cross_registries — incremental skips Tier 2 prebuild */);
+            rc = cbm_parallel_resolve(
+                ctx, changed_files, ci, cache, &shared_ids, worker_count, NULL, 0, NULL,
+                NULL /* module_def_index */,
+                NULL /* cross_registries — incremental skips Tier 2 prebuild */);
             cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
             cbm_log_info("pass.timing", "pass", "incr_resolve", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t)));
-
-            for (int j = 0; j < ci; j++) {
-                if (cache[j]) {
-                    cbm_free_result(cache[j]);
-                }
-            }
-            free(cache);
         }
+
+        for (int j = 0; j < ci; j++) {
+            if (cache[j]) {
+                cbm_free_result(cache[j]);
+            }
+        }
+        free(cache);
+        cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
+        cbm_pipeline_set_pkgmap(NULL);
+        return rc;
     } else {
         cbm_log_info("incremental.mode", "mode", "sequential", "changed", itoa_buf(ci));
-        cbm_pipeline_pass_definitions(ctx, changed_files, ci);
-        cbm_pipeline_pass_calls(ctx, changed_files, ci);
-        cbm_pipeline_pass_usages(ctx, changed_files, ci);
-        cbm_pipeline_pass_semantic(ctx, changed_files, ci);
+        CBMFileResult **cache = (CBMFileResult **)calloc((size_t)ci, sizeof(*cache));
+        if (!cache) {
+            return CBM_STORE_ERR;
+        }
+        ctx->result_cache = cache;
+        cbm_pipeline_set_pkgmap(cbm_pkgmap_build_from_repo_snapshot(
+            ctx->repo_path, NULL, 0, ctx->project_name, ctx->excluded_dirs, ctx->excluded_count,
+            ctx->pipeline ? cbm_pipeline_userconfig_snapshot(ctx->pipeline) : NULL));
+        int rc = cbm_pipeline_pass_definitions(ctx, changed_files, ci);
+        if (rc == 0) {
+            rc = cbm_pipeline_verify_extracted_versions(changed_files, ci, versions, cache);
+        }
+        if (rc == 0) {
+            rc = cbm_pipeline_pass_calls(ctx, changed_files, ci);
+        }
+        if (rc == 0) {
+            rc = cbm_pipeline_pass_usages(ctx, changed_files, ci);
+        }
+        if (rc == 0) {
+            rc = cbm_pipeline_pass_semantic(ctx, changed_files, ci);
+        }
+        for (int i = 0; i < ci; i++) {
+            if (cache[i]) {
+                cbm_free_result(cache[i]);
+            }
+        }
+        free(cache);
+        ctx->result_cache = NULL;
+        cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
+        cbm_pipeline_set_pkgmap(NULL);
+        return rc;
     }
 }
 
@@ -641,20 +738,46 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
-static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                            cbm_file_info_t *files, int file_count,
+static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const char *db_path,
+                            const char *project, cbm_file_info_t *files, int file_count,
+                            cbm_file_version_snapshot_t *versions,
                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                            const char *repo_path, const cbm_coverage_row_t *cov, int cov_count) {
+                            const cbm_coverage_row_t *cov, int cov_count) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
-    char staged_path[CBM_SZ_4K];
-    if (snprintf(staged_path, sizeof(staged_path), "%s.building", db_path) >=
-        (int)sizeof(staged_path)) {
+    if (cbm_pipeline_verify_input_snapshot(pipeline) != CBM_STORE_OK ||
+        cbm_pipeline_verify_file_versions(files, file_count, versions) != CBM_STORE_OK) {
+        cbm_log_error("incremental.err", "msg", "input_changed_during_index", "project", project);
         return CBM_STORE_ERR;
     }
-    cbm_unlink(staged_path);
-    cbm_remove_db_sidecars(staged_path);
+
+    size_t db_path_len = strlen(db_path);
+    static const char building_suffix[] = ".building.XXXXXX";
+    if (db_path_len > SIZE_MAX - sizeof(building_suffix)) {
+        return CBM_STORE_ERR;
+    }
+    char *staged_path = (char *)malloc(db_path_len + sizeof(building_suffix));
+    if (!staged_path) {
+        return CBM_STORE_ERR;
+    }
+    memcpy(staged_path, db_path, db_path_len);
+    memcpy(staged_path + db_path_len, building_suffix, sizeof(building_suffix));
+    int staged_fd = cbm_mkstemp(staged_path);
+    if (staged_fd < 0) {
+        free(staged_path);
+        return CBM_STORE_ERR;
+    }
+#ifdef _WIN32
+    int staged_close_rc = _close(staged_fd);
+#else
+    int staged_close_rc = close(staged_fd);
+#endif
+    if (staged_close_rc != 0) {
+        cbm_unlink(staged_path);
+        free(staged_path);
+        return CBM_STORE_ERR;
+    }
 
     int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, staged_path);
     cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "elapsed_ms",
@@ -662,6 +785,7 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
     if (dump_rc != 0) {
         cbm_unlink(staged_path);
         cbm_remove_db_sidecars(staged_path);
+        free(staged_path);
         return dump_rc;
     }
 
@@ -670,11 +794,12 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         cbm_log_error("incremental.err", "msg", "reopen_persisted_db", "project", project);
         cbm_unlink(staged_path);
         cbm_remove_db_sidecars(staged_path);
+        free(staged_path);
         return CBM_STORE_ERR;
     }
     {
-        bool persist_ok = persist_hashes(hash_store, project, files, file_count, mode_skipped,
-                                         mode_skipped_count) == CBM_STORE_OK;
+        bool persist_ok = persist_hashes(hash_store, project, files, file_count, versions,
+                                         mode_skipped, mode_skipped_count) == CBM_STORE_OK;
 
         /* Coverage rows (#963): re-write the merged set into the rebuilt DB
          * (AFTER hashes, so the deleted-file prune sees the live file set). */
@@ -692,24 +817,35 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
             CBM_STORE_OK) {
             persist_ok = false;
         }
-        if (persist_ok && cbm_store_exec(hash_store,
+        if (persist_ok &&
+            cbm_store_exec(hash_store,
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
                            "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
                            "FROM nodes;") != CBM_STORE_OK) {
-            if (cbm_store_exec(hash_store,
-                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                               "SELECT id, name, qualified_name, label, file_path FROM nodes;") !=
+            if (cbm_store_exec(
+                    hash_store,
+                    "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                    "SELECT id, name, qualified_name, label, file_path FROM nodes;") !=
                 CBM_STORE_OK) {
                 persist_ok = false;
             }
         }
 
-        if (!persist_ok || cbm_store_mark_index_complete(hash_store, project) != CBM_STORE_OK ||
+        const char *config_fingerprint = cbm_pipeline_config_fingerprint(pipeline);
+        const char *input_fingerprint = cbm_pipeline_userconfig_fingerprint(pipeline);
+        if (!persist_ok || !cbm_pipeline_input_generation_ok(pipeline) ||
+            cbm_pipeline_verify_input_snapshot(pipeline) != CBM_STORE_OK ||
+            cbm_pipeline_verify_discovery_set(pipeline, files, file_count) != CBM_STORE_OK ||
+            !config_fingerprint || !input_fingerprint ||
+            cbm_store_mark_index_complete_with_inputs(
+                hash_store, project, config_fingerprint, input_fingerprint,
+                cbm_pipeline_get_effective_mode(pipeline)) != CBM_STORE_OK ||
             cbm_store_checkpoint(hash_store) != CBM_STORE_OK) {
             cbm_log_error("incremental.err", "msg", "publish_snapshot", "project", project);
             cbm_store_close(hash_store);
             cbm_unlink(staged_path);
             cbm_remove_db_sidecars(staged_path);
+            free(staged_path);
             return CBM_STORE_ERR;
         }
 
@@ -720,15 +856,19 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         cbm_log_error("incremental.err", "msg", "install_snapshot", "project", project);
         cbm_unlink(staged_path);
         cbm_remove_db_sidecars(staged_path);
+        free(staged_path);
         return CBM_STORE_ERR;
     }
     cbm_unlink(staged_path);
     cbm_remove_db_sidecars(staged_path);
+    free(staged_path);
 
     /* Auto-update artifact if one already exists (persistence was enabled previously) */
+    const char *repo_path = cbm_pipeline_repo_path(pipeline);
     if (repo_path && cbm_artifact_exists(repo_path)) {
         if (cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST) != 0) {
-            return CBM_STORE_ERR;
+            const char *err = cbm_artifact_export_last_error();
+            cbm_log_warn("incremental.artifact_export_failed", "err", err ? err : "unknown");
         }
     }
     return 0;
@@ -753,13 +893,37 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Load stored file hashes */
     cbm_file_hash_t *stored = NULL;
     int stored_count = 0;
-    cbm_store_get_file_hashes(store, project, &stored, &stored_count);
+    if (cbm_store_get_file_hashes(store, project, &stored, &stored_count) != CBM_STORE_OK) {
+        cbm_store_close(store);
+        return CBM_STORE_ERR;
+    }
+
+    /* Hash every size-eligible discovered file exactly once for
+     * classification. Oversized/read-skipped files retain an unverified empty
+     * digest without an unbounded read. Snapshots are reused for extraction
+     * validation and persistence; the noop path never re-hashes a file. */
+    cbm_file_version_snapshot_t *versions = (cbm_file_version_snapshot_t *)calloc(
+        (size_t)(file_count > 0 ? file_count : 1), sizeof(*versions));
+    if (!versions ||
+        cbm_pipeline_capture_file_versions(files, file_count, versions) != CBM_STORE_OK) {
+        free(versions);
+        cbm_store_free_file_hashes(stored, stored_count);
+        cbm_store_close(store);
+        return CBM_STORE_ERR;
+    }
+    cbm_pipeline_run_snapshot_hook_for_test();
 
     /* Classify files */
     int n_changed = 0;
     int n_unchanged = 0;
     bool *is_changed =
-        classify_files(files, file_count, stored, stored_count, &n_changed, &n_unchanged);
+        classify_files(files, file_count, stored, stored_count, versions, &n_changed, &n_unchanged);
+    if (!is_changed && file_count > 0) {
+        free(versions);
+        cbm_store_free_file_hashes(stored, stored_count);
+        cbm_store_close(store);
+        return CBM_STORE_ERR;
+    }
 
     /* Classify stored files absent from current discovery: truly-deleted
      * (purge) vs mode-skipped (preserve nodes AND hash rows). */
@@ -769,6 +933,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int deleted_count =
         find_deleted_files(cbm_pipeline_repo_path(p), files, file_count, stored, stored_count,
                            &deleted, &mode_skipped, &mode_skipped_count);
+    if (deleted_count < 0) {
+        free(is_changed);
+        free(versions);
+        cbm_store_free_file_hashes(stored, stored_count);
+        cbm_store_close(store);
+        return CBM_STORE_ERR;
+    }
 
     cbm_log_info("incremental.classify", "changed", itoa_buf(n_changed), "unchanged",
                  itoa_buf(n_unchanged), "deleted", itoa_buf(deleted_count), "mode_skipped",
@@ -778,10 +949,25 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * which means existing hash rows (including for any mode-skipped files
      * that were already preserved by an earlier run) remain intact. */
     if (n_changed == 0 && deleted_count == 0) {
+        if (!cbm_pipeline_input_generation_ok(p) ||
+            cbm_pipeline_verify_input_snapshot(p) != CBM_STORE_OK ||
+            cbm_pipeline_verify_file_versions(files, file_count, versions) != CBM_STORE_OK ||
+            cbm_pipeline_verify_discovery_set(p, files, file_count) != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "msg", "input_changed_during_noop", "project",
+                          project);
+            free(is_changed);
+            free(deleted);
+            free_mode_skipped(mode_skipped, mode_skipped_count);
+            free(versions);
+            cbm_store_free_file_hashes(stored, stored_count);
+            cbm_store_close(store);
+            return CBM_STORE_ERR;
+        }
         cbm_log_info("incremental.noop", "reason", "no_changes");
         free(is_changed);
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
+        free(versions);
         cbm_store_free_file_hashes(stored, stored_count);
         cbm_store_close(store);
         return 0;
@@ -794,15 +980,47 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * still open) so entries for files NOT re-extracted this run survive. */
     cbm_coverage_row_t *old_cov = NULL;
     int old_cov_count = 0;
-    (void)cbm_store_coverage_get(store, project, &old_cov, &old_cov_count);
+    if (cbm_store_coverage_get(store, project, &old_cov, &old_cov_count) != CBM_STORE_OK) {
+        free(is_changed);
+        for (int i = 0; i < deleted_count; i++) {
+            free(deleted[i]);
+        }
+        free(deleted);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        free(versions);
+        cbm_store_close(store);
+        return CBM_STORE_ERR;
+    }
 
     /* Build list of changed files */
     cbm_file_info_t *changed_files =
         (n_changed > 0) ? malloc((size_t)n_changed * sizeof(cbm_file_info_t)) : NULL;
+    cbm_file_version_snapshot_t *changed_versions =
+        (n_changed > 0) ? malloc((size_t)n_changed * sizeof(cbm_file_version_snapshot_t)) : NULL;
+    int *changed_indices =
+        (n_changed > 0) ? malloc((size_t)n_changed * sizeof(*changed_indices)) : NULL;
+    if (n_changed > 0 && (!changed_files || !changed_versions || !changed_indices)) {
+        free(changed_files);
+        free(changed_versions);
+        free(changed_indices);
+        free(is_changed);
+        for (int i = 0; i < deleted_count; i++) {
+            free(deleted[i]);
+        }
+        free(deleted);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_store_free_coverage(old_cov, old_cov_count);
+        cbm_store_close(store);
+        free(versions);
+        return CBM_STORE_ERR;
+    }
     int ci = 0;
     for (int i = 0; i < file_count; i++) {
         if (is_changed[i]) {
-            changed_files[ci++] = files[i];
+            changed_files[ci] = files[i];
+            changed_versions[ci] = versions[i];
+            changed_indices[ci] = i;
+            ci++;
         }
     }
     free(is_changed);
@@ -814,16 +1032,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Step 1: Load existing graph into RAM */
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_gbuf_t *existing = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
-    int load_rc = cbm_gbuf_load_from_db(existing, db_path, project);
+    int load_rc = existing ? cbm_gbuf_load_from_db(existing, db_path, project) : CBM_STORE_ERR;
     cbm_log_info("incremental.load_db", "rc", itoa_buf(load_rc), "nodes",
-                 itoa_buf(cbm_gbuf_node_count(existing)), "edges",
-                 itoa_buf(cbm_gbuf_edge_count(existing)), "elapsed_ms",
+                 itoa_buf(existing ? cbm_gbuf_node_count(existing) : 0), "edges",
+                 itoa_buf(existing ? cbm_gbuf_edge_count(existing) : 0), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
 
     if (load_rc != 0) {
         cbm_log_error("incremental.err", "msg", "load_db_failed");
         cbm_gbuf_free(existing);
         free(changed_files);
+        free(changed_versions);
+        free(changed_indices);
         for (int i = 0; i < deleted_count; i++) {
             free(deleted[i]);
         }
@@ -831,6 +1051,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_free_coverage(old_cov, old_cov_count);
         cbm_store_close(store);
+        free(versions);
         return CBM_NOT_FOUND;
     }
 
@@ -842,15 +1063,40 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_edge_capture_t edge_cap = {0};
     edge_cap.gbuf = existing;
     {
-        CBMHashTable *changed_paths = cbm_ht_create(ci > 0 ? (size_t)ci * PAIR_LEN : CBM_SZ_64);
-        for (int i = 0; i < ci; i++) {
-            cbm_ht_set(changed_paths, changed_files[i].rel_path, &changed_files[i]);
+        uint32_t changed_capacity = ci > 0 ? (uint32_t)ci * PAIR_LEN : CBM_SZ_64;
+        CBMHashTable *changed_paths = cbm_ht_create(changed_capacity);
+        if (!changed_paths) {
+            edge_cap.failed = true;
+        }
+        for (int i = 0; !edge_cap.failed && i < ci; i++) {
+            (void)cbm_ht_set(changed_paths, changed_files[i].rel_path, &changed_files[i]);
+            if (cbm_ht_get(changed_paths, changed_files[i].rel_path) != &changed_files[i]) {
+                edge_cap.failed = true;
+            }
         }
         edge_cap.changed_paths = changed_paths;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-        cbm_gbuf_foreach_edge(existing, incr_capture_inbound_edge, &edge_cap);
+        if (!edge_cap.failed) {
+            cbm_gbuf_foreach_edge(existing, incr_capture_inbound_edge, &edge_cap);
+        }
         edge_cap.changed_paths = NULL;
         cbm_ht_free(changed_paths); /* keys borrowed from changed_files; not freed here */
+    }
+    if (edge_cap.failed) {
+        cbm_log_error("incremental.err", "msg", "edge_snapshot_incomplete");
+        incr_free_edge_capture(&edge_cap);
+        free(changed_files);
+        free(changed_versions);
+        free(changed_indices);
+        for (int i = 0; i < deleted_count; i++) {
+            free(deleted[i]);
+        }
+        free(deleted);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_store_free_coverage(old_cov, old_cov_count);
+        cbm_gbuf_free(existing);
+        free(versions);
+        return CBM_STORE_ERR;
     }
     cbm_log_info("incremental.edge_snapshot", "captured", itoa_buf(edge_cap.count), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
@@ -869,6 +1115,17 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     /* Step 3-5: Registry + extract + resolve */
     cbm_registry_t *registry = cbm_registry_new();
+    if (!registry) {
+        incr_free_edge_capture(&edge_cap);
+        free(changed_files);
+        free(changed_versions);
+        free(changed_indices);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_store_free_coverage(old_cov, old_cov_count);
+        cbm_gbuf_free(existing);
+        free(versions);
+        return CBM_STORE_ERR;
+    }
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_gbuf_foreach_node(existing, registry_visitor, registry);
     cbm_log_info("incremental.registry_seed", "symbols", itoa_buf(cbm_registry_size(registry)),
@@ -882,8 +1139,43 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int excluded_count = 0;
     cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
 
-    cbm_path_alias_collection_t *path_aliases =
-        cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs, excluded_count);
+    cbm_path_alias_collection_t *path_aliases = cbm_load_path_aliases_excluded_snapshot(
+        cbm_pipeline_repo_path(p), excluded_dirs, excluded_count,
+        cbm_pipeline_userconfig_snapshot(p));
+    CBMHashTable *source_version_index =
+        cbm_ht_create(file_count > 0 ? (uint32_t)file_count * PAIR_LEN : CBM_SZ_64);
+    if (!source_version_index) {
+        cbm_path_alias_collection_free(path_aliases);
+        cbm_registry_free(registry);
+        incr_free_edge_capture(&edge_cap);
+        free(changed_files);
+        free(changed_versions);
+        free(changed_indices);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_store_free_coverage(old_cov, old_cov_count);
+        cbm_gbuf_free(existing);
+        free(versions);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].rel_path) {
+            (void)cbm_ht_set(source_version_index, files[i].rel_path, &versions[i]);
+            if (cbm_ht_get(source_version_index, files[i].rel_path) != &versions[i]) {
+                cbm_path_alias_collection_free(path_aliases);
+                cbm_ht_free(source_version_index);
+                cbm_registry_free(registry);
+                incr_free_edge_capture(&edge_cap);
+                free(changed_files);
+                free(changed_versions);
+                free(changed_indices);
+                free_mode_skipped(mode_skipped, mode_skipped_count);
+                cbm_store_free_coverage(old_cov, old_cov_count);
+                cbm_gbuf_free(existing);
+                free(versions);
+                return CBM_STORE_ERR;
+            }
+        }
+    }
 
     cbm_pipeline_ctx_t ctx = {
         .project_name = project,
@@ -892,33 +1184,52 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
         .pipeline = p, /* so passes can record per-file skips (Track B) */
-        .mode = cbm_pipeline_get_mode(p),
+        .mode = cbm_pipeline_get_effective_mode(p),
+        .source_version_files = files,
+        .source_versions = versions,
+        .source_version_count = file_count,
+        .source_version_index = source_version_index,
         .path_aliases = path_aliases,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
     };
 
-    for (int i = 0; i < ci; i++) {
+    bool file_nodes_ok = true;
+    for (int i = 0; file_nodes_ok && i < ci; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
-        if (file_qn) {
-            cbm_gbuf_upsert_node(existing, "File", changed_files[i].rel_path, file_qn,
-                                 changed_files[i].rel_path, 0, 0, "{}");
-            free(file_qn);
+        if (!file_qn) {
+            file_nodes_ok = false;
+            break;
         }
+        file_nodes_ok = cbm_gbuf_upsert_node(existing, "File", changed_files[i].rel_path, file_qn,
+                                             changed_files[i].rel_path, 0, 0, "{}") > 0;
+        free(file_qn);
     }
 
-    run_extract_resolve(&ctx, changed_files, ci);
-    cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
-    int postpass_rc = run_postpasses(&ctx, changed_files, ci, files, file_count, project);
+    int postpass_rc = file_nodes_ok ? run_extract_resolve(&ctx, changed_files, ci, changed_versions)
+                                    : CBM_STORE_ERR;
+    if (postpass_rc == 0) {
+        for (int i = 0; i < ci; i++) {
+            versions[changed_indices[i]] = changed_versions[i];
+        }
+        postpass_rc = cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
+    }
+    if (postpass_rc == 0) {
+        postpass_rc = run_postpasses(&ctx, changed_files, ci, files, file_count, project);
+    }
     if (postpass_rc != 0) {
-        cbm_log_error("incremental.err", "msg", "design_context_failed");
+        cbm_log_error("incremental.err", "msg", "extract_or_postpass_failed");
         free(changed_files);
+        free(changed_versions);
+        free(changed_indices);
         cbm_registry_free(registry);
         cbm_path_alias_collection_free(path_aliases);
+        cbm_ht_free(source_version_index);
         incr_free_edge_capture(&edge_cap);
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_free_coverage(old_cov, old_cov_count);
         cbm_gbuf_free(existing);
+        free(versions);
         return postpass_rc;
     }
 
@@ -942,46 +1253,83 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, NULL);
     cbm_coverage_row_t *cov = NULL;
     int cov_n = 0;
-    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
-    if (cov_cap > 0) {
-        cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
+    bool coverage_ok = old_cov_count >= 0 && run_err_count >= 0 && run_excluded_count >= 0 &&
+                       run_ignored_count >= 0;
+    size_t cov_cap = coverage_ok ? (size_t)old_cov_count : 0;
+    if (coverage_ok &&
+        ((size_t)run_err_count > SIZE_MAX - cov_cap ||
+         (cov_cap += (size_t)run_err_count, (size_t)run_excluded_count > SIZE_MAX - cov_cap) ||
+         (cov_cap += (size_t)run_excluded_count, (size_t)run_ignored_count > SIZE_MAX - cov_cap))) {
+        coverage_ok = false;
     }
-    if (cov) {
-        CBMHashTable *changed_set = cbm_ht_create(ci > 0 ? (size_t)ci * PAIR_LEN : CBM_SZ_64);
-        for (int i = 0; i < ci; i++) {
-            cbm_ht_set(changed_set, changed_files[i].rel_path, &changed_files[i]);
+    if (coverage_ok) {
+        cov_cap += (size_t)run_ignored_count;
+        if (cov_cap > SIZE_MAX / sizeof(*cov)) {
+            coverage_ok = false;
+        }
+    }
+    if (coverage_ok && cov_cap > 0) {
+        cov = (cbm_coverage_row_t *)malloc(cov_cap * sizeof(*cov));
+        coverage_ok = cov != NULL;
+    }
+    if (coverage_ok && cov) {
+        uint32_t changed_capacity = ci > 0 ? (uint32_t)ci * PAIR_LEN : CBM_SZ_64;
+        CBMHashTable *changed_set = cbm_ht_create(changed_capacity);
+        coverage_ok = changed_set != NULL;
+        for (int i = 0; coverage_ok && i < ci; i++) {
+            (void)cbm_ht_set(changed_set, changed_files[i].rel_path, &changed_files[i]);
+            coverage_ok = cbm_ht_get(changed_set, changed_files[i].rel_path) == &changed_files[i];
         }
         for (int i = 0; i < old_cov_count; i++) {
             bool by_design = old_cov[i].kind && strncmp(old_cov[i].kind, "not_indexed", 11) == 0;
-            if (!by_design && old_cov[i].rel_path &&
+            if (coverage_ok && !by_design && old_cov[i].rel_path &&
                 !cbm_ht_get(changed_set, old_cov[i].rel_path)) {
                 cov[cov_n++] = old_cov[i];
             }
         }
         cbm_ht_free(changed_set);
-        for (int i = 0; i < run_err_count; i++) {
+        for (int i = 0; coverage_ok && i < run_err_count; i++) {
             cov[cov_n].rel_path = run_errs[i].path;
             cov[cov_n].kind = run_errs[i].phase;
             cov[cov_n].detail = run_errs[i].reason;
             cov_n++;
         }
-        for (int i = 0; i < run_excluded_count; i++) {
+        for (int i = 0; coverage_ok && i < run_excluded_count; i++) {
             cov[cov_n].rel_path = run_excluded[i];
             cov[cov_n].kind = "not_indexed_dir";
             cov[cov_n].detail = "excluded subtree";
             cov_n++;
         }
-        for (int i = 0; i < run_ignored_count; i++) {
+        for (int i = 0; coverage_ok && i < run_ignored_count; i++) {
             cov[cov_n].rel_path = run_ignored[i].rel_path;
             cov[cov_n].kind = "not_indexed_file";
             cov[cov_n].detail = run_ignored[i].reason;
             cov_n++;
         }
     }
+    if (!coverage_ok) {
+        cbm_log_error("incremental.err", "msg", "coverage_merge_failed");
+        free(cov);
+        free(changed_files);
+        free(changed_versions);
+        free(changed_indices);
+        cbm_registry_free(registry);
+        cbm_path_alias_collection_free(path_aliases);
+        cbm_ht_free(source_version_index);
+        incr_free_edge_capture(&edge_cap);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_store_free_coverage(old_cov, old_cov_count);
+        cbm_gbuf_free(existing);
+        free(versions);
+        return CBM_STORE_ERR;
+    }
 
     free(changed_files);
+    free(changed_versions);
+    free(changed_indices);
     cbm_registry_free(registry);
     cbm_path_alias_collection_free(path_aliases);
+    cbm_ht_free(source_version_index);
 
     /* Re-link inbound cross-file edges that the purge orphaned. Runs after
      * re-resolution AND post-passes so the freshly re-created target nodes
@@ -1002,11 +1350,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full ones. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
-    int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                                      mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n);
+    int persist_rc = dump_and_persist(p, existing, db_path, project, files, file_count, versions,
+                                      mode_skipped, mode_skipped_count, cov, cov_n);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);
+    free(versions);
     cbm_gbuf_free(existing);
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));

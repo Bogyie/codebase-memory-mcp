@@ -14,6 +14,7 @@
 #include "store/store.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
+#include "foundation/sha256.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,12 @@
 #include "foundation/compat_thread.h"
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <sys/utime.h>
+#else
+#include <sys/wait.h>
+#include <utime.h>
+#endif
 #include <unistd.h>
 #include "graph_buffer/graph_buffer.h"
 #include "yyjson/yyjson.h"
@@ -728,10 +735,10 @@ TEST(pipeline_yaml_config_paths_remain_distinct) {
         }
         timeout_count++;
         ASSERT_NOT_NULL(vars[i].properties_json);
-        saw_api |= strstr(vars[i].properties_json,
-                          "\"config_path\":\"services.api.timeout\"") != NULL;
-        saw_worker |= strstr(vars[i].properties_json,
-                             "\"config_path\":\"services.worker.timeout\"") != NULL;
+        saw_api |=
+            strstr(vars[i].properties_json, "\"config_path\":\"services.api.timeout\"") != NULL;
+        saw_worker |=
+            strstr(vars[i].properties_json, "\"config_path\":\"services.worker.timeout\"") != NULL;
     }
     ASSERT_EQ(timeout_count, 2);
     ASSERT_TRUE(saw_api);
@@ -1390,6 +1397,59 @@ TEST(pipeline_local_fetch_shadow_not_classified_as_http) {
 }
 
 /* ── Git history pass tests ─────────────────────────────────────── */
+
+#ifndef _WIN32
+static int githistory_git_run(const char *repo, const char *args) {
+    char cmd[CBM_SZ_2K];
+    int n = snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s >/dev/null 2>&1", repo, args);
+    return n > 0 && n < (int)sizeof(cmd) ? system(cmd) : -1;
+}
+#endif
+
+TEST(githistory_argv_capture_handles_adversarial_names) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git fixture uses POSIX shell setup");
+#else
+    char *tmp = th_mktempdir("cbm_gh_capture");
+    ASSERT(tmp != NULL);
+    if (githistory_git_run(tmp, "init -q") != 0 ||
+        githistory_git_run(tmp, "config user.email test@example.com") != 0 ||
+        githistory_git_run(tmp, "config user.name Test") != 0) {
+        th_rmtree(tmp);
+        SKIP_PLATFORM("git unavailable");
+    }
+    static const char header_name[] = "COMMIT:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:123";
+    static const char newline_name[] = "\nleading.go";
+    char header_path[CBM_SZ_2K];
+    char newline_path[CBM_SZ_2K];
+    char a_path[CBM_SZ_2K];
+    ASSERT_LT(snprintf(header_path, sizeof(header_path), "%s/%s", tmp, header_name),
+              (int)sizeof(header_path));
+    ASSERT_LT(snprintf(newline_path, sizeof(newline_path), "%s/%s", tmp, newline_name),
+              (int)sizeof(newline_path));
+    ASSERT_LT(snprintf(a_path, sizeof(a_path), "%s/a.go", tmp), (int)sizeof(a_path));
+    for (int i = 0; i < 3; i++) {
+        char body[32];
+        snprintf(body, sizeof(body), "revision %d\n", i);
+        ASSERT_EQ(th_write_file(header_path, body), 0);
+        ASSERT_EQ(th_write_file(newline_path, body), 0);
+        ASSERT_EQ(th_write_file(a_path, body), 0);
+        ASSERT_EQ(githistory_git_run(tmp, "add -A"), 0);
+        char commit_cmd[64];
+        snprintf(commit_cmd, sizeof(commit_cmd), "commit -q -m revision-%d", i);
+        ASSERT_EQ(githistory_git_run(tmp, commit_cmd), 0);
+    }
+
+    cbm_githistory_result_t result = {0};
+    ASSERT_EQ(cbm_pipeline_githistory_compute_at(tmp, NULL, &result), 0);
+    ASSERT_GTE(result.commit_count, 3);
+    ASSERT_EQ(strlen(result.input_sha256), CBM_SHA256_HEX_LEN);
+    free(result.couplings);
+    free(result.file_temporal);
+    th_rmtree(tmp);
+    PASS();
+#endif
+}
 
 TEST(githistory_is_trackable) {
     /* Source files → trackable */
@@ -5669,6 +5729,76 @@ static void cleanup_incremental_repo(void) {
     th_rmtree(g_incr_tmpdir);
 }
 
+typedef struct {
+    const char *path;
+    const char *content;
+    bool wrote;
+} snapshot_mutation_t;
+
+static void mutate_file_after_snapshot(void *userdata) {
+    snapshot_mutation_t *mutation = (snapshot_mutation_t *)userdata;
+    FILE *file = fopen(mutation->path, "w");
+    if (!file) {
+        return;
+    }
+    bool wrote = fputs(mutation->content, file) >= 0;
+    bool closed = fclose(file) == 0;
+    mutation->wrote = wrote && closed;
+}
+
+TEST(sha256_file_helper_is_bounded_regular_file_only) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_sha_file_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("tmpdir");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/source.txt", tmpdir);
+    FILE *file = fopen(path, "w");
+    ASSERT_NOT_NULL(file);
+    ASSERT_TRUE(fputs("0123456789abcdef0123456789abcdef", file) >= 0);
+    ASSERT_EQ(fclose(file), 0);
+
+    char direct_hash[CBM_SHA256_HEX_LEN + 1];
+    char limited_hash[CBM_SHA256_HEX_LEN + 1];
+    ASSERT_EQ(cbm_sha256_file_hex_limited(path, 64, direct_hash), 0);
+    char *stable_bytes = NULL;
+    size_t stable_len = 0;
+    ASSERT_EQ(cbm_sha256_file_read_hex(path, 64, &stable_bytes, &stable_len, limited_hash), 0);
+    ASSERT_NOT_NULL(stable_bytes);
+    ASSERT_EQ(stable_len, 32);
+    ASSERT_STR_EQ(stable_bytes, "0123456789abcdef0123456789abcdef");
+    ASSERT_STR_EQ(limited_hash, direct_hash);
+    free(stable_bytes);
+    int64_t version_mtime = 0;
+    int64_t version_size = 0;
+    ASSERT_EQ(cbm_sha256_file_version_hex(path, 16, limited_hash, &version_mtime, &version_size),
+              CBM_SHA256_FILE_SKIPPED);
+    ASSERT_EQ(version_size, 32);
+    ASSERT_STR_EQ(limited_hash, "");
+    ASSERT_EQ(cbm_sha256_file_hex_limited(path, 16, limited_hash), -1);
+    ASSERT_STR_EQ(limited_hash, "");
+    ASSERT_EQ(cbm_sha256_file_hex(tmpdir, limited_hash), -1); /* directory */
+
+#ifndef _WIN32
+    char link_path[512];
+    snprintf(link_path, sizeof(link_path), "%s/source-link.txt", tmpdir);
+    ASSERT_EQ(symlink(path, link_path), 0);
+    ASSERT_EQ(cbm_sha256_file_hex(link_path, limited_hash), 0);
+    ASSERT_STR_EQ(limited_hash, direct_hash);
+
+    char fifo_path[512];
+    snprintf(fifo_path, sizeof(fifo_path), "%s/source.fifo", tmpdir);
+    ASSERT_EQ(mkfifo(fifo_path, 0600), 0);
+    /* O_NONBLOCK open + fstat regular-file validation must reject this without
+     * waiting for a writer. */
+    ASSERT_EQ(cbm_sha256_file_hex(fifo_path, limited_hash), -1);
+#endif
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  FastAPI Depends() edge tracking (PR #66, fix #27)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -5733,7 +5863,6 @@ TEST(incremental_full_then_noop) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
-
     /* First: full index */
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
@@ -5764,6 +5893,164 @@ TEST(incremental_full_then_noop) {
 
     cleanup_incremental_repo();
     PASS();
+}
+
+TEST(pipeline_concurrent_processes_use_private_staging_files) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX fork fixture");
+#else
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    cbm_pipeline_t *name_probe = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(name_probe);
+    char *project = strdup(cbm_pipeline_project_name(name_probe));
+    cbm_pipeline_free(name_probe);
+    ASSERT_NOT_NULL(project);
+    int gate[2];
+    ASSERT_EQ(pipe(gate), 0);
+    pid_t children[2] = {-1, -1};
+    for (int i = 0; i < 2; i++) {
+        children[i] = fork();
+        ASSERT_GTE(children[i], 0);
+        if (children[i] == 0) {
+            close(gate[1]);
+            char token;
+            if (read(gate[0], &token, 1) != 1) {
+                _exit(2);
+            }
+            close(gate[0]);
+            cbm_pipeline_t *pipeline =
+                cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+            int rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+            cbm_pipeline_free(pipeline);
+            _exit(rc == 0 ? 0 : 1);
+        }
+    }
+    close(gate[0]);
+    ASSERT_EQ(write(gate[1], "xx", 2), 2);
+    close(gate[1]);
+    for (int i = 0; i < 2; i++) {
+        int status = 0;
+        ASSERT_EQ(waitpid(children[i], &status, 0), children[i]);
+        ASSERT_TRUE(WIFEXITED(status));
+        ASSERT_EQ(WEXITSTATUS(status), 0);
+    }
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(cbm_store_check_integrity(store));
+    ASSERT_GT(cbm_store_count_nodes(store, project), 0);
+    cbm_store_close(store);
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+#endif
+}
+
+TEST(incremental_full_fast_full_preserves_completed_generation) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    char *full_generation = NULL;
+    ASSERT_EQ(cbm_store_get_index_generation(store, project, &full_generation), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    char *fast_generation = NULL;
+    ASSERT_EQ(cbm_store_get_index_generation(store, project, &fast_generation), CBM_STORE_OK);
+    ASSERT_STR_EQ(fast_generation, full_generation);
+    cbm_store_close(store);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    char *final_generation = NULL;
+    ASSERT_EQ(cbm_store_get_index_generation(store, project, &final_generation), CBM_STORE_OK);
+    ASSERT_STR_EQ(final_generation, full_generation);
+    cbm_store_close(store);
+
+    free(final_generation);
+    free(fast_generation);
+    free(full_generation);
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_full_to_moderate_rebuilds_on_history_change) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git fixture uses POSIX shell setup");
+#else
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    if (githistory_git_run(g_incr_tmpdir, "init -q") != 0 ||
+        githistory_git_run(g_incr_tmpdir, "config user.email test@example.com") != 0 ||
+        githistory_git_run(g_incr_tmpdir, "config user.name Test") != 0 ||
+        githistory_git_run(g_incr_tmpdir, "add main.go helper.go") != 0 ||
+        githistory_git_run(g_incr_tmpdir, "commit -qm initial") != 0) {
+        cleanup_incremental_repo();
+        SKIP_PLATFORM("git unavailable");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_free(p);
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    char *before = NULL;
+    ASSERT_EQ(cbm_store_get_index_generation(store, project, &before), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    char notes[512];
+    snprintf(notes, sizeof(notes), "%s/notes.txt", g_incr_tmpdir);
+    FILE *file = fopen(notes, "w");
+    ASSERT_NOT_NULL(file);
+    ASSERT_TRUE(fputs("history-only change\n", file) >= 0);
+    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(githistory_git_run(g_incr_tmpdir, "add notes.txt"), 0);
+    ASSERT_EQ(githistory_git_run(g_incr_tmpdir, "commit -qm history-change"), 0);
+
+    /* notes.txt is not a selected source, so only the bounded git-history
+     * generation changed. Moderate still consumes history and must rebuild;
+     * it may not inherit Full's fingerprint like the explicit Fast downgrade. */
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_MODERATE);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    char *after = NULL;
+    ASSERT_EQ(cbm_store_get_index_generation(store, project, &after), CBM_STORE_OK);
+    ASSERT_TRUE(strcmp(before, after) != 0);
+    cbm_store_close(store);
+
+    free(after);
+    free(before);
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+#endif
 }
 
 TEST(incremental_detects_changed_file) {
@@ -5803,6 +6090,419 @@ TEST(incremental_detects_changed_file) {
     cbm_pipeline_free(p);
     free(project);
 
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_detects_content_change_with_matching_metadata) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    int64_t indexed_mtime = 0;
+    int64_t indexed_size = 0;
+    char *indexed_hash = NULL;
+    ASSERT_EQ(cbm_store_get_file_version(store, project, "helper.go", &indexed_mtime, &indexed_size,
+                                         &indexed_hash),
+              CBM_STORE_OK);
+    ASSERT_NOT_NULL(indexed_hash);
+    ASSERT_EQ((int)strlen(indexed_hash), CBM_SHA256_HEX_LEN);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    FILE *file = fopen(path, "w");
+    ASSERT_NOT_NULL(file);
+    /* Hxlper has the same byte length as Helper, keeping file size stable. */
+    ASSERT_TRUE(fputs("package main\n\nfunc Hxlper() string {\n\treturn \"hello\"\n}\n", file) >=
+                0);
+    ASSERT_EQ(fclose(file), 0);
+    struct stat current;
+    ASSERT_EQ(stat(path, &current), 0);
+    ASSERT_EQ(current.st_size, indexed_size);
+
+    /* Simulate a copy/restore tool preserving the current stat metadata while
+     * the stored digest still identifies the indexed bytes. */
+#ifdef __APPLE__
+    int64_t current_mtime =
+        (int64_t)current.st_mtimespec.tv_sec * 1000000000LL + current.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    int64_t current_mtime = (int64_t)current.st_mtime * 1000000000LL;
+#else
+    int64_t current_mtime =
+        (int64_t)current.st_mtim.tv_sec * 1000000000LL + current.st_mtim.tv_nsec;
+#endif
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "helper.go", indexed_hash, current_mtime,
+                                         current.st_size),
+              CBM_STORE_OK);
+    free(indexed_hash);
+    cbm_store_close(store);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, project, "Hxlper", &nodes, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(store);
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_timestamp_only_touch_is_noop) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    int64_t stored_mtime = 0;
+    int64_t stored_size = 0;
+    char *stored_hash = NULL;
+    ASSERT_EQ(cbm_store_get_file_version(store, project, "helper.go", &stored_mtime, &stored_size,
+                                         &stored_hash),
+              CBM_STORE_OK);
+    cbm_store_close(store);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    struct stat before;
+    ASSERT_EQ(stat(path, &before), 0);
+#ifdef _WIN32
+    struct _utimbuf touched = {before.st_atime, before.st_mtime + 10};
+    ASSERT_EQ(_utime(path, &touched), 0);
+#else
+    struct utimbuf touched = {before.st_atime, before.st_mtime + 10};
+    ASSERT_EQ(utime(path, &touched), 0);
+#endif
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    /* A noop leaves the completed DB untouched. In particular, its metadata
+     * row retains the original timestamp while the digest remains valid. */
+    store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    int64_t after_mtime = 0;
+    int64_t after_size = 0;
+    char *after_hash = NULL;
+    ASSERT_EQ(cbm_store_get_file_version(store, project, "helper.go", &after_mtime, &after_size,
+                                         &after_hash),
+              CBM_STORE_OK);
+    ASSERT_EQ(after_mtime, stored_mtime);
+    ASSERT_EQ(after_size, stored_size);
+    ASSERT_STR_EQ(after_hash, stored_hash);
+
+    free(after_hash);
+    free(stored_hash);
+    cbm_store_close(store);
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_stable_oversized_file_is_noop_without_rehash) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    cbm_setenv("CBM_MAX_FILE_BYTES", "16", 1);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    if (!p) {
+        cbm_unsetenv("CBM_MAX_FILE_BYTES");
+        cleanup_incremental_repo();
+        FAIL("pipeline alloc failed");
+    }
+    int first_rc = cbm_pipeline_run(p);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    if (!p) {
+        cbm_unsetenv("CBM_MAX_FILE_BYTES");
+        free(project);
+        cleanup_incremental_repo();
+        FAIL("pipeline alloc failed");
+    }
+    int second_rc = cbm_pipeline_run(p);
+    int committed_nodes = 0;
+    int committed_edges = 0;
+    cbm_pipeline_get_committed_counts(p, &committed_nodes, &committed_edges);
+    cbm_pipeline_free(p);
+    cbm_unsetenv("CBM_MAX_FILE_BYTES");
+
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_EQ(second_rc, 0);
+    /* -1/-1 means the second run took the incremental noop and never dumped a
+     * replacement graph. Stable oversized files therefore cost only stat. */
+    ASSERT_EQ(committed_nodes, -1);
+    ASSERT_EQ(committed_edges, -1);
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    int64_t mtime = 0;
+    int64_t size = 0;
+    char *hash = NULL;
+    ASSERT_EQ(cbm_store_get_file_version(store, project, "helper.go", &mtime, &size, &hash),
+              CBM_STORE_OK);
+    ASSERT_NOT_NULL(hash);
+    ASSERT_STR_EQ(hash, "");
+
+    free(hash);
+    cbm_store_close(store);
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_ignored_userconfig_change_forces_full_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    char config_path[512];
+    snprintf(config_path, sizeof(config_path), "%s/.codebase-memory.json", g_incr_tmpdir);
+    FILE *config = fopen(config_path, "w");
+    ASSERT_NOT_NULL(config);
+    ASSERT_TRUE(fputs("{\"extra_extensions\":{\".ignoredx\":\"python\"}}\n", config) >= 0);
+    ASSERT_EQ(fclose(config), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    char *first_generation = NULL;
+    char *first_fingerprint = NULL;
+    ASSERT_EQ(cbm_store_get_index_generation(store, project, &first_generation), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_index_config_fingerprint(store, project, &first_fingerprint),
+              CBM_STORE_OK);
+    int64_t ignored_mtime = 0;
+    int64_t ignored_size = 0;
+    char *ignored_hash = NULL;
+    ASSERT_EQ(cbm_store_get_file_version(store, project, ".codebase-memory.json", &ignored_mtime,
+                                         &ignored_size, &ignored_hash),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_NULL(ignored_hash);
+    cbm_store_close(store);
+
+    /* This file is deliberately absent from file_hashes/discovery. Its config
+     * fingerprint must nevertheless invalidate the incremental noop route. */
+    config = fopen(config_path, "w");
+    ASSERT_NOT_NULL(config);
+    ASSERT_TRUE(fputs("{\"extra_extensions\":{\".ignoredx\":\"rust\"}}\n", config) >= 0);
+    ASSERT_EQ(fclose(config), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    int committed_nodes = -1;
+    int committed_edges = -1;
+    cbm_pipeline_get_committed_counts(p, &committed_nodes, &committed_edges);
+    ASSERT_GT(committed_nodes, 0);
+    cbm_pipeline_free(p);
+
+    store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    char *second_generation = NULL;
+    char *second_fingerprint = NULL;
+    ASSERT_EQ(cbm_store_get_index_generation(store, project, &second_generation), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_index_config_fingerprint(store, project, &second_fingerprint),
+              CBM_STORE_OK);
+    ASSERT_TRUE(strcmp(first_generation, second_generation) != 0);
+    ASSERT_TRUE(strcmp(first_fingerprint, second_fingerprint) != 0);
+
+    free(first_generation);
+    free(first_fingerprint);
+    free(second_generation);
+    free(second_fingerprint);
+    cbm_store_close(store);
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_userconfig_race_preserves_completed_db) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    char config_path[512];
+    snprintf(config_path, sizeof(config_path), "%s/.codebase-memory.json", g_incr_tmpdir);
+    FILE *config = fopen(config_path, "w");
+    ASSERT_NOT_NULL(config);
+    ASSERT_TRUE(fputs("{\"extra_extensions\":{\".racecfg\":\"python\"}}\n", config) >= 0);
+    ASSERT_EQ(fclose(config), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    char *first_generation = NULL;
+    char *first_fingerprint = NULL;
+    ASSERT_EQ(cbm_store_get_index_generation(store, project, &first_generation), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_index_config_fingerprint(store, project, &first_fingerprint),
+              CBM_STORE_OK);
+    cbm_store_close(store);
+
+    snapshot_mutation_t mutation = {
+        .path = config_path,
+        .content = "{\"extra_extensions\":{\".racecfg\":\"rust\"}}\n",
+        .wrote = false,
+    };
+    cbm_pipeline_set_snapshot_hook_for_test(mutate_file_after_snapshot, &mutation);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_NEQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_TRUE(mutation.wrote);
+
+    /* The race occurs after config load/routing. No mixed generation may be
+     * marked complete, even on the incremental no-source-change fast path. */
+    store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    char *after_generation = NULL;
+    char *after_fingerprint = NULL;
+    ASSERT_EQ(cbm_store_get_index_generation(store, project, &after_generation), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_index_config_fingerprint(store, project, &after_fingerprint),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(after_generation, first_generation);
+    ASSERT_STR_EQ(after_fingerprint, first_fingerprint);
+
+    free(first_generation);
+    free(first_fingerprint);
+    free(after_generation);
+    free(after_fingerprint);
+    cbm_store_close(store);
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(full_index_rejects_file_changed_after_snapshot) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    snapshot_mutation_t mutation = {
+        .path = path,
+        .content = "package main\n\nfunc ChangedDuringFull() string {\n\treturn \"new\"\n}\n",
+        .wrote = false,
+    };
+    cbm_pipeline_set_snapshot_hook_for_test(mutate_file_after_snapshot, &mutation);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_NEQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_TRUE(mutation.wrote);
+
+    /* No complete snapshot may be created from a generation different from
+     * the bytes selected before extraction. */
+    ASSERT_FALSE(cbm_file_exists(g_incr_dbpath));
+    char staged_path[1024];
+    snprintf(staged_path, sizeof(staged_path), "%s.building", g_incr_dbpath);
+    ASSERT_FALSE(cbm_file_exists(staged_path));
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_rejects_file_changed_between_classification_and_extraction) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    int64_t original_mtime = 0;
+    int64_t original_size = 0;
+    char *original_hash = NULL;
+    ASSERT_EQ(cbm_store_get_file_version(store, project, "helper.go", &original_mtime,
+                                         &original_size, &original_hash),
+              CBM_STORE_OK);
+    cbm_store_close(store);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    FILE *file = fopen(path, "w");
+    ASSERT_NOT_NULL(file);
+    ASSERT_TRUE(
+        fputs("package main\n\nfunc BeforeRace() string {\n\treturn \"before\"\n}\n", file) >= 0);
+    ASSERT_EQ(fclose(file), 0);
+
+    snapshot_mutation_t mutation = {
+        .path = path,
+        .content = "package main\n\nfunc DuringRace() string {\n\treturn \"during\"\n}\n",
+        .wrote = false,
+    };
+    cbm_pipeline_set_snapshot_hook_for_test(mutate_file_after_snapshot, &mutation);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_NEQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_TRUE(mutation.wrote);
+
+    /* The failed mixed-generation run must not replace the completed DB. Its
+     * stored digest still identifies Helper(), while hashing the live path
+     * identifies DuringRace() and therefore cannot be reported as current. */
+    store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    int64_t after_mtime = 0;
+    int64_t after_size = 0;
+    char *after_hash = NULL;
+    ASSERT_EQ(cbm_store_get_file_version(store, project, "helper.go", &after_mtime, &after_size,
+                                         &after_hash),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(after_hash, original_hash);
+    char live_hash[CBM_SHA256_HEX_LEN + 1];
+    ASSERT_EQ(cbm_sha256_file_hex(path, live_hash), 0);
+    ASSERT_TRUE(strcmp(live_hash, after_hash) != 0);
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, project, "Helper", &nodes, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    cbm_store_free_nodes(nodes, count);
+    nodes = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, project, "DuringRace", &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_nodes(nodes, count);
+
+    free(after_hash);
+    free(original_hash);
+    cbm_store_close(store);
+    free(project);
     cleanup_incremental_repo();
     PASS();
 }
@@ -7000,6 +7700,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
     /* Git history pass */
+    RUN_TEST(githistory_argv_capture_handles_adversarial_names);
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);
     RUN_TEST(githistory_coupling_carries_last_co_change);
@@ -7164,8 +7865,19 @@ SUITE(pipeline) {
     /* FastAPI Depends edge tracking (PR #66 port) */
     RUN_TEST(pipeline_fastapi_depends_edges);
     /* Incremental */
+    RUN_TEST(sha256_file_helper_is_bounded_regular_file_only);
     RUN_TEST(incremental_full_then_noop);
+    RUN_TEST(pipeline_concurrent_processes_use_private_staging_files);
+    RUN_TEST(incremental_full_fast_full_preserves_completed_generation);
+    RUN_TEST(incremental_full_to_moderate_rebuilds_on_history_change);
     RUN_TEST(incremental_detects_changed_file);
+    RUN_TEST(incremental_detects_content_change_with_matching_metadata);
+    RUN_TEST(incremental_timestamp_only_touch_is_noop);
+    RUN_TEST(incremental_stable_oversized_file_is_noop_without_rehash);
+    RUN_TEST(incremental_ignored_userconfig_change_forces_full_rebuild);
+    RUN_TEST(incremental_userconfig_race_preserves_completed_db);
+    RUN_TEST(full_index_rejects_file_changed_after_snapshot);
+    RUN_TEST(incremental_rejects_file_changed_between_classification_and_extraction);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);

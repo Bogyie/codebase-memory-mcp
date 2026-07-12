@@ -25,6 +25,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
@@ -35,33 +36,17 @@ static bool ps_module_is_dir(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
 }
 
-static char *read_file(const char *path, int *out_len) {
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
+static char *read_file(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file, int *out_len) {
+    char *source = NULL;
+    size_t source_len = 0;
+    char source_sha256[CBM_SHA256_HEX_LEN + 1];
+    if (cbm_pipeline_read_selected_source(ctx, file, 0, &source, &source_len, source_sha256) != 0 ||
+        source_len == 0 || source_len > INT_MAX) {
+        free(source);
         return NULL;
     }
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
-        (void)fclose(f);
-        return NULL;
-    }
-    /* +pad: tree-sitter lexer lookahead reads past EOF; keep it in-bounds */
-    enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
-    if (!buf) {
-        (void)fclose(f);
-        return NULL;
-    }
-    size_t nread = fread(buf, SKIP_ONE, size, f);
-    (void)fclose(f);
-    if (nread > (size_t)size) {
-        nread = (size_t)size;
-    }
-    memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
-    *out_len = (int)nread;
-    return buf;
+    *out_len = (int)source_len;
+    return source;
 }
 
 static const char *itoa_log(int val) {
@@ -480,7 +465,7 @@ static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
         return ctx->result_cache[file_idx];
     }
     int source_len = 0;
-    char *source = read_file(fi->path, &source_len);
+    char *source = read_file(ctx, fi, &source_len);
     if (!source) {
         return NULL;
     }

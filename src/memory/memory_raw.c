@@ -597,8 +597,7 @@ static bool memory_raw_fd_matches_regular_entry(int fd, int directory_fd, const 
     struct stat opened;
     struct stat entry;
     if (fd < 0 || directory_fd < 0 || !name || fstat(fd, &opened) != 0 ||
-        !S_ISREG(opened.st_mode) ||
-        fstatat(directory_fd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(opened.st_mode) || fstatat(directory_fd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0 ||
         !S_ISREG(entry.st_mode) || opened.st_dev != entry.st_dev || opened.st_ino != entry.st_ino) {
         return false;
     }
@@ -1268,11 +1267,6 @@ static int memory_raw_durable_flush(FILE *fp) {
 }
 
 #ifdef _WIN32
-static int memory_raw_sync_parent_directory(const char *path) {
-    (void)path;
-    return 0;
-}
-
 static int memory_raw_link_no_replace(const char *staged, const char *target) {
     wchar_t *wide_staged = cbm_utf8_to_wide(staged);
     wchar_t *wide_target = cbm_utf8_to_wide(target);
@@ -1364,9 +1358,8 @@ static int memory_raw_create_directory_no_replace(const char *path) {
 }
 
 static int memory_raw_stage_create_internal(const char *home, const char *target,
-                                            const char *target_parent,
-                                            const unsigned char *bytes, size_t len,
-                                            const char *expected_hash,
+                                            const char *target_parent, const unsigned char *bytes,
+                                            size_t len, const char *expected_hash,
                                             bool allow_invalid_target,
                                             cbm_memory_raw_stage_t **out_stage) {
     if (!out_stage) {
@@ -1426,8 +1419,7 @@ static int memory_raw_stage_create_internal(const char *home, const char *target
             for (unsigned int attempt = 0; attempt < 32 && !linked; attempt++) {
                 uint64_t seq = atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
                 int n = snprintf(stage->lease_name, sizeof(stage->lease_name),
-                                 "ingest-%ld-%" PRIu64 "-lease-%u", (long)getpid(), seq,
-                                 attempt);
+                                 "ingest-%ld-%" PRIu64 "-lease-%u", (long)getpid(), seq, attempt);
                 if (n < 0 || n >= (int)sizeof(stage->lease_name)) {
                     cbm_memory_raw_stage_dispose(stage, false);
                     return -1;
@@ -1443,12 +1435,11 @@ static int memory_raw_stage_create_internal(const char *home, const char *target
             stage->lease_exists = linked;
             struct stat lease_entry;
             if (!linked ||
-                fstatat(stage->staging_fd, stage->lease_name, &lease_entry,
-                        AT_SYMLINK_NOFOLLOW) != 0 ||
+                fstatat(stage->staging_fd, stage->lease_name, &lease_entry, AT_SYMLINK_NOFOLLOW) !=
+                    0 ||
                 !S_ISREG(lease_entry.st_mode) ||
-                !memory_raw_fd_matches_regular_entry(stage->target_lease_fd,
-                                                    stage->target_parent_fd, stage->target_name,
-                                                    NULL)) {
+                !memory_raw_fd_matches_regular_entry(
+                    stage->target_lease_fd, stage->target_parent_fd, stage->target_name, NULL)) {
                 cbm_memory_raw_stage_dispose(stage, false);
                 return -1;
             }
@@ -1569,10 +1560,8 @@ static int memory_raw_stage_create_internal(const char *home, const char *target
     size_t written = len ? fwrite(bytes, 1, len, fp) : 0;
     int flush_rc = written == len ? memory_raw_durable_flush(fp) : -1;
     int close_rc = fclose(fp);
-    int mode_rc = 0;
-    if (flush_rc != 0 || close_rc != 0 || mode_rc != 0 ||
-        !memory_raw_object_matches(stage->staged, bytes, len, expected_hash) ||
-        memory_raw_sync_parent_directory(stage->staged) != 0) {
+    if (flush_rc != 0 || close_rc != 0 ||
+        !memory_raw_object_matches(stage->staged, bytes, len, expected_hash)) {
         cbm_memory_raw_stage_dispose(stage, false);
         return -1;
     }
@@ -1604,9 +1593,9 @@ int cbm_memory_raw_stage_promote(cbm_memory_raw_stage_t *stage, const unsigned c
 #ifndef _WIN32
     if (!stage->staged_exists) {
         return stage->target_lease_fd >= 0 && stage->target_parent_fd >= 0 &&
-                       memory_raw_fd_matches_regular_entry(
-                           stage->target_lease_fd, stage->target_parent_fd, stage->target_name,
-                           NULL) &&
+                       memory_raw_fd_matches_regular_entry(stage->target_lease_fd,
+                                                           stage->target_parent_fd,
+                                                           stage->target_name, NULL) &&
                        memory_raw_object_matches_at(stage->target_parent_fd, stage->target_name,
                                                     bytes, len, expected_hash)
                    ? 0
@@ -1660,10 +1649,7 @@ int cbm_memory_raw_stage_promote(cbm_memory_raw_stage_t *stage, const unsigned c
     stage->target_parent_created = parent_created;
     int install_rc = memory_raw_link_no_replace(stage->staged, stage->target);
     if (install_rc == 0) {
-        return memory_raw_object_matches(stage->target, bytes, len, expected_hash) &&
-                       memory_raw_sync_parent_directory(stage->target) == 0
-                   ? 0
-                   : -1;
+        return memory_raw_object_matches(stage->target, bytes, len, expected_hash) ? 0 : -1;
     }
     return install_rc == 1 && memory_raw_object_matches(stage->target, bytes, len, expected_hash)
                ? 0

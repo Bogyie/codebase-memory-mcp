@@ -8,6 +8,7 @@
  * mapping return SQLITE_IOERR instead of crashing the process with SIGBUS.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <store/store.h>
@@ -86,6 +87,40 @@ TEST(store_open_with_mmap_disabled) {
     PASS();
 }
 
+TEST(store_open_without_cache_root_rejects_shared_tmp_fallback) {
+    static const char *const names[] = {"CBM_CACHE_DIR", "HOME", "USERPROFILE"};
+    char old_values[3][1024] = {{0}};
+    bool had_values[3] = {false};
+    for (size_t i = 0; i < 3; i++) {
+        had_values[i] = getenv(names[i]) != NULL;
+        if (had_values[i]) {
+            snprintf(old_values[i], sizeof(old_values[i]), "%s", getenv(names[i]));
+        }
+        cbm_unsetenv(names[i]);
+    }
+
+    char project[128];
+    char fallback_path[512];
+    snprintf(project, sizeof(project), "cbm_no_cache_%d", (int)getpid());
+    snprintf(fallback_path, sizeof(fallback_path), "%s/%s.db", cbm_tmpdir(), project);
+    int existed_before = cbm_path_probe(fallback_path);
+    cbm_store_t *store = cbm_store_open(project);
+    bool rejected = store == NULL;
+    cbm_store_close(store);
+    if (existed_before == 0) {
+        (void)cbm_unlink(fallback_path);
+    }
+
+    for (size_t i = 0; i < 3; i++) {
+        if (had_values[i]) {
+            cbm_setenv(names[i], old_values[i], 1);
+        } else {
+            cbm_unsetenv(names[i]);
+        }
+    }
+    ASSERT_TRUE(rejected);
+    PASS();
+}
 
 /* #896: a row-scan that dies mid-stream (SQLITE_CORRUPT) must surface a
  * loud store error, not masquerade as a clean end of results. Counts are
@@ -107,8 +142,7 @@ TEST(corrupt_page_scan_returns_error_not_truncation) {
         char qn[256];
         snprintf(name, sizeof(name), "corrupt_probe_fn_%04d", i);
         snprintf(qn, sizeof(qn),
-                 "corr.some.rather.long.module.path.to.fill.table.pages.%s_padding_padding",
-                 name);
+                 "corr.some.rather.long.module.path.to.fill.table.pages.%s_padding_padding", name);
         cbm_node_t n = {.project = "corr",
                         .label = "Function",
                         .name = name,
@@ -147,8 +181,8 @@ TEST(corrupt_page_scan_returns_error_not_truncation) {
     cbm_store_t *s2 = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s2);
     /* The scan must CROSS the corrupt band: request every row. */
-    cbm_search_params_t all_params = {.project = "corr", .label = "Function",
-                                      .limit = CORRUPT_NODES};
+    cbm_search_params_t all_params = {
+        .project = "corr", .label = "Function", .limit = CORRUPT_NODES};
     cbm_search_output_t out2 = {0};
     int rc_search = cbm_store_search(s2, &all_params, &out2);
     if (rc_search == CBM_STORE_OK && out2.count == CORRUPT_NODES) {
@@ -187,4 +221,5 @@ SUITE(store_pragmas) {
     RUN_TEST(mmap_size_garbage_falls_back_to_default);
     RUN_TEST(mmap_size_partial_garbage_falls_back_to_default);
     RUN_TEST(store_open_with_mmap_disabled);
+    RUN_TEST(store_open_without_cache_root_rejects_shared_tmp_fallback);
 }

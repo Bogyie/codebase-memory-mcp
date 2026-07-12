@@ -1,8 +1,8 @@
 /*
  * diagnostics.c — Periodic diagnostics file writer.
  *
- * Writes JSON to /tmp/cbm-diagnostics-<pid>.json every 5 seconds.
- * Atomic: writes .tmp then renames to avoid partial reads.
+ * Writes JSON inside a private temporary diagnostics directory every 5 seconds.
+ * Atomic: writes .tmp then replaces the latest snapshot.
  */
 #include "foundation/constants.h"
 #include "foundation/diagnostics.h"
@@ -34,11 +34,12 @@ static atomic_int g_diag_stop = 0;
 static cbm_thread_t g_diag_thread;
 static bool g_diag_started = false;
 static time_t g_start_time = 0;
-static char g_diag_path[CBM_SZ_256] = "";
+static char g_diag_dir[CBM_SZ_1K] = "";
+static char g_diag_path[CBM_SZ_1K] = "";
 /* Persistent NDJSON time-series (the memory TRAJECTORY users send us to diagnose
  * slow leaks like #581). Unlike g_diag_path (a latest-snapshot file overwritten
  * every interval and deleted on stop), this is appended-to and KEPT on exit. */
-static char g_diag_ndjson_path[CBM_SZ_256] = "";
+static char g_diag_ndjson_path[CBM_SZ_1K] = "";
 static size_t g_diag_ndjson_size = 0;
 #define DIAG_NDJSON_CAP_BYTES (8u * 1024u * 1024u) /* rotate to .1 past this */
 
@@ -93,6 +94,7 @@ static int count_open_fds(void) {
 /* ── Writer ──────────────────────────────────────────────────────── */
 
 #define DIAG_INTERVAL_S 5
+#define DIAG_SLEEP_SLICE_MS 100
 #define DIAG_PATH_EXTRA 24 /* ".tmp" + safety margin */
 
 /* Append one compact JSON line to the persistent NDJSON trajectory, rotating to
@@ -107,10 +109,10 @@ static void append_trajectory(long uptime, size_t rss, size_t peak_rss, size_t c
     if (g_diag_ndjson_size > DIAG_NDJSON_CAP_BYTES) {
         char rot[sizeof(g_diag_ndjson_path) + DIAG_PATH_EXTRA];
         snprintf(rot, sizeof(rot), "%s.1", g_diag_ndjson_path);
-        (void)rename(g_diag_ndjson_path, rot); /* keep one previous generation */
+        (void)cbm_rename_replace(g_diag_ndjson_path, rot); /* keep one previous generation */
         g_diag_ndjson_size = 0;
     }
-    FILE *f = fopen(g_diag_ndjson_path, "a");
+    FILE *f = cbm_fopen(g_diag_ndjson_path, "a");
     if (!f) {
         return;
     }
@@ -156,7 +158,7 @@ static void write_diagnostics(void) {
     char tmp_path[sizeof(g_diag_path) + DIAG_PATH_EXTRA];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", g_diag_path);
 
-    FILE *f = fopen(tmp_path, "w");
+    FILE *f = cbm_fopen(tmp_path, "w");
     if (!f) {
         return;
     }
@@ -185,7 +187,7 @@ static void write_diagnostics(void) {
     if (fclose(f) != 0) {
         return;
     }
-    (void)rename(tmp_path, g_diag_path);
+    (void)cbm_rename_replace(tmp_path, g_diag_path);
 
     /* Also append to the persistent trajectory (kept on exit for users to send). */
     append_trajectory(uptime, current_rss, peak_rss, current_commit, peak_commit, page_faults, fds,
@@ -196,8 +198,15 @@ static void *diag_thread_fn(void *arg) {
     (void)arg;
     while (!atomic_load(&g_diag_stop)) {
         write_diagnostics();
-        struct timespec ts = {DIAG_INTERVAL_S, 0};
-        cbm_nanosleep(&ts, NULL);
+        /* Sleep in short slices so shutdown does not block for almost the
+         * entire five-second publication interval. */
+        int remaining_ms = DIAG_INTERVAL_S * 1000;
+        while (remaining_ms > 0 && !atomic_load(&g_diag_stop)) {
+            int slice_ms = remaining_ms < DIAG_SLEEP_SLICE_MS ? remaining_ms : DIAG_SLEEP_SLICE_MS;
+            struct timespec ts = {slice_ms / 1000, (slice_ms % 1000) * 1000000L};
+            cbm_nanosleep(&ts, NULL);
+            remaining_ms -= slice_ms;
+        }
     }
     /* Final write before exit */
     write_diagnostics();
@@ -216,13 +225,37 @@ bool cbm_diag_start(void) {
     g_start_time = time(NULL);
     atomic_store(&g_diag_stop, 0);
 
-    snprintf(g_diag_path, sizeof(g_diag_path), "%s/cbm-diagnostics-%d.json", cbm_tmpdir(),
-             (int)getpid());
-    snprintf(g_diag_ndjson_path, sizeof(g_diag_ndjson_path), "%s/cbm-diagnostics-%d.ndjson",
-             cbm_tmpdir(), (int)getpid());
+    const char *tmp_dir = cbm_tmpdir();
+    if (!tmp_dir) {
+        return false;
+    }
+    int n = snprintf(g_diag_dir, sizeof(g_diag_dir), "%s/cbm-diagnostics-XXXXXX", tmp_dir);
+    if (n <= 0 || (size_t)n >= sizeof(g_diag_dir) || !cbm_mkdtemp(g_diag_dir) ||
+        cbm_path_is_reparse_point(g_diag_dir)) {
+        if (g_diag_dir[0] != '\0') {
+            (void)cbm_rmdir(g_diag_dir);
+        }
+        g_diag_dir[0] = '\0';
+        return false;
+    }
+    n = snprintf(g_diag_path, sizeof(g_diag_path), "%s/latest.json", g_diag_dir);
+    int n2 = snprintf(g_diag_ndjson_path, sizeof(g_diag_ndjson_path), "%s/trajectory.ndjson",
+                      g_diag_dir);
+    if (n <= 0 || (size_t)n >= sizeof(g_diag_path) || n2 <= 0 ||
+        (size_t)n2 >= sizeof(g_diag_ndjson_path)) {
+        (void)cbm_rmdir(g_diag_dir);
+        g_diag_dir[0] = '\0';
+        g_diag_path[0] = '\0';
+        g_diag_ndjson_path[0] = '\0';
+        return false;
+    }
     g_diag_ndjson_size = 0;
 
     if (cbm_thread_create(&g_diag_thread, 0, diag_thread_fn, NULL) != 0) {
+        (void)cbm_rmdir(g_diag_dir);
+        g_diag_dir[0] = '\0';
+        g_diag_path[0] = '\0';
+        g_diag_ndjson_path[0] = '\0';
         return false;
     }
 

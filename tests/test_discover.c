@@ -1525,6 +1525,54 @@ TEST(discover_snapshot_detects_coverage_only_ignore_change) {
     PASS();
 }
 
+TEST(discover_snapshot_excludes_only_configured_output_family) {
+    char *base = th_mktempdir("cbm_disc_snapshot_output");
+    ASSERT(base != NULL);
+    char *output = cbm_strdup(TH_PATH(base, "index.db"));
+    ASSERT(output != NULL);
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(output, "sqlite generation one");
+    th_write_file(TH_PATH(base, "index.db-wal"), "wal one");
+    th_write_file(TH_PATH(base, "index.db.building.abcdef"), "staging one");
+    th_write_file(TH_PATH(base, ".codebase-memory.json"),
+                  "{\"extra_extensions\":{\".x\":\"go\"}}\n");
+
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .exclude_output_path = output,
+    };
+    cbm_file_info_t *files = NULL;
+    cbm_ignored_file_t *ignored = NULL;
+    int count = 0;
+    int ignored_count = 0;
+    int ignored_total = 0;
+    cbm_discovery_snapshot_t *snapshot = NULL;
+    ASSERT_EQ(cbm_discover_ex3(base, &opts, &files, &count, NULL, NULL, &ignored, &ignored_count,
+                               &ignored_total, &snapshot),
+              0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
+    ASSERT_EQ(ignored_count, 0);
+    ASSERT_EQ(ignored_total, 0);
+    ASSERT_TRUE(cbm_discovery_snapshot_verify(snapshot));
+
+    /* Output publication and sidecar churn are not repository inputs. */
+    th_write_file(output, "sqlite generation two");
+    th_write_file(TH_PATH(base, "index.db-wal"), "wal two");
+    ASSERT_TRUE(cbm_discovery_snapshot_verify(snapshot));
+
+    /* The exclusion is exact: an unrelated ignored DB still changes coverage. */
+    th_write_file(TH_PATH(base, "other.db"), "not the configured output");
+    ASSERT_FALSE(cbm_discovery_snapshot_verify(snapshot));
+
+    cbm_discovery_snapshot_free(snapshot);
+    cbm_discover_free(files, count);
+    cbm_discover_free_ignored(ignored, ignored_count);
+    free(output);
+    th_cleanup(base);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
@@ -1651,4 +1699,5 @@ SUITE(discover) {
     RUN_TEST(discover_ignore_generation_change_rejects_partial_results);
     RUN_TEST(discover_snapshot_is_full_mode_independent);
     RUN_TEST(discover_snapshot_detects_coverage_only_ignore_change);
+    RUN_TEST(discover_snapshot_excludes_only_configured_output_family);
 }

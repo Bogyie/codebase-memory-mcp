@@ -190,8 +190,7 @@ static void route_pending_add(route_ctx_t *ctx, const cbm_gbuf_edge_t *edge, con
                               const char *route_qn, const char *route_props) {
     if (ctx->pending_count == ctx->pending_cap) {
         int next_cap = ctx->pending_cap ? ctx->pending_cap * PAIR_LEN : CBM_SZ_16;
-        pending_route_t *next =
-            realloc(ctx->pending, (size_t)next_cap * sizeof(*ctx->pending));
+        pending_route_t *next = realloc(ctx->pending, (size_t)next_cap * sizeof(*ctx->pending));
         if (!next) {
             return;
         }

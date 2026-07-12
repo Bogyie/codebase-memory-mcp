@@ -29,76 +29,9 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "semantic/ast_profile.h"
 
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Read entire file into heap-allocated buffer. Returns NULL on error.
- * Caller must free(). Sets *out_len to byte count. *out_size receives the
- * on-disk size and *out_status the failure reason, so the caller can attribute
- * a skip to the right phase/reason (read vs oversized) instead of a silent
- * drop. Both out params may be NULL. */
-static char *read_file(const char *path, int *out_len, long *out_size,
-                       cbm_read_status_t *out_status) {
-    if (out_size) {
-        *out_size = 0;
-    }
-    if (out_status) {
-        *out_status = CBM_READ_OK;
-    }
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
-        if (out_status) {
-            *out_status = CBM_READ_OPEN_FAIL;
-        }
-        return NULL;
-    }
-
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-    if (out_size) {
-        *out_size = size;
-    }
-
-    if (size <= 0) {
-        (void)fclose(f);
-        if (out_status) {
-            *out_status = CBM_READ_EMPTY;
-        }
-        return NULL;
-    }
-    if (size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
-        (void)fclose(f);
-        if (out_status) {
-            *out_status = CBM_READ_OVERSIZED;
-        }
-        return NULL;
-    }
-
-    /* +16 padding: tree-sitter's lexer peeks a few bytes past the final UTF-8
-     * character when computing lookahead, reading beyond the logical end.
-     * Over-allocate and zero the tail so that read stays in-bounds (ASan
-     * flags it as a heap-buffer-overflow otherwise; harmless but real UB). */
-    enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
-    if (!buf) {
-        (void)fclose(f);
-        if (out_status) {
-            *out_status = CBM_READ_OOM;
-        }
-        return NULL;
-    }
-
-    size_t nread = fread(buf, SKIP_ONE, size, f);
-    (void)fclose(f);
-
-    if (nread > (size_t)size) {
-        nread = (size_t)size;
-    }
-    memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
-    *out_len = (int)nread;
-    return buf;
-}
 
 /* Format int to string for logging. Thread-safe via TLS. */
 static const char *itoa_log(int val) {
@@ -517,7 +450,6 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             return CBM_NOT_FOUND;
         }
 
-        const char *path = files[i].path;
         const char *rel = files[i].rel_path;
         CBMLanguage lang = files[i].language;
 
@@ -542,30 +474,34 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
 
         /* Read source file */
-        int source_len = 0;
-        long file_size = 0;
-        cbm_read_status_t rst = CBM_READ_OK;
-        char *source = read_file(path, &source_len, &file_size, &rst);
-        if (!source) {
-            errors++;
-            if (rst == CBM_READ_OVERSIZED) {
+        size_t source_size = 0;
+        char source_sha256[CBM_SHA256_HEX_LEN + 1];
+        char *source = NULL;
+        int source_rc = cbm_pipeline_read_selected_source(
+            ctx, &files[i], (size_t)cbm_max_file_bytes(), &source, &source_size, source_sha256);
+        if (source_rc != CBM_SHA256_FILE_HASHED || source_size == 0 || source_size > INT_MAX) {
+            if (source_rc == CBM_SHA256_FILE_SKIPPED) {
+                errors++;
                 /* Never a silent drop: record the oversized skip + WARN so the
                  * file surfaces in the response/logfile with its sizes. */
                 long cap = cbm_max_file_bytes();
                 char reason[96];
                 snprintf(reason, sizeof(reason), "oversized (%lld MB > %lld MB)",
-                         (long long)(file_size / (CBM_SZ_1K * CBM_SZ_1K)),
+                         (long long)(files[i].size / (CBM_SZ_1K * CBM_SZ_1K)),
                          (long long)(cap / (CBM_SZ_1K * CBM_SZ_1K)));
                 cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, "oversized");
                 cbm_log_warn("index.file_oversized", "path", rel, "size_mb",
-                             itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
+                             itoa_log((int)(files[i].size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
                              itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
-            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
+            } else if (source_rc != CBM_SHA256_FILE_HASHED || source_size > INT_MAX) {
+                errors++;
                 cbm_pipeline_add_file_error(ctx->pipeline, rel, "read failed", "read");
             }
             /* CBM_READ_EMPTY: benign 0-byte file — nothing to index, not reported. */
+            free(source);
             continue;
         }
+        int source_len = (int)source_size;
 
         /* Extract */
         CBMFileResult *result =

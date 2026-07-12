@@ -32,6 +32,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 
 /* ── Constants ─────────────────────────────────────────────────── */
@@ -67,31 +68,19 @@ static bool pxc_module_is_dir(CBMLanguage lang) {
 /* Slurp a file into a malloc'd, NUL-terminated buffer. Mirrors the
  * read_file helper in pass_calls.c / pass_parallel.c (kept local so the
  * pipeline doesn't grow a public read-file API just for this pass). */
-static char *pxc_read_file(const char *path, int *out_len) {
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f)
-        return NULL;
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > (long)PXC_MAX_FILE_BYTES_FACTOR * (long)CBM_SZ_1K * (long)CBM_SZ_1K) {
-        (void)fclose(f);
-        return NULL;
-    }
-    /* +pad: tree-sitter lexer lookahead reads past EOF; keep it in-bounds */
-    enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = (char *)malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
-    if (!buf) {
-        (void)fclose(f);
+static char *pxc_read_file(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file, int *out_len) {
+    char *source = NULL;
+    size_t source_len = 0;
+    char source_sha256[CBM_SHA256_HEX_LEN + 1];
+    size_t max_bytes = (size_t)PXC_MAX_FILE_BYTES_FACTOR * (size_t)CBM_SZ_1K * (size_t)CBM_SZ_1K;
+    if (cbm_pipeline_read_selected_source(ctx, file, max_bytes, &source, &source_len,
+                                          source_sha256) != 0 ||
+        source_len == 0 || source_len > INT_MAX) {
+        free(source);
         return NULL;
     }
-    size_t nread = fread(buf, 1, (size_t)size, f);
-    (void)fclose(f);
-    if (nread > (size_t)size)
-        nread = (size_t)size;
-    memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
-    *out_len = (int)nread;
-    return buf;
+    *out_len = (int)source_len;
+    return source;
 }
 
 /* Map a CBMDefinition.label to a CBMLSPDef.label. Per-language LSP registrars
@@ -762,16 +751,36 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
     free(filtered);
 }
 
-static bool pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
+static bool pxc_build_rust_manifest(cbm_pipeline_ctx_t *ctx, CBMArena *marena,
                                     CBMCargoManifest *out_m) {
     if (!ctx || !ctx->repo_path || !marena || !out_m)
         return false;
+    cbm_userconfig_snapshot_t *inputs =
+        ctx->pipeline ? cbm_pipeline_userconfig_snapshot(ctx->pipeline) : NULL;
+    cbm_userconfig_aux_source_state_t cargo_state =
+        cbm_userconfig_snapshot_auxiliary_source_state(inputs, "Cargo.toml");
+    if (cargo_state == CBM_USERCONFIG_AUX_SOURCE_ABSENT) {
+        /* A Cargo manifest is optional. Its absence was selected and will be
+         * rechecked by the final auxiliary rescan, so no read failure should
+         * poison an otherwise valid Rust generation. */
+        return false;
+    }
+    if (cargo_state == CBM_USERCONFIG_AUX_SOURCE_UNREADABLE) {
+        cbm_userconfig_snapshot_note_auxiliary_read_failure(inputs, "Cargo.toml");
+        return false;
+    }
+    if (cargo_state == CBM_USERCONFIG_AUX_SOURCE_UNKNOWN && ctx->pipeline) {
+        cbm_userconfig_snapshot_note_auxiliary_consumer_failure(inputs, CBM_USERCONFIG_AUX_PKGMAP);
+        return false;
+    }
     char path[1024];
     int n = snprintf(path, sizeof(path), "%s/Cargo.toml", ctx->repo_path);
     if (n <= 0 || (size_t)n >= sizeof(path))
         return false;
+    cbm_file_info_t cargo = {
+        .path = path, .rel_path = "Cargo.toml", .language = CBM_LANG_TOML, .size = 0};
     int toml_len = 0;
-    char *toml = pxc_read_file(path, &toml_len);
+    char *toml = pxc_read_file(ctx, &cargo, &toml_len);
     if (!toml || toml_len <= 0) {
         free(toml);
         return false;
@@ -861,10 +870,15 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
             continue;
         }
 
-        int source_len = 0;
-        char *source = pxc_read_file(files[i].path, &source_len);
+        int source_len = cache[i]->source_len;
+        char *source_owned = NULL;
+        const char *source = cache[i]->source;
         if (!source || source_len <= 0) {
-            free(source);
+            source_owned = pxc_read_file(ctx, &files[i], &source_len);
+            source = source_owned;
+        }
+        if (!source || source_len <= 0) {
+            free(source_owned);
             skipped_no_source++;
             continue;
         }
@@ -892,7 +906,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         processed++;
 
         pxc_free_import_map(imp_keys, imp_vals, imp_count);
-        free(source);
+        free(source_owned);
     }
 
     cbm_pxc_free_module_def_index(module_def_index);

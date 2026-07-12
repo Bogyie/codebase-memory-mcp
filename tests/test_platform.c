@@ -2,11 +2,18 @@
  * test_platform.c — RED phase tests for foundation/platform.
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "../src/foundation/compat.h" /* cbm_setenv / cbm_unsetenv (Windows-portable) */
+#include "../src/foundation/compat_fs.h"
 #include "../src/foundation/platform.h"
 #include "../src/foundation/system_info_internal.h"
 #include <stdlib.h>
 #include <unistd.h>
+
+#ifndef _WIN32
+#include <pthread.h>
+#include <stdatomic.h>
+#endif
 
 #ifdef __linux__
 /* Linux-only cgroup tests need stdio for FILE*, stdlib for mkdtemp,
@@ -18,6 +25,30 @@
 #include <sys/stat.h>
 #endif
 
+typedef struct {
+    const char *name;
+    char *value;
+    bool was_set;
+} platform_env_snapshot_t;
+
+static bool platform_save_env(platform_env_snapshot_t *snapshot, const char *name) {
+    const char *value = getenv(name);
+    snapshot->name = name;
+    snapshot->was_set = value != NULL;
+    snapshot->value = value ? cbm_strdup(value) : NULL;
+    return !value || snapshot->value != NULL;
+}
+
+static void platform_restore_env(platform_env_snapshot_t *snapshot) {
+    if (snapshot->was_set) {
+        (void)cbm_setenv(snapshot->name, snapshot->value, 1);
+    } else {
+        (void)cbm_unsetenv(snapshot->name);
+    }
+    free(snapshot->value);
+    snapshot->value = NULL;
+}
+
 TEST(platform_now_ns) {
     uint64_t t1 = cbm_now_ns();
     ASSERT_GT(t1, 0);
@@ -27,6 +58,49 @@ TEST(platform_now_ns) {
     ASSERT_GT(t2, t1);
     PASS();
 }
+
+TEST(platform_qpc_scaling_avoids_intermediate_overflow) {
+    const uint64_t frequency = 10000000ULL;
+    const uint64_t ticks = UINT64_MAX / 1000000000ULL + 1234567ULL;
+    const uint64_t expected =
+        (ticks / frequency) * 1000000000ULL + ((ticks % frequency) * 1000000000ULL) / frequency;
+    ASSERT_GT(ticks, UINT64_MAX / 1000000000ULL);
+    ASSERT_EQ(cbm_qpc_ticks_to_ns(ticks, frequency), expected);
+    ASSERT_EQ(cbm_qpc_ticks_to_ns(ticks, 0), 0);
+    PASS();
+}
+
+TEST(platform_posix_resolvers_preserve_backslash) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX path semantics");
+#else
+    char saved[1024] = "";
+    bool had_saved = cbm_safe_getenv("CBM_CACHE_DIR", saved, sizeof(saved), NULL) != NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", "/tmp/a\\b", 1), 0);
+    ASSERT_STR_EQ(cbm_resolve_cache_dir(), "/tmp/a\\b");
+    if (had_saved) {
+        ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", saved, 1), 0);
+    } else {
+        ASSERT_EQ(cbm_unsetenv("CBM_CACHE_DIR"), 0);
+    }
+    PASS();
+#endif
+}
+
+#ifdef _WIN32
+TEST(platform_safe_getenv_decodes_wide_unicode) {
+    static const wchar_t name[] = L"CBM_TEST_PLATFORM_WIDE_ENV";
+    wchar_t saved[32768];
+    DWORD saved_len = GetEnvironmentVariableW(name, saved, 32768U);
+    bool had_saved = saved_len > 0 && saved_len < 32768U;
+    ASSERT_TRUE(SetEnvironmentVariableW(name, L"C:\\사용자\\캐시") != FALSE);
+    char value[256];
+    ASSERT_NOT_NULL(cbm_safe_getenv("CBM_TEST_PLATFORM_WIDE_ENV", value, sizeof(value), NULL));
+    ASSERT_STR_EQ(value, "C:\\사용자\\캐시");
+    (void)SetEnvironmentVariableW(name, had_saved ? saved : NULL);
+    PASS();
+}
+#endif
 
 TEST(platform_now_ms) {
     uint64_t t1 = cbm_now_ms();
@@ -45,6 +119,38 @@ TEST(platform_file_exists) {
     /* This test file should exist */
     ASSERT_TRUE(cbm_file_exists("tests/test_platform.c"));
     ASSERT_FALSE(cbm_file_exists("nonexistent_file_xyz.txt"));
+    PASS();
+}
+
+TEST(platform_mkdir_p_rejects_file_components) {
+    char *base = th_mktempdir("cbm_mkdir_p");
+    ASSERT_NOT_NULL(base);
+    char final_file[1024];
+    char below_file[1024];
+    char nested_dir[1024];
+    snprintf(final_file, sizeof(final_file), "%s/blocker", base);
+    snprintf(below_file, sizeof(below_file), "%s/blocker/child", base);
+    snprintf(nested_dir, sizeof(nested_dir), "%s/real/child", base);
+    th_write_file(final_file, "regular file\n");
+
+    ASSERT_FALSE(cbm_mkdir_p(final_file, 0700));
+    ASSERT_FALSE(cbm_mkdir_p(below_file, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(nested_dir, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(nested_dir, 0700)); /* existing directory */
+
+#ifndef _WIN32
+    char target[1024];
+    char alias[1024];
+    char through_alias[1024];
+    snprintf(target, sizeof(target), "%s/target", base);
+    snprintf(alias, sizeof(alias), "%s/alias", base);
+    snprintf(through_alias, sizeof(through_alias), "%s/alias/child", base);
+    ASSERT_TRUE(cbm_mkdir_p(target, 0700));
+    ASSERT_EQ(symlink(target, alias), 0);
+    ASSERT_TRUE(cbm_mkdir_p(through_alias, 0700));
+#endif
+
+    th_cleanup(base);
     PASS();
 }
 
@@ -80,6 +186,208 @@ TEST(platform_mmap_nonexistent) {
     ASSERT_NULL(data);
     PASS();
 }
+
+TEST(platform_safe_getenv_rejects_invalid_arguments) {
+    char buf[16] = "sentinel";
+    ASSERT_NULL(cbm_safe_getenv(NULL, buf, sizeof(buf), NULL));
+    ASSERT_EQ(buf[0], '\0');
+
+    memcpy(buf, "sentinel", sizeof("sentinel"));
+    ASSERT_NULL(cbm_safe_getenv("", buf, sizeof(buf), NULL));
+    ASSERT_EQ(buf[0], '\0');
+
+    memcpy(buf, "sentinel", sizeof("sentinel"));
+    ASSERT_NULL(cbm_safe_getenv("CBM_TEST_PLATFORM_ENV", buf, 0, NULL));
+    ASSERT_EQ(buf[0], 's'); /* a zero-sized buffer cannot be cleared */
+    ASSERT_NULL(cbm_safe_getenv("CBM_TEST_PLATFORM_ENV", NULL, sizeof(buf), NULL));
+    PASS();
+}
+
+TEST(platform_safe_getenv_rejects_truncation) {
+    const char *name = "CBM_TEST_PLATFORM_SAFE_GETENV";
+    platform_env_snapshot_t snapshot;
+    ASSERT_TRUE(platform_save_env(&snapshot, name));
+
+    char buf[8] = "";
+    bool ok = cbm_setenv(name, "1234567", 1) == 0;
+    const char *result = ok ? cbm_safe_getenv(name, buf, sizeof(buf), "fallback") : NULL;
+    bool exact_env_ok = result == buf && strcmp(buf, "1234567") == 0;
+
+    ok = ok && cbm_setenv(name, "12345678", 1) == 0;
+    memcpy(buf, "stale", sizeof("stale"));
+    result = ok ? cbm_safe_getenv(name, buf, sizeof(buf), "short") : buf;
+    bool long_env_rejected = result == NULL && buf[0] == '\0';
+
+    ok = ok && cbm_unsetenv(name) == 0;
+    result = ok ? cbm_safe_getenv(name, buf, sizeof(buf), "1234567") : NULL;
+    bool exact_fallback_ok = result == buf && strcmp(buf, "1234567") == 0;
+
+    memcpy(buf, "stale", sizeof("stale"));
+    result = ok ? cbm_safe_getenv(name, buf, sizeof(buf), "12345678") : buf;
+    bool long_fallback_rejected = result == NULL && buf[0] == '\0';
+
+    platform_restore_env(&snapshot);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(exact_env_ok);
+    ASSERT_TRUE(long_env_rejected);
+    ASSERT_TRUE(exact_fallback_ok);
+    ASSERT_TRUE(long_fallback_rejected);
+    PASS();
+}
+
+TEST(platform_path_resolvers_reject_truncation) {
+#ifdef _WIN32
+    const char *config_env = "APPDATA";
+    const char *local_env = "LOCALAPPDATA";
+    const char *names[] = {"HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "CBM_CACHE_DIR"};
+#else
+    const char *config_env = "XDG_CONFIG_HOME";
+    const char *names[] = {"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "CBM_CACHE_DIR"};
+#endif
+    enum { ENV_COUNT = sizeof(names) / sizeof(names[0]), PATH_CAP = 1024 };
+    platform_env_snapshot_t snapshots[ENV_COUNT];
+    for (size_t i = 0; i < ENV_COUNT; i++) {
+        ASSERT_TRUE(platform_save_env(&snapshots[i], names[i]));
+    }
+
+    char oversized[PATH_CAP + 1];
+    memset(oversized, 'x', sizeof(oversized) - 1);
+    oversized[sizeof(oversized) - 1] = '\0';
+    char max_sized[PATH_CAP];
+    memset(max_sized, 'h', sizeof(max_sized) - 1);
+    max_sized[sizeof(max_sized) - 1] = '\0';
+
+    bool setup_ok = cbm_setenv("HOME", oversized, 1) == 0 &&
+                    cbm_setenv("USERPROFILE", "/fallback-must-not-be-used", 1) == 0;
+    bool home_truncation_rejected = setup_ok && cbm_get_home_dir() == NULL;
+
+    setup_ok = setup_ok && cbm_setenv("HOME", "/tmp/cbm-platform-home", 1) == 0 &&
+               cbm_setenv(config_env, oversized, 1) == 0;
+    bool config_truncation_rejected = setup_ok && cbm_app_config_dir() == NULL;
+
+#ifdef _WIN32
+    setup_ok = setup_ok && cbm_setenv(local_env, oversized, 1) == 0;
+#endif
+    bool local_truncation_rejected = setup_ok && cbm_app_local_dir() == NULL;
+
+    setup_ok = setup_ok && cbm_setenv("CBM_CACHE_DIR", oversized, 1) == 0;
+    bool cache_truncation_rejected = setup_ok && cbm_resolve_cache_dir() == NULL;
+
+    /* The base itself fits exactly, but each derived suffix must fail closed. */
+    setup_ok = setup_ok && cbm_setenv("HOME", max_sized, 1) == 0 &&
+               cbm_unsetenv("USERPROFILE") == 0 && cbm_unsetenv(config_env) == 0 &&
+               cbm_unsetenv("CBM_CACHE_DIR") == 0;
+#ifdef _WIN32
+    setup_ok = setup_ok && cbm_unsetenv(local_env) == 0;
+#endif
+    const char *home = setup_ok ? cbm_get_home_dir() : NULL;
+    bool max_home_accepted = home != NULL && strlen(home) == PATH_CAP - 1;
+    bool config_join_rejected = setup_ok && cbm_app_config_dir() == NULL;
+    bool local_join_rejected = setup_ok && cbm_app_local_dir() == NULL;
+    bool cache_join_rejected = setup_ok && cbm_resolve_cache_dir() == NULL;
+
+    for (size_t i = ENV_COUNT; i > 0; i--) {
+        platform_restore_env(&snapshots[i - 1]);
+    }
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(home_truncation_rejected);
+    ASSERT_TRUE(config_truncation_rejected);
+    ASSERT_TRUE(local_truncation_rejected);
+    ASSERT_TRUE(cache_truncation_rejected);
+    ASSERT_TRUE(max_home_accepted);
+    ASSERT_TRUE(config_join_rejected);
+    ASSERT_TRUE(local_join_rejected);
+    ASSERT_TRUE(cache_join_rejected);
+    PASS();
+}
+
+#ifndef _WIN32
+typedef struct {
+    const char *home;
+    const char *config;
+    const char *local;
+    const char *cache;
+    bool content_ok;
+} platform_tls_result_t;
+
+static atomic_int platform_tls_ready;
+static atomic_bool platform_tls_release;
+
+static void *platform_tls_worker(void *opaque) {
+    platform_tls_result_t *result = opaque;
+    result->home = cbm_get_home_dir();
+    result->config = cbm_app_config_dir();
+    result->local = cbm_app_local_dir();
+    result->cache = cbm_resolve_cache_dir();
+    result->content_ok =
+        result->home && strcmp(result->home, "/tmp/cbm-platform-tls-home") == 0 && result->config &&
+        strcmp(result->config, "/tmp/cbm-platform-tls-config") == 0 && result->local &&
+        strcmp(result->local, "/tmp/cbm-platform-tls-config") == 0 && result->cache &&
+        strcmp(result->cache, "/tmp/cbm-platform-tls-cache") == 0;
+    atomic_fetch_add_explicit(&platform_tls_ready, 1, memory_order_release);
+    while (!atomic_load_explicit(&platform_tls_release, memory_order_acquire)) {
+        cbm_usleep(1000);
+    }
+    return NULL;
+}
+
+TEST(platform_path_resolvers_use_thread_local_buffers) {
+    const char *names[] = {"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "CBM_CACHE_DIR"};
+    enum { ENV_COUNT = sizeof(names) / sizeof(names[0]) };
+    platform_env_snapshot_t snapshots[ENV_COUNT];
+    for (size_t i = 0; i < ENV_COUNT; i++) {
+        ASSERT_TRUE(platform_save_env(&snapshots[i], names[i]));
+    }
+
+    bool setup_ok = cbm_setenv("HOME", "/tmp/cbm-platform-tls-home", 1) == 0 &&
+                    cbm_unsetenv("USERPROFILE") == 0 &&
+                    cbm_setenv("XDG_CONFIG_HOME", "/tmp/cbm-platform-tls-config", 1) == 0 &&
+                    cbm_setenv("CBM_CACHE_DIR", "/tmp/cbm-platform-tls-cache", 1) == 0;
+    atomic_store_explicit(&platform_tls_ready, 0, memory_order_relaxed);
+    atomic_store_explicit(&platform_tls_release, false, memory_order_relaxed);
+
+    pthread_t threads[2];
+    platform_tls_result_t results[2] = {{0}};
+    int create_rc[2] = {-1, -1};
+    if (setup_ok) {
+        create_rc[0] = pthread_create(&threads[0], NULL, platform_tls_worker, &results[0]);
+        create_rc[1] = pthread_create(&threads[1], NULL, platform_tls_worker, &results[1]);
+    }
+
+    bool ready = false;
+    if (create_rc[0] == 0 && create_rc[1] == 0) {
+        for (int i = 0; i < 10000; i++) {
+            if (atomic_load_explicit(&platform_tls_ready, memory_order_acquire) == 2) {
+                ready = true;
+                break;
+            }
+            cbm_usleep(1000);
+        }
+    }
+    bool distinct = ready && results[0].home != results[1].home &&
+                    results[0].config != results[1].config &&
+                    results[0].local != results[1].local && results[0].cache != results[1].cache;
+    atomic_store_explicit(&platform_tls_release, true, memory_order_release);
+    if (create_rc[0] == 0) {
+        (void)pthread_join(threads[0], NULL);
+    }
+    if (create_rc[1] == 0) {
+        (void)pthread_join(threads[1], NULL);
+    }
+
+    for (size_t i = ENV_COUNT; i > 0; i--) {
+        platform_restore_env(&snapshots[i - 1]);
+    }
+    ASSERT_TRUE(setup_ok);
+    ASSERT_EQ(create_rc[0], 0);
+    ASSERT_EQ(create_rc[1], 0);
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(results[0].content_ok);
+    ASSERT_TRUE(results[1].content_ok);
+    ASSERT_TRUE(distinct);
+    PASS();
+}
+#endif
 
 /*
  * CBM_WORKERS env override for cbm_default_worker_count.
@@ -306,13 +614,25 @@ TEST(cgroup_no_mem_files) {
 
 SUITE(platform) {
     RUN_TEST(platform_now_ns);
+    RUN_TEST(platform_qpc_scaling_avoids_intermediate_overflow);
+    RUN_TEST(platform_posix_resolvers_preserve_backslash);
+#ifdef _WIN32
+    RUN_TEST(platform_safe_getenv_decodes_wide_unicode);
+#endif
     RUN_TEST(platform_now_ms);
     RUN_TEST(platform_nprocs);
     RUN_TEST(platform_file_exists);
+    RUN_TEST(platform_mkdir_p_rejects_file_components);
     RUN_TEST(platform_is_dir);
     RUN_TEST(platform_file_size);
     RUN_TEST(platform_mmap);
     RUN_TEST(platform_mmap_nonexistent);
+    RUN_TEST(platform_safe_getenv_rejects_invalid_arguments);
+    RUN_TEST(platform_safe_getenv_rejects_truncation);
+    RUN_TEST(platform_path_resolvers_reject_truncation);
+#ifndef _WIN32
+    RUN_TEST(platform_path_resolvers_use_thread_local_buffers);
+#endif
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);

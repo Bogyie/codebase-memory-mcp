@@ -47,7 +47,9 @@ int cbm_pclose(FILE *f);
 
 /* ── File operations ──────────────────────────────────────────── */
 
-/* Create directory (and parents). mode is ignored on Windows. Returns true on success. */
+/* Create directory (and parents). mode is ignored on Windows. Returns true
+ * only when every final path component resolves to a directory; existing
+ * symlinks/junctions to directories retain their historical acceptance. */
 bool cbm_mkdir_p(const char *path, int mode);
 
 /* Delete a file. Returns 0 on success. */
@@ -62,7 +64,9 @@ int cbm_rename_replace(const char *src, const char *dst);
 /* Canonicalize an EXISTING path (realpath / wide handle final path), resolving
  * symlinks and Windows reparse points. Locale-independent on Windows — never
  * routes UTF-8 through the ANSI CRT (#973). The output size is checked against
- * out_sz; small buffers fail without writing past the end. */
+ * out_sz; small buffers fail without writing past the end.
+ * Returns 1 on success and 0 on failure (it is an int for legacy ABI reasons;
+ * do not interpret 0 as a POSIX-style success status). */
 int cbm_canonical_path(const char *path, char *out, size_t out_sz);
 bool cbm_path_is_reparse_point(const char *path);
 /* UTF-8-safe existence probe: 1 exists, 0 definitely absent, -1 for invalid

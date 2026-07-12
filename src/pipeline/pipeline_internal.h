@@ -12,7 +12,9 @@
 #include "pipeline/path_alias.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
+#include "discover/userconfig.h"
 #include "foundation/hash_table.h"
+#include "foundation/sha256.h"
 #include "cbm.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
@@ -22,6 +24,11 @@
 
 /* Maximum byte budget for tree-sitter extraction per file */
 #define CBM_EXTRACT_BUDGET 5000000
+
+/* tree-sitter external scanners may inspect a small lookahead past the logical
+ * source length. Stable verified reads keep the hash over the exact file bytes,
+ * but return this zero-filled tail to preserve the extraction-reader contract. */
+#define CBM_SOURCE_LOOKAHEAD_PAD 16U
 
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
 #define CBM_ROUTE_QN_SIZE 768
@@ -53,6 +60,42 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
 #define CBM_MS_PER_SEC 1000.0
 #define CBM_US_PER_SEC_F 1e6
 
+/* Content generation selected for one indexing run. `sha256` is normally
+ * captured before extraction/classification and is the value persisted to
+ * file_hashes. Oversized/read-skipped files remain unverified with an empty
+ * digest; a later successful extraction may promote the exact parsed-byte
+ * digest. Metadata is refreshed at final verification when safe. */
+typedef struct {
+    char sha256[CBM_SHA256_HEX_LEN + 1];
+    int64_t mtime_ns;
+    int64_t size;
+    bool verified;
+    bool content_skipped;
+} cbm_file_version_snapshot_t;
+
+int cbm_pipeline_capture_file_versions(const cbm_file_info_t *files, int file_count,
+                                       cbm_file_version_snapshot_t *versions);
+int cbm_pipeline_verify_file_versions(const cbm_file_info_t *files, int file_count,
+                                      cbm_file_version_snapshot_t *versions);
+int cbm_pipeline_verify_extracted_versions(const cbm_file_info_t *files, int file_count,
+                                           cbm_file_version_snapshot_t *versions,
+                                           CBMFileResult *const *results);
+int cbm_pipeline_verify_discovery_set(cbm_pipeline_t *p, const cbm_file_info_t *files,
+                                      int file_count);
+
+/* One-shot deterministic seam for the file-generation race regression test.
+ * The production path never installs a hook. Pipeline execution is globally
+ * serialized, so no additional synchronization is required. */
+typedef void (*cbm_pipeline_snapshot_hook_fn)(void *userdata);
+void cbm_pipeline_set_snapshot_hook_for_test(cbm_pipeline_snapshot_hook_fn hook, void *userdata);
+void cbm_pipeline_run_snapshot_hook_for_test(void);
+
+/* One-shot seam invoked after Design has stably read the ignored project
+ * config but before its digest is compared with the selected user-config
+ * generation. Used to reproduce A->B-read->A ABA races. */
+void cbm_pipeline_set_design_config_hook_for_test(cbm_pipeline_snapshot_hook_fn hook,
+                                                  void *userdata);
+
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 
 /* Per-worker manifest collection entry. */
@@ -66,6 +109,7 @@ typedef struct {
     cbm_pkg_entry_t *items;
     int count;
     int cap;
+    bool failed;
 } cbm_pkg_entries_t;
 
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
@@ -91,6 +135,14 @@ typedef struct {
      * Indexed by file position in the files[] array. Owned by pipeline.c. */
     CBMFileResult **result_cache;
 
+    /* File generations selected before this run. Auxiliary passes that read
+     * source independently of CBMFileResult (Design Context today) must bind
+     * the bytes they consumed to these snapshots. Borrowed for the run. */
+    const cbm_file_info_t *source_version_files;
+    cbm_file_version_snapshot_t *source_versions;
+    int source_version_count;
+    CBMHashTable *source_version_index; /* rel_path -> cbm_file_version_snapshot_t* */
+
     /* Build-tool path aliases (tsconfig/jsconfig today; webpack/vite-style
      * configs are an easy follow-on). NULL when no usable configs were found.
      * Owned by pipeline.c / pipeline_incremental.c. */
@@ -111,6 +163,13 @@ typedef struct {
     CBMArena seq_cross_arena;
     bool seq_cross_arena_live;
 } cbm_pipeline_ctx_t;
+
+/* Stable same-descriptor source read bound to the generation selected before
+ * extraction. Secondary passes must use this instead of reopening a path with
+ * fread: an A->read-B->restore-A race becomes sticky-fatal on the pipeline. */
+int cbm_pipeline_read_selected_source(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file,
+                                      size_t max_bytes, char **out_source, size_t *out_len,
+                                      char out_sha256[CBM_SHA256_HEX_LEN + 1]);
 
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
                                                    int excluded_count) {
@@ -180,9 +239,17 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
 /* Build pkgmap by reading manifest files from the files array (sequential path). */
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
                          int excluded_count);
+int cbm_pkgmap_scan_repo_snapshot(const char *repo_path, cbm_pkg_entries_t *entries,
+                                  char **excluded_dirs, int excluded_count,
+                                  cbm_userconfig_snapshot_t *input_snapshot);
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
                                          int file_count, const char *project_name,
                                          char **excluded_dirs, int excluded_count);
+CBMHashTable *cbm_pkgmap_build_from_repo_snapshot(const char *repo_path,
+                                                  const cbm_file_info_t *files, int file_count,
+                                                  const char *project_name, char **excluded_dirs,
+                                                  int excluded_count,
+                                                  cbm_userconfig_snapshot_t *input_snapshot);
 CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count,
                                           const char *project_name);
 
@@ -555,11 +622,14 @@ typedef struct {
      * NULL when the history pass had no commits to analyse. */
     cbm_file_temporal_t *file_temporal;
     int file_temporal_count;
+    char input_sha256[CBM_SHA256_HEX_LEN + 1];
 } cbm_githistory_result_t;
 
 /* Compute change couplings without touching the graph buffer.
  * Can run on a separate thread while other passes use the gbuf. */
 int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result_t *result);
+int cbm_pipeline_githistory_compute_at(const char *repo_path, const char *revision,
+                                       cbm_githistory_result_t *result);
 
 /* Apply pre-computed couplings to the graph buffer (main thread only). */
 int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_result_t *result);
@@ -607,17 +677,24 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
 /* Run incremental re-index on an existing disk DB.
- * Classifies files by mtime+size, deletes changed nodes, re-parses changed
- * files, merges into disk DB. Returns 0 on success. */
+ * Classifies files by SHA-256 (legacy rows without a digest reindex once),
+ * deletes changed nodes, re-parses changed files, and merges into disk DB.
+ * Returns 0 on success. */
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+cbm_userconfig_snapshot_t *cbm_pipeline_userconfig_snapshot(cbm_pipeline_t *p);
+const char *cbm_pipeline_userconfig_fingerprint(const cbm_pipeline_t *p);
+const char *cbm_pipeline_config_fingerprint(const cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
+bool cbm_pipeline_input_generation_ok(const cbm_pipeline_t *p);
+int cbm_pipeline_verify_input_snapshot(cbm_pipeline_t *p);
+int cbm_pipeline_get_effective_mode(const cbm_pipeline_t *p);
 
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client

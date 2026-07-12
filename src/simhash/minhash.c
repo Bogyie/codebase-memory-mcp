@@ -288,10 +288,15 @@ void cbm_minhash_to_hex(const cbm_minhash_t *fp, char *buf, int bufsize) {
         }
         return;
     }
+    static const char hex_digits[] = "0123456789abcdef";
     int pos = 0;
     for (int i = 0; i < CBM_MINHASH_K; i++) {
-        pos += snprintf(buf + pos, (size_t)(bufsize - pos), "%08x", fp->values[i]);
+        uint32_t value = fp->values[i];
+        for (int shift = 28; shift >= 0; shift -= 4) {
+            buf[pos++] = hex_digits[(value >> shift) & 0x0fU];
+        }
     }
+    buf[pos] = '\0';
 }
 
 bool cbm_minhash_from_hex(const char *hex, cbm_minhash_t *out) {

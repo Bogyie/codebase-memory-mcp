@@ -1573,7 +1573,7 @@ static bool raw_stage_add_lease(raw_bundle_stage_t *stage, int lease_fd, const c
             return false;
         }
         int *leases = malloc(next * sizeof(*leases));
-        char(*names)[MEM_SHARE_NAME_CAP] = malloc(next * sizeof(*names));
+        char (*names)[MEM_SHARE_NAME_CAP] = malloc(next * sizeof(*names));
         if (!leases || !names) {
             free(leases);
             free(names);
@@ -1773,8 +1773,8 @@ static bool stage_raw_bundle(cbm_memory_t *memory, yyjson_val *root, raw_bundle_
                 return false;
             }
             char lease_name[MEM_SHARE_NAME_CAP] = "";
-            int lease_name_length = snprintf(lease_name, sizeof(lease_name), "lease-%zu",
-                                             stage->lease_count);
+            int lease_name_length =
+                snprintf(lease_name, sizeof(lease_name), "lease-%zu", stage->lease_count);
             if (lease_name_length < 0 || (size_t)lease_name_length >= sizeof(lease_name) ||
                 linkat(target_parent_fd, target_name, stage->dir_fd, lease_name, 0) != 0 ||
                 !raw_stage_add_lease(stage, lease_fd, lease_name)) {

@@ -97,17 +97,37 @@ static const char *FAST_PATTERNS[] = {".d.ts",      ".bundle.", ".chunk.", ".gen
 
 /* ── Ignored JSON filenames ──────────────────────── */
 
-static const char *IGNORED_JSON_FILES[] = {
-    "package.json",       "package-lock.json", "tsconfig.json",
-    "jsconfig.json",      "composer.json",     "composer.lock",
-    "yarn.lock",          "openapi.json",      "swagger.json",
-    "jest.config.json",   ".eslintrc.json",    ".prettierrc.json",
-    ".babelrc.json",      "tslint.json",       "angular.json",
-    "firebase.json",      "renovate.json",     "lerna.json",
-    "turbo.json",         ".stylelintrc.json", "pnpm-lock.json",
-    "deno.json",          "biome.json",        "devcontainer.json",
-    ".devcontainer.json", "launch.json",       "settings.json",
-    "extensions.json",    "tasks.json",        NULL};
+static const char *IGNORED_JSON_FILES[] = {"package.json",
+                                           "package-lock.json",
+                                           "tsconfig.json",
+                                           "jsconfig.json",
+                                           "composer.json",
+                                           "composer.lock",
+                                           "yarn.lock",
+                                           "openapi.json",
+                                           "swagger.json",
+                                           "jest.config.json",
+                                           ".eslintrc.json",
+                                           ".prettierrc.json",
+                                           ".babelrc.json",
+                                           "tslint.json",
+                                           "angular.json",
+                                           "firebase.json",
+                                           "renovate.json",
+                                           "lerna.json",
+                                           "turbo.json",
+                                           ".stylelintrc.json",
+                                           "pnpm-lock.json",
+                                           "deno.json",
+                                           "biome.json",
+                                           "devcontainer.json",
+                                           ".devcontainer.json",
+                                           "launch.json",
+                                           "settings.json",
+                                           "extensions.json",
+                                           "tasks.json",
+                                           ".codebase-memory.json",
+                                           NULL};
 
 /* ── Helper: check if string is in NULL-terminated array ─────────── */
 
@@ -1033,6 +1053,64 @@ static bool join_path_alloc(const char *base, const char *name, char **out) {
     return true;
 }
 
+static bool discovery_path_char_equal(unsigned char left, unsigned char right) {
+#ifdef _WIN32
+    if (left == '\\') {
+        left = '/';
+    }
+    if (right == '\\') {
+        right = '/';
+    }
+    return tolower(left) == tolower(right);
+#else
+    return left == right;
+#endif
+}
+
+static bool discovery_path_suffix_equal(const char *value, const char *suffix) {
+    if (!value || !suffix) {
+        return false;
+    }
+    while (*value && *suffix &&
+           discovery_path_char_equal((unsigned char)*value, (unsigned char)*suffix)) {
+        value++;
+        suffix++;
+    }
+    return *value == '\0' && *suffix == '\0';
+}
+
+/* Exclude only the configured output DB family. Generic ignored files remain
+ * fingerprinted for coverage; this exception prevents the index publication
+ * itself from becoming a new input on the following run. */
+static bool discovery_is_output_family(const char *path, const char *output_path) {
+    if (!path || !output_path || !output_path[0]) {
+        return false;
+    }
+    const char *left = path;
+    const char *right = output_path;
+    while (*left && *right &&
+           discovery_path_char_equal((unsigned char)*left, (unsigned char)*right)) {
+        left++;
+        right++;
+    }
+    if (*right != '\0') {
+        return false;
+    }
+    if (*left == '\0' || discovery_path_suffix_equal(left, "-wal") ||
+        discovery_path_suffix_equal(left, "-shm") ||
+        discovery_path_suffix_equal(left, "-journal")) {
+        return true;
+    }
+    static const char staging[] = ".building.";
+    for (size_t i = 0; i < sizeof(staging) - SKIP_ONE; i++) {
+        if (!left[i] ||
+            !discovery_path_char_equal((unsigned char)left[i], (unsigned char)staging[i])) {
+            return false;
+        }
+    }
+    return left[sizeof(staging) - SKIP_ONE] != '\0';
+}
+
 static bool walk_stack_push(walk_stack_t *stack, char *dir, char *prefix, ignore_scope_t *scope) {
     if (!grow_array((void **)&stack->items, &stack->capacity, stack->count + SKIP_ONE, CBM_SZ_64,
                     sizeof(walk_frame_t))) {
@@ -1114,6 +1192,11 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
         free(abs_path);
         free(rel_path);
         out->failed = true;
+        return;
+    }
+    if (opts && discovery_is_output_family(abs_path, opts->exclude_output_path)) {
+        free(abs_path);
+        free(rel_path);
         return;
     }
 
@@ -1214,6 +1297,7 @@ struct cbm_discovery_snapshot {
     char *repo_path;
     cbm_discover_opts_t opts;
     char *ignore_file;
+    char *exclude_output_path;
     char fingerprint[CBM_SHA256_HEX_LEN + SKIP_ONE];
 };
 
@@ -1413,11 +1497,16 @@ static cbm_discovery_snapshot_t *discovery_snapshot_create(const char *repo_path
     if (snapshot->opts.ignore_file) {
         snapshot->ignore_file = strdup(snapshot->opts.ignore_file);
     }
-    if (!snapshot->repo_path || (snapshot->opts.ignore_file && !snapshot->ignore_file)) {
+    if (snapshot->opts.exclude_output_path) {
+        snapshot->exclude_output_path = strdup(snapshot->opts.exclude_output_path);
+    }
+    if (!snapshot->repo_path || (snapshot->opts.ignore_file && !snapshot->ignore_file) ||
+        (snapshot->opts.exclude_output_path && !snapshot->exclude_output_path)) {
         cbm_discovery_snapshot_free(snapshot);
         return NULL;
     }
     snapshot->opts.ignore_file = snapshot->ignore_file;
+    snapshot->opts.exclude_output_path = snapshot->exclude_output_path;
     memcpy(snapshot->fingerprint, fingerprint, sizeof(snapshot->fingerprint));
     return snapshot;
 }
@@ -1881,5 +1970,6 @@ void cbm_discovery_snapshot_free(cbm_discovery_snapshot_t *snapshot) {
     }
     free(snapshot->repo_path);
     free(snapshot->ignore_file);
+    free(snapshot->exclude_output_path);
     free(snapshot);
 }

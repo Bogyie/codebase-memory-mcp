@@ -141,6 +141,11 @@ typedef struct {
     cbm_index_mode_t mode;   /* CBM_MODE_FULL or CBM_MODE_FAST */
     const char *ignore_file; /* path to .cbmignore file, or NULL */
     int64_t max_file_size;   /* 0 = no limit */
+    /* Optional exact pipeline output path. That file and only its SQLite
+     * sidecars/private staging siblings are omitted from discovery entirely,
+     * so publishing an index inside the repository cannot invalidate its own
+     * next input fingerprint. The snapshot owns a copy during verification. */
+    const char *exclude_output_path;
 } cbm_discover_opts_t;
 
 /* Walk a repository directory tree and discover all source files.

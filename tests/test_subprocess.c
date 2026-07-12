@@ -10,12 +10,38 @@
  */
 #include "test_framework.h"
 #include "../src/foundation/subprocess.h"
+#include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
+#include "../src/foundation/compat_thread.h"
 
 #include <string.h>
+#include <stdlib.h>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <fcntl.h>
 #include <signal.h>
+#include <unistd.h>
 #endif
+
+typedef struct {
+    char lines[4][64];
+    int count;
+    cbm_proc_control_t *control;
+    uint64_t observed_pid;
+} subprocess_log_capture_t;
+
+static void capture_subprocess_line(const char *line, void *userdata) {
+    subprocess_log_capture_t *capture = (subprocess_log_capture_t *)userdata;
+    if (!capture || !line || capture->count >= 4) {
+        return;
+    }
+    snprintf(capture->lines[capture->count], sizeof(capture->lines[capture->count]), "%s", line);
+    capture->count++;
+    if (capture->control)
+        capture->observed_pid = cbm_proc_control_pid(capture->control);
+}
 
 /* ── Layer 1: pure classifier (all platforms) ─────────────────────────────── */
 
@@ -69,6 +95,7 @@ TEST(subprocess_outcome_str) {
     ASSERT_STR_EQ(cbm_proc_outcome_str(CBM_PROC_CLEAN), "clean");
     ASSERT_STR_EQ(cbm_proc_outcome_str(CBM_PROC_CRASH), "crash");
     ASSERT_STR_EQ(cbm_proc_outcome_str(CBM_PROC_HANG), "hang");
+    ASSERT_STR_EQ(cbm_proc_outcome_str(CBM_PROC_OUTPUT_LIMIT), "output_limit");
     ASSERT_STR_EQ(cbm_proc_outcome_str(CBM_PROC_EXIT_NONZERO), "exit_nonzero");
     ASSERT_STR_EQ(cbm_proc_outcome_str(CBM_PROC_KILLED), "killed");
     PASS();
@@ -159,12 +186,231 @@ TEST(subprocess_run_spawn_failure) {
 }
 
 TEST(subprocess_run_null_bin_rejected) {
+    cbm_proc_control_t control = {0};
+    cbm_proc_control_init(&control);
     cbm_proc_opts_t opts = {0};
     opts.bin = NULL;
+    opts.control = &control;
     cbm_proc_result_t r;
     int rc = cbm_subprocess_run(&opts, &r);
     ASSERT_EQ(rc, -1);
     ASSERT_EQ(r.outcome, CBM_PROC_SPAWN_FAILED);
+    ASSERT_EQ(cbm_proc_control_pid(&control), 0);
+    PASS();
+}
+
+TEST(subprocess_child_stdin_and_descriptors_are_isolated) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX descriptor semantics");
+#else
+    int inherited = open("/dev/null", O_RDONLY);
+    ASSERT_GTE(inherited, 0);
+    char script[256];
+    snprintf(script, sizeof(script),
+             "if [ -e /dev/fd/%d ]; then exit 41; fi; "
+             "if IFS= read -r line; then exit 42; fi; exit 0",
+             inherited);
+    cbm_proc_result_t result = run_sh(script, 1000);
+    ASSERT_EQ(close(inherited), 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_EQ(result.exit_code, 0);
+    PASS();
+#endif
+}
+
+TEST(subprocess_capture_binary_exact) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh binary capture");
+#else
+    const char *argv[] = {"/bin/sh", "-c", "printf 'A\\000B'", NULL};
+    cbm_proc_opts_t opts = {
+        .bin = "/bin/sh", .argv = argv, .quiet_timeout_ms = 1000, .discard_stderr = true};
+    char *data = NULL;
+    size_t len = 0;
+    char sha256[65];
+    cbm_proc_result_t process;
+    ASSERT_EQ(cbm_subprocess_capture(&opts, 1024, &data, &len, sha256, &process), 0);
+    ASSERT_EQ(process.outcome, CBM_PROC_CLEAN);
+    ASSERT_EQ(len, 3);
+    ASSERT_EQ(data[0], 'A');
+    ASSERT_EQ(data[1], '\0');
+    ASSERT_EQ(data[2], 'B');
+    ASSERT_EQ(strlen(sha256), 64);
+    free(data);
+    PASS();
+#endif
+}
+
+TEST(subprocess_capture_rejects_oversized_output) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh capture limit");
+#else
+    const char *argv[] = {"/bin/sh", "-c", "printf '0123456789'", NULL};
+    cbm_proc_opts_t opts = {.bin = "/bin/sh", .argv = argv, .discard_stderr = true};
+    char *data = NULL;
+    size_t len = 0;
+    char sha256[65];
+    cbm_proc_result_t process;
+    ASSERT_EQ(cbm_subprocess_capture(&opts, 5, &data, &len, sha256, &process), -1);
+    ASSERT_EQ(process.outcome, CBM_PROC_OUTPUT_LIMIT);
+    ASSERT(data == NULL);
+    ASSERT_EQ(len, 0);
+    ASSERT_EQ(sha256[0], '\0');
+    PASS();
+#endif
+}
+
+TEST(subprocess_log_path_rejects_symlink_and_closed_output_fd) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX descriptor and symlink semantics");
+#else
+    char victim[512];
+    char log_path[512];
+    snprintf(victim, sizeof(victim), "%s/cbm-subprocess-victim-%d", cbm_tmpdir(), (int)getpid());
+    snprintf(log_path, sizeof(log_path), "%s/cbm-subprocess-log-%d", cbm_tmpdir(), (int)getpid());
+    (void)cbm_unlink(victim);
+    (void)cbm_unlink(log_path);
+    FILE *file = fopen(victim, "w");
+    ASSERT_NOT_NULL(file);
+    ASSERT_TRUE(fputs("do-not-truncate", file) >= 0);
+    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(symlink(victim, log_path), 0);
+
+    const char *argv[] = {"/bin/sh", "-c", "printf attacker", NULL};
+    cbm_proc_opts_t opts = {.bin = "/bin/sh", .argv = argv, .log_file = log_path};
+    cbm_proc_result_t result;
+    ASSERT_EQ(cbm_subprocess_run(&opts, &result), -1);
+    ASSERT_EQ(result.outcome, CBM_PROC_SPAWN_FAILED);
+    char check[32] = {0};
+    file = fopen(victim, "r");
+    ASSERT_NOT_NULL(file);
+    ASSERT_NOT_NULL(fgets(check, sizeof(check), file));
+    ASSERT_EQ(fclose(file), 0);
+    ASSERT_STR_EQ(check, "do-not-truncate");
+    ASSERT_EQ(cbm_unlink(log_path), 0);
+    ASSERT_EQ(cbm_unlink(victim), 0);
+
+    int dead_fd = open("/dev/null", O_WRONLY);
+    ASSERT_GTE(dead_fd, 0);
+    ASSERT_EQ(close(dead_fd), 0);
+    opts = (cbm_proc_opts_t){
+        .bin = "/bin/sh", .argv = argv, .use_output_fd = true, .output_fd = dead_fd};
+    ASSERT_EQ(cbm_subprocess_run(&opts, &result), 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_EXIT_NONZERO);
+    ASSERT_EQ(result.exit_code, 127);
+    PASS();
+#endif
+}
+
+TEST(subprocess_output_fd_is_tailed_without_reopening_path) {
+    char output_path[512];
+    snprintf(output_path, sizeof(output_path), "%s/cbm-subprocess-tail-XXXXXX", cbm_tmpdir());
+    int output_fd = cbm_mkstemp(output_path);
+    ASSERT_GTE(output_fd, 0);
+#ifndef _WIN32
+    /* Unlink before spawn: the callback can only succeed by reading the exact
+     * still-open descriptor, never by reopening its former pathname. */
+    ASSERT_EQ(cbm_unlink(output_path), 0);
+#endif
+
+#ifdef _WIN32
+    const char *comspec = getenv("COMSPEC");
+    if (!comspec || !comspec[0]) {
+        _close(output_fd);
+        cbm_unlink(output_path);
+        SKIP_PLATFORM("COMSPEC unavailable");
+    }
+    const char *argv[] = {comspec, "/d", "/s", "/c", "echo alpha&&echo beta", NULL};
+#else
+    const char *argv[] = {"/bin/sh", "-c", "printf 'alpha\\nbeta\\n'", NULL};
+#endif
+    cbm_proc_control_t control = {0};
+    cbm_proc_control_init(&control);
+    subprocess_log_capture_t capture = {.control = &control};
+    cbm_proc_opts_t opts = {
+#ifdef _WIN32
+        .bin = comspec,
+#else
+        .bin = "/bin/sh",
+#endif
+        .argv = argv,
+        .on_log_line = capture_subprocess_line,
+        .log_ud = &capture,
+        .quiet_timeout_ms = 1000,
+        .use_output_fd = true,
+        .output_fd = output_fd,
+        .control = &control,
+    };
+    cbm_proc_result_t result;
+    ASSERT_EQ(cbm_subprocess_run(&opts, &result), 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_EQ(capture.count, 2);
+    ASSERT_STR_EQ(capture.lines[0], "alpha");
+    ASSERT_STR_EQ(capture.lines[1], "beta");
+    ASSERT_TRUE(capture.observed_pid > 0);
+    ASSERT_EQ(cbm_proc_control_pid(&control), 0);
+#ifdef _WIN32
+    ASSERT_EQ(_close(output_fd), 0);
+    ASSERT_EQ(cbm_unlink(output_path), 0);
+#else
+    ASSERT_EQ(close(output_fd), 0);
+#endif
+    PASS();
+}
+
+typedef struct {
+    cbm_proc_opts_t opts;
+    cbm_proc_result_t result;
+    int rc;
+} subprocess_control_run_t;
+
+static void *run_controlled_subprocess(void *arg) {
+    subprocess_control_run_t *run = (subprocess_control_run_t *)arg;
+    run->rc = cbm_subprocess_run(&run->opts, &run->result);
+    return NULL;
+}
+
+TEST(subprocess_control_kill_is_consumed_by_owner) {
+#ifdef _WIN32
+    const char *bin = getenv("COMSPEC");
+    if (!bin || !bin[0])
+        SKIP_PLATFORM("COMSPEC unavailable");
+    const char *argv[] = {bin, "/d", "/s", "/c", "for /L %i in (1,1,2147483647) do @rem", NULL};
+#else
+    const char *bin = "/bin/sh";
+    const char *argv[] = {bin, "-c", "while :; do :; done", NULL};
+#endif
+    cbm_proc_control_t control = {0};
+    cbm_proc_control_init(&control);
+    subprocess_control_run_t run;
+    memset(&run, 0, sizeof(run));
+    run.opts.bin = bin;
+    run.opts.argv = argv;
+    run.opts.quiet_timeout_ms = 5000;
+    run.opts.control = &control;
+
+    cbm_thread_t thread;
+    ASSERT_EQ(cbm_thread_create(&thread, 0, run_controlled_subprocess, &run), 0);
+    uint64_t pid = 0;
+    for (int i = 0; i < 200 && pid == 0; i++) {
+        pid = cbm_proc_control_pid(&control);
+        if (pid == 0)
+            cbm_usleep(10000);
+    }
+
+    bool wrong_pid_rejected = pid > 0 && !cbm_proc_control_request_kill(&control, pid + 1U);
+    bool accepted = pid > 0 && cbm_proc_control_request_kill(&control, pid);
+    bool duplicate_rejected = !cbm_proc_control_request_kill(&control, pid);
+    ASSERT_EQ(cbm_thread_join(&thread), 0);
+
+    ASSERT_TRUE(pid > 0);
+    ASSERT_TRUE(wrong_pid_rejected);
+    ASSERT_TRUE(accepted);
+    ASSERT_TRUE(duplicate_rejected);
+    ASSERT_EQ(run.rc, 0);
+    ASSERT_EQ(run.result.outcome, CBM_PROC_KILLED);
+    ASSERT_EQ(cbm_proc_control_pid(&control), 0);
+    ASSERT_FALSE(cbm_proc_control_request_kill(&control, pid));
     PASS();
 }
 
@@ -330,6 +576,12 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_run_hang_is_hang);
     RUN_TEST(subprocess_run_spawn_failure);
     RUN_TEST(subprocess_run_null_bin_rejected);
+    RUN_TEST(subprocess_child_stdin_and_descriptors_are_isolated);
+    RUN_TEST(subprocess_capture_binary_exact);
+    RUN_TEST(subprocess_capture_rejects_oversized_output);
+    RUN_TEST(subprocess_log_path_rejects_symlink_and_closed_output_fd);
+    RUN_TEST(subprocess_output_fd_is_tailed_without_reopening_path);
+    RUN_TEST(subprocess_control_kill_is_consumed_by_owner);
     RUN_TEST(win_cmdline_index_worker_json);
     RUN_TEST(win_cmdline_roundtrip_battery);
     RUN_TEST(win_cmdline_overflow_rejected);

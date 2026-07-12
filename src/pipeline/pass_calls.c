@@ -33,6 +33,7 @@ enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
@@ -44,38 +45,17 @@ static bool pc_module_is_dir(CBMLanguage lang) {
 }
 
 /* Read entire file into heap-allocated buffer. Caller must free(). */
-static char *read_file(const char *path, int *out_len) {
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
+static char *read_file(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file, int *out_len) {
+    char *source = NULL;
+    size_t source_len = 0;
+    char source_sha256[CBM_SHA256_HEX_LEN + 1];
+    if (cbm_pipeline_read_selected_source(ctx, file, 0, &source, &source_len, source_sha256) != 0 ||
+        source_len == 0 || source_len > INT_MAX) {
+        free(source);
         return NULL;
     }
-
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-
-    if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
-        (void)fclose(f);
-        return NULL;
-    }
-
-    /* +pad: tree-sitter lexer lookahead reads past EOF; keep it in-bounds */
-    enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
-    if (!buf) {
-        (void)fclose(f);
-        return NULL;
-    }
-
-    size_t nread = fread(buf, SKIP_ONE, size, f);
-    (void)fclose(f);
-
-    if (nread > (size_t)size) {
-        nread = (size_t)size;
-    }
-    memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
-    *out_len = (int)nread;
-    return buf;
+    *out_len = (int)source_len;
+    return source;
 }
 
 /* Format int for logging. Thread-safe via TLS. */
@@ -610,7 +590,7 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
         return ctx->result_cache[idx];
     }
     int slen = 0;
-    char *src = read_file(fi->path, &slen);
+    char *src = read_file(ctx, fi, &slen);
     if (!src) {
         return NULL;
     }
@@ -801,7 +781,7 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
 
         /* Read source and scan for Depends(func_ref) in function signatures */
         int source_len = 0;
-        char *source = read_file(files[i].path, &source_len);
+        char *source = read_file(ctx, &files[i], &source_len);
         if (!source) {
             continue;
         }
