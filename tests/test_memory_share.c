@@ -26,6 +26,24 @@
 
 enum { SHARE_TEST_PATH = 1024 };
 
+#ifndef _WIN32
+typedef struct {
+    char parent[SHARE_TEST_PATH];
+    char moved[SHARE_TEST_PATH];
+    char outside[SHARE_TEST_PATH];
+    bool swapped;
+} share_parent_swap_t;
+
+static bool swap_share_parent_hook(const char *stage, void *context) {
+    share_parent_swap_t *swap = (share_parent_swap_t *)context;
+    if (strcmp(stage, "path_scope_opened") == 0 && !swap->swapped) {
+        swap->swapped = rename(swap->parent, swap->moved) == 0 &&
+                        symlink(swap->outside, swap->parent) == 0;
+    }
+    return true;
+}
+#endif
+
 static bool result_ok(const char *json) {
     yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
     if (!doc) {
@@ -538,6 +556,48 @@ TEST(memory_share_rejects_symlink_and_nonregular_paths) {
     cbm_memory_close(memory);
     th_rmtree(root);
     PASS();
+}
+
+TEST(memory_share_rejects_parent_swap_after_authorization) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX directory-fd race regression");
+#else
+    char root[SHARE_TEST_PATH];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_memory_share_parent_swap"));
+    char home[SHARE_TEST_PATH];
+    char bundle[SHARE_TEST_PATH];
+    char outside_bundle[SHARE_TEST_PATH];
+    share_parent_swap_t swap = {0};
+    snprintf(home, sizeof(home), "%s/home", root);
+    snprintf(swap.parent, sizeof(swap.parent), "%s/export", home);
+    snprintf(swap.moved, sizeof(swap.moved), "%s/export-opened", home);
+    snprintf(swap.outside, sizeof(swap.outside), "%s/outside", root);
+    snprintf(bundle, sizeof(bundle), "%s/bundle.json", swap.parent);
+    snprintf(outside_bundle, sizeof(outside_bundle), "%s/bundle.json", swap.outside);
+
+    cbm_memory_t *memory = cbm_memory_open(home);
+    ASSERT_NOT_NULL(memory);
+    ASSERT_TRUE(cbm_mkdir_p(swap.parent, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(swap.outside, 0700));
+    ASSERT_EQ(seed_full_memory(memory, "Scoped", "open", 1), 0);
+
+    char args[SHARE_TEST_PATH + 128];
+    snprintf(args, sizeof(args), "{\"path\":\"%s\"}", bundle);
+    cbm_memory_share_set_test_hook(swap_share_parent_hook, &swap);
+    char *result = cbm_memory_export_json(memory, args);
+    cbm_memory_share_set_test_hook(NULL, NULL);
+
+    ASSERT_TRUE(swap.swapped);
+    ASSERT_FALSE(result_ok(result));
+    ASSERT_FALSE(cbm_file_exists(outside_bundle));
+
+    free(result);
+    ASSERT_EQ(cbm_unlink(swap.parent), 0);
+    ASSERT_EQ(rename(swap.moved, swap.parent), 0);
+    cbm_memory_close(memory);
+    th_rmtree(root);
+    PASS();
+#endif
 }
 
 TEST(memory_share_import_round_trip_is_idempotent) {
@@ -1117,6 +1177,7 @@ SUITE(memory_share) {
     RUN_TEST(memory_share_export_preserves_parent_permissions);
     RUN_TEST(memory_share_share_paths_require_explicit_authority);
     RUN_TEST(memory_share_rejects_symlink_and_nonregular_paths);
+    RUN_TEST(memory_share_rejects_parent_swap_after_authorization);
     RUN_TEST(memory_share_import_round_trip_is_idempotent);
     RUN_TEST(memory_share_page_fast_forward_materializes_new_revision);
     RUN_TEST(memory_share_natural_identity_conflict_becomes_proposal);

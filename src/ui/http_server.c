@@ -763,6 +763,7 @@ static size_t collect_ui_processes(ui_process_info_t *out, size_t cap) {
 }
 #endif
 
+#ifndef _WIN32
 static bool owned_index_job_for_pid(uint64_t pid, uint64_t *job_id) {
     if (job_id)
         *job_id = 0;
@@ -782,6 +783,7 @@ static bool owned_index_job_for_pid(uint64_t pid, uint64_t *job_id) {
     }
     return false;
 }
+#endif
 
 /* GET /api/processes — list codebase-memory-mcp processes without a shell. */
 static void handle_processes(cbm_http_conn_t *c) {

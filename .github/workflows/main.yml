@@ -1,0 +1,52 @@
+# Validate the exact immutable main commit that can later be released. PR checks
+# run against a pull-request head/merge ref; this workflow gives release a
+# same-SHA gate that cannot be confused with an earlier PR result.
+name: Main
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    permissions:
+      actions: read
+      contents: read
+      security-events: read
+    uses: ./.github/workflows/_security.yml
+
+  lint:
+    uses: ./.github/workflows/_lint.yml
+
+  test:
+    uses: ./.github/workflows/_test.yml
+    with:
+      skip_perf: true
+      broad_platforms: false
+
+  ci-ok:
+    needs: [security, lint, test]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: All main stages must have succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | python3 -c "
+          import json, sys
+          needs = json.load(sys.stdin)
+          bad = {k: v['result'] for k, v in needs.items() if v['result'] != 'success'}
+          if bad:
+              print('MAIN CI NOT OK:', bad)
+              sys.exit(1)
+          print('MAIN CI OK:', ', '.join(needs))
+          "

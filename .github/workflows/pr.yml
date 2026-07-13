@@ -31,8 +31,6 @@ jobs:
     uses: ./.github/workflows/_lint.yml
 
   test:
-    needs: [lint]
-    if: ${{ !cancelled() && needs.lint.result == 'success' }}
     uses: ./.github/workflows/_test.yml
     with:
       # Perf assertions are timing-sensitive on shared runners; they stay in

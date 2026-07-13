@@ -146,10 +146,22 @@ typedef struct {
     char parent[MEM_SHARE_PATH_CAP];
     char name[MEM_SHARE_PATH_CAP];
 #ifndef _WIN32
-    dev_t parent_device;
-    ino_t parent_inode;
+    int parent_fd;
 #endif
 } share_path_scope_t;
+
+static cbm_memory_share_test_hook_fn g_memory_share_test_hook = NULL;
+static void *g_memory_share_test_hook_context = NULL;
+
+void cbm_memory_share_set_test_hook(cbm_memory_share_test_hook_fn hook, void *context) {
+    g_memory_share_test_hook = hook;
+    g_memory_share_test_hook_context = context;
+}
+
+static bool memory_share_run_test_hook(const char *stage) {
+    return !g_memory_share_test_hook ||
+           g_memory_share_test_hook(stage, g_memory_share_test_hook_context);
+}
 
 static char *share_strdup(const char *s) {
     if (!s) {
@@ -369,20 +381,51 @@ static int share_open_directory_at(int parent_fd, const char *name) {
     return fd;
 }
 
-static int share_open_scoped_parent(const share_path_scope_t *scope) {
-    if (!scope || !scope->parent[0]) {
-        return -1;
+static bool share_directory_path_from_fd(int fd, char *out, size_t cap) {
+    if (fd < 0 || !out || cap == 0) {
+        return false;
     }
-    int fd = share_open_directory_path_verified(scope->parent);
-    struct stat opened;
-    if (fd < 0 || fstat(fd, &opened) != 0 || opened.st_dev != scope->parent_device ||
-        opened.st_ino != scope->parent_inode) {
-        if (fd >= 0) {
-            close(fd);
-        }
-        return -1;
+#ifdef __APPLE__
+    if (fcntl(fd, F_GETPATH, out) != 0) {
+        return false;
     }
-    return fd;
+    return out[0] != '\0' && strlen(out) < cap;
+#else
+    char proc_path[64];
+    int n = snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+    if (n < 0 || (size_t)n >= sizeof(proc_path)) {
+        return false;
+    }
+    ssize_t length = readlink(proc_path, out, cap - 1U);
+    if (length < 0 || (size_t)length >= cap - 1U) {
+        return false;
+    }
+    out[length] = '\0';
+    return strstr(out, " (deleted)") == NULL;
+#endif
+}
+
+static bool share_path_scope_current(const share_path_scope_t *scope) {
+    if (!scope || scope->parent_fd < 0 || !scope->parent[0]) {
+        return false;
+    }
+    int current_fd = open(scope->parent, share_directory_open_flags());
+    struct stat retained;
+    struct stat current;
+    bool same = current_fd >= 0 && fstat(scope->parent_fd, &retained) == 0 &&
+                fstat(current_fd, &current) == 0 && retained.st_dev == current.st_dev &&
+                retained.st_ino == current.st_ino;
+    if (current_fd >= 0) {
+        close(current_fd);
+    }
+    return same;
+}
+
+static void share_path_scope_close(share_path_scope_t *scope) {
+    if (scope && scope->parent_fd >= 0) {
+        close(scope->parent_fd);
+        scope->parent_fd = -1;
+    }
 }
 
 static share_path_kind_t share_path_kind_at(int parent_fd, const char *name) {
@@ -938,6 +981,9 @@ static bool share_path_scope(cbm_memory_t *memory, char path[MEM_SHARE_PATH_CAP]
         return false;
     }
     memset(scope, 0, sizeof(*scope));
+#ifndef _WIN32
+    scope->parent_fd = -1;
+#endif
     char parent[MEM_SHARE_PATH_CAP];
     char canonical_parent[MEM_SHARE_PATH_CAP];
     char canonical_home[MEM_SHARE_PATH_CAP];
@@ -959,12 +1005,28 @@ static bool share_path_scope(cbm_memory_t *memory, char path[MEM_SHARE_PATH_CAP]
         *error = "invalid share path";
         return false;
     }
+#ifndef _WIN32
+    scope->parent_fd = open(parent, share_directory_open_flags());
+    struct stat opened_parent;
+    if (scope->parent_fd < 0 || fstat(scope->parent_fd, &opened_parent) != 0 ||
+        !S_ISDIR(opened_parent.st_mode) ||
+        !share_directory_path_from_fd(scope->parent_fd, canonical_parent,
+                                      sizeof(canonical_parent))) {
+        share_path_scope_close(scope);
+        *error = "share path parent directory must exist";
+        return false;
+    }
+#else
     if (cbm_memory_raw_resolve_directory(parent, canonical_parent, sizeof(canonical_parent)) != 0) {
         *error = "share path parent directory must exist";
         return false;
     }
+#endif
     if (cbm_memory_raw_resolve_directory(cbm_memory_home(memory), canonical_home,
                                          sizeof(canonical_home)) != 0) {
+#ifndef _WIN32
+        share_path_scope_close(scope);
+#endif
         *error = "cannot resolve memory home";
         return false;
     }
@@ -972,38 +1034,12 @@ static bool share_path_scope(cbm_memory_t *memory, char path[MEM_SHARE_PATH_CAP]
     if (snprintf(scope->parent, sizeof(scope->parent), "%s", canonical_parent) >=
             (int)sizeof(scope->parent) ||
         snprintf(scope->name, sizeof(scope->name), "%s", name) >= (int)sizeof(scope->name)) {
+#ifndef _WIN32
+        share_path_scope_close(scope);
+#endif
         *error = "share path is too long";
         return false;
     }
-#ifndef _WIN32
-    int directory_flags = O_RDONLY;
-#ifdef O_CLOEXEC
-    directory_flags |= O_CLOEXEC;
-#endif
-#ifdef O_DIRECTORY
-    directory_flags |= O_DIRECTORY;
-#endif
-#ifdef O_NOFOLLOW
-    directory_flags |= O_NOFOLLOW;
-#endif
-    int parent_fd = open(canonical_parent, directory_flags);
-    struct stat opened_parent;
-    struct stat current_parent;
-    bool stable_parent =
-        parent_fd >= 0 && fstat(parent_fd, &opened_parent) == 0 && S_ISDIR(opened_parent.st_mode) &&
-        lstat(canonical_parent, &current_parent) == 0 && S_ISDIR(current_parent.st_mode) &&
-        opened_parent.st_dev == current_parent.st_dev &&
-        opened_parent.st_ino == current_parent.st_ino;
-    if (parent_fd >= 0) {
-        close(parent_fd);
-    }
-    if (!stable_parent) {
-        *error = "share path parent changed during validation";
-        return false;
-    }
-    scope->parent_device = opened_parent.st_dev;
-    scope->parent_inode = opened_parent.st_ino;
-#endif
     size_t parent_length = strlen(canonical_parent);
     bool has_separator = parent_length > 0 && canonical_parent[parent_length - 1] == '/';
 #ifdef _WIN32
@@ -1013,12 +1049,22 @@ static bool share_path_scope(cbm_memory_t *memory, char path[MEM_SHARE_PATH_CAP]
     int target_length = snprintf(path, MEM_SHARE_PATH_CAP, has_separator ? "%s%s" : "%s/%s",
                                  canonical_parent, name);
     if (target_length < 0 || target_length >= MEM_SHARE_PATH_CAP) {
+#ifndef _WIN32
+        share_path_scope_close(scope);
+#endif
         *error = "share path is too long";
         return false;
     }
 #ifdef _WIN32
     cbm_normalize_path_sep(path);
 #endif
+    if (!memory_share_run_test_hook("path_scope_opened")) {
+#ifndef _WIN32
+        share_path_scope_close(scope);
+#endif
+        *error = "share path validation interrupted";
+        return false;
+    }
     return true;
 }
 
@@ -1077,30 +1123,36 @@ char *cbm_memory_export_json(cbm_memory_t *memory, const char *args_json) {
     }
     if (!path_scope.inside_home && !(user_approved && allow_external_path)) {
         yyjson_doc_free(args_doc);
+#ifndef _WIN32
+        share_path_scope_close(&path_scope);
+#endif
         return share_json_result(false,
                                  "external export path requires user_approved and "
                                  "allow_external_path",
                                  path, -1, -1, 0, 0, 0);
     }
 #ifndef _WIN32
-    int destination_parent_fd = share_open_scoped_parent(&path_scope);
     share_path_kind_t destination_kind =
-        destination_parent_fd >= 0 ? share_path_kind_at(destination_parent_fd, path_scope.name)
-                                   : SHARE_PATH_UNSAFE;
-    if (destination_parent_fd >= 0) {
-        close(destination_parent_fd);
-    }
+        share_path_scope_current(&path_scope)
+            ? share_path_kind_at(path_scope.parent_fd, path_scope.name)
+            : SHARE_PATH_UNSAFE;
 #else
     share_path_kind_t destination_kind = share_path_kind(path);
 #endif
     if (destination_kind == SHARE_PATH_UNSAFE) {
         yyjson_doc_free(args_doc);
+#ifndef _WIN32
+        share_path_scope_close(&path_scope);
+#endif
         return share_json_result(false, "export destination must be a regular file or absent", path,
                                  -1, -1, 0, 0, 0);
     }
     bool replace_existing = destination_kind == SHARE_PATH_REGULAR;
     if (replace_existing && !(overwrite && user_approved)) {
         yyjson_doc_free(args_doc);
+#ifndef _WIN32
+        share_path_scope_close(&path_scope);
+#endif
         return share_json_result(false, "overwrite requires overwrite and user_approved", path, -1,
                                  -1, 0, 0, 0);
     }
@@ -1108,6 +1160,9 @@ char *cbm_memory_export_json(cbm_memory_t *memory, const char *args_json) {
 
     sqlite3 *db = cbm_memory_db(memory);
     if (!db || sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK) {
+#ifndef _WIN32
+        share_path_scope_close(&path_scope);
+#endif
         return share_json_result(false, "memory database is unavailable", path, -1, -1, 0, 0, 0);
     }
     /* Read the epoch only after BEGIN: all table rows and the epoch now come
@@ -1115,12 +1170,18 @@ char *cbm_memory_export_json(cbm_memory_t *memory, const char *args_json) {
     int64_t epoch = cbm_memory_snapshot_epoch(memory);
     if (epoch < 0) {
         (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+#ifndef _WIN32
+        share_path_scope_close(&path_scope);
+#endif
         return share_json_result(false, "cannot read memory snapshot", path, -1, -1, 0, 0, 0);
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+#ifndef _WIN32
+        share_path_scope_close(&path_scope);
+#endif
         return NULL;
     }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -1147,12 +1208,18 @@ char *cbm_memory_export_json(cbm_memory_t *memory, const char *args_json) {
     if (!ok) {
         (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
         yyjson_mut_doc_free(doc);
+#ifndef _WIN32
+        share_path_scope_close(&path_scope);
+#endif
         return share_json_result(false, "failed to build deterministic export", path, epoch, -1, 0,
                                  0, 0);
     }
     if (sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
         (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
         yyjson_mut_doc_free(doc);
+#ifndef _WIN32
+        share_path_scope_close(&path_scope);
+#endif
         return share_json_result(false, "failed to close export snapshot", path, epoch, -1, 0, 0,
                                  0);
     }
@@ -1161,16 +1228,17 @@ char *cbm_memory_export_json(cbm_memory_t *memory, const char *args_json) {
     char *json = yyjson_mut_write(doc, 0, &len);
     yyjson_mut_doc_free(doc);
     if (!json) {
+#ifndef _WIN32
+        share_path_scope_close(&path_scope);
+#endif
         return NULL;
     }
 #ifndef _WIN32
-    int output_parent_fd = share_open_scoped_parent(&path_scope);
-    int rc = output_parent_fd >= 0 ? write_atomic_mode_at(output_parent_fd, path_scope.name, json,
-                                                          len, replace_existing)
-                                   : -1;
-    if (output_parent_fd >= 0) {
-        close(output_parent_fd);
-    }
+    int rc = share_path_scope_current(&path_scope)
+                 ? write_atomic_mode_at(path_scope.parent_fd, path_scope.name, json, len,
+                                        replace_existing)
+                 : -1;
+    share_path_scope_close(&path_scope);
 #else
     int rc = write_atomic_mode(path, json, len, replace_existing);
 #endif
@@ -2905,24 +2973,24 @@ char *cbm_memory_import_json(cbm_memory_t *memory, const char *args_json) {
     }
     if (!path_scope.inside_home && !(user_approved && allow_external_path)) {
         yyjson_doc_free(args_doc);
+#ifndef _WIN32
+        share_path_scope_close(&path_scope);
+#endif
         return share_json_result(false,
                                  "external import path requires user_approved and "
                                  "allow_external_path",
                                  path, -1, 0, 0, 0, 0);
     }
 #ifndef _WIN32
-    int import_parent_fd = share_open_scoped_parent(&path_scope);
-    share_path_kind_t import_kind = import_parent_fd >= 0
-                                        ? share_path_kind_at(import_parent_fd, path_scope.name)
+    share_path_kind_t import_kind = share_path_scope_current(&path_scope)
+                                        ? share_path_kind_at(path_scope.parent_fd, path_scope.name)
                                         : SHARE_PATH_UNSAFE;
 #else
     share_path_kind_t import_kind = share_path_kind(path);
 #endif
     if (import_kind != SHARE_PATH_REGULAR) {
 #ifndef _WIN32
-        if (import_parent_fd >= 0) {
-            close(import_parent_fd);
-        }
+        share_path_scope_close(&path_scope);
 #endif
         yyjson_doc_free(args_doc);
         return share_json_result(false, "import bundle must be a regular non-symlink file", path,
@@ -2933,9 +3001,9 @@ char *cbm_memory_import_json(cbm_memory_t *memory, const char *args_json) {
     size_t bundle_len = 0;
     unsigned char *bundle = NULL;
 #ifndef _WIN32
-    int bundle_read_rc = cbm_memory_raw_read_regular_at(import_parent_fd, path_scope.name,
+    int bundle_read_rc = cbm_memory_raw_read_regular_at(path_scope.parent_fd, path_scope.name,
                                                         MEM_SHARE_BUNDLE_MAX, &bundle, &bundle_len);
-    close(import_parent_fd);
+    share_path_scope_close(&path_scope);
 #else
     int bundle_read_rc =
         cbm_memory_raw_read_regular_file(path, MEM_SHARE_BUNDLE_MAX, &bundle, &bundle_len);

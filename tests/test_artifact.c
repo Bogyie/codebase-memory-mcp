@@ -296,6 +296,7 @@ static bool fail_metadata_publish_hook(const char *stage, void *context) {
     return strcmp(stage, "before_metadata_publish") != 0;
 }
 
+#ifndef _WIN32
 typedef struct {
     char payload[4096];
     char outside[4096];
@@ -305,15 +306,12 @@ typedef struct {
 static bool swap_payload_hook(const char *stage, void *context) {
     payload_swap_t *swap = (payload_swap_t *)context;
     if (strcmp(stage, "payload_opened") == 0 && !swap->swapped) {
-#ifndef _WIN32
         swap->swapped =
             cbm_unlink(swap->payload) == 0 && symlink(swap->outside, swap->payload) == 0;
-#else
-        swap->swapped = false;
-#endif
     }
     return true;
 }
+#endif
 
 typedef struct {
     const char *db;

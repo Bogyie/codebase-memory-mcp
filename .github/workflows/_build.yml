@@ -102,9 +102,9 @@ jobs:
           CXX: ${{ matrix.cxx }}
         run: |
           if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" "CC=$CC" "CXX=$CXX"
+            scripts/build.sh --reuse-build --with-ui --version "$VERSION" "CC=$CC" "CXX=$CXX"
           else
-            scripts/build.sh --with-ui "CC=$CC" "CXX=$CXX"
+            scripts/build.sh --reuse-build --with-ui "CC=$CC" "CXX=$CXX"
           fi
 
       - name: Ad-hoc sign macOS UI binary
@@ -188,9 +188,9 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++
+            scripts/build.sh --reuse-build --with-ui --version "$VERSION" CC=clang CXX=clang++
           else
-            scripts/build.sh --with-ui CC=clang CXX=clang++
+            scripts/build.sh --reuse-build --with-ui CC=clang CXX=clang++
           fi
 
       - name: Archive UI binary
@@ -269,9 +269,9 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++
+            scripts/build.sh --reuse-build --with-ui --version "$VERSION" CC=clang CXX=clang++
           else
-            scripts/build.sh --with-ui CC=clang CXX=clang++
+            scripts/build.sh --reuse-build --with-ui CC=clang CXX=clang++
           fi
 
       - name: Archive UI binary
@@ -352,9 +352,9 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" CC=gcc CXX=g++ STATIC=1
+            scripts/build.sh --reuse-build --with-ui --version "$VERSION" CC=gcc CXX=g++ STATIC=1
           else
-            scripts/build.sh --with-ui CC=gcc CXX=g++ STATIC=1
+            scripts/build.sh --reuse-build --with-ui CC=gcc CXX=g++ STATIC=1
           fi
 
       - name: Archive UI binary

@@ -2,8 +2,8 @@
 #
 # This intentionally skips the upstream npm/PyPI/MCP Registry, attestations,
 # signing, SBOM, and VirusTotal publishing jobs that require additional
-# credentials/services. It still gates publication on lint, security, the
-# cross-platform test matrix, and smoke tests of the exact built artifacts.
+# credentials/services. Publication reuses the required validation results for
+# the exact main SHA, then smoke-tests the newly built release artifacts.
 name: Fork Release
 
 on:
@@ -30,6 +30,9 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
     steps:
       - name: Validate release version
         env:
@@ -43,28 +46,25 @@ jobs:
             echo "invalid release version: $VERSION" >&2
             exit 1
           fi
-
-  lint:
-    needs: validate
-    uses: ./.github/workflows/_lint.yml
-
-  security:
-    needs: validate
-    permissions:
-      actions: read
-      contents: read
-      security-events: read
-    uses: ./.github/workflows/_security.yml
-
-  test:
-    needs: lint
-    uses: ./.github/workflows/_test.yml
-    with:
-      skip_perf: true
-      broad_platforms: false
+      - name: Require successful validation for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          RUNS=$(gh api \
+            "repos/$REPO/actions/workflows/main.yml/runs?head_sha=$SHA&event=push&per_page=10")
+          echo "$RUNS" | jq -e --arg sha "$SHA" '
+            .workflow_runs
+            | any(.head_sha == $sha and .event == "push" and .conclusion == "success")
+          ' >/dev/null || {
+            echo "release blocked: Main validation has not succeeded on $SHA" >&2
+            exit 1
+          }
+          echo "release validation passed for $SHA"
 
   build:
-    needs: [test, security]
+    needs: validate
     # Reusable workflows cannot elevate permissions beyond their caller.
     # _build.yml declares these scopes because it can optionally attest
     # artifacts, so the caller must grant them even when attest=false.

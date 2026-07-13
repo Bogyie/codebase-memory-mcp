@@ -1375,15 +1375,15 @@ static bool db_internal_project_name(const char *full_path, char *name_out, size
  * passed name (drifted filename). Defined after is_project_db_file below. */
 static cbm_store_t *resolve_store_fallback_scan(const char *project);
 
+#ifndef _WIN32
 static int64_t mcp_stat_mtime_ns(const struct stat *st) {
 #if defined(__APPLE__)
     return (int64_t)st->st_mtimespec.tv_sec * 1000000000LL + st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * 1000000000LL;
 #else
     return (int64_t)st->st_mtim.tv_sec * 1000000000LL + st->st_mtim.tv_nsec;
 #endif
 }
+#endif
 
 static bool read_store_identity(const char *path, uint64_t *device, uint64_t *inode,
                                 int64_t *mtime_ns, int64_t *size) {
