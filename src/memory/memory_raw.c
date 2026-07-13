@@ -6,6 +6,7 @@
 
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
+#include "foundation/rooted_file.h"
 #include "foundation/sha256.h"
 
 #include <errno.h>
@@ -1141,14 +1142,51 @@ int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned 
 
 int cbm_memory_raw_read_regular_object(const char *home, const char *path, size_t max_len,
                                        unsigned char **out_bytes, size_t *out_len) {
-#ifdef _WIN32
-    char raw_root[CBM_MEMORY_RAW_PATH_MAX];
-    char canonical_root[CBM_MEMORY_RAW_PATH_MAX];
-    if (!home || !memory_raw_path_join(raw_root, sizeof(raw_root), home, "raw/objects") ||
-        cbm_memory_raw_resolve_directory(raw_root, canonical_root, sizeof(canonical_root)) != 0) {
+    if (!out_bytes || !out_len) {
         return -1;
     }
-    return memory_raw_read_regular_file_scoped(path, canonical_root, max_len, out_bytes, out_len);
+    *out_bytes = NULL;
+    *out_len = 0;
+#ifdef _WIN32
+    if (!home || !path || max_len == 0) {
+        return -1;
+    }
+    char normalized_home[CBM_MEMORY_RAW_PATH_MAX];
+    char normalized_path[CBM_MEMORY_RAW_PATH_MAX];
+    int home_n = snprintf(normalized_home, sizeof(normalized_home), "%s", home);
+    int path_n = snprintf(normalized_path, sizeof(normalized_path), "%s", path);
+    if (home_n < 0 || home_n >= (int)sizeof(normalized_home) || path_n < 0 ||
+        path_n >= (int)sizeof(normalized_path)) {
+        return -1;
+    }
+    memory_raw_normalize_native_path(normalized_home);
+    memory_raw_normalize_native_path(normalized_path);
+    size_t home_len = strlen(normalized_home);
+    while (home_len > 3U &&
+           (normalized_home[home_len - 1U] == '/' || normalized_home[home_len - 1U] == '\\')) {
+        normalized_home[--home_len] = '\0';
+    }
+    if (_strnicmp(normalized_home, normalized_path, home_len) != 0 ||
+        (normalized_path[home_len] != '/' && normalized_path[home_len] != '\\')) {
+        return -1;
+    }
+    const char *relative = normalized_path + home_len + 1U;
+    static const char raw_prefix[] = "raw/objects/";
+    if (_strnicmp(relative, raw_prefix, sizeof(raw_prefix) - 1U) != 0) {
+        return -1;
+    }
+    cbm_rooted_file_t file;
+    cbm_rooted_file_status_t status =
+        cbm_rooted_file_read(normalized_home, relative, max_len, &file);
+    if (status != CBM_ROOTED_FILE_OK) {
+        cbm_rooted_file_free(&file);
+        return -1;
+    }
+    *out_bytes = (unsigned char *)file.data;
+    *out_len = file.len;
+    file.data = NULL;
+    cbm_rooted_file_free(&file);
+    return 0;
 #else
     (void)home;
     return memory_raw_read_regular_file_scoped(path, NULL, max_len, out_bytes, out_len);

@@ -297,10 +297,10 @@ static int sha256_file_process_windows(const char *path, size_t max_bytes, char 
                     !sha256_windows_info_equal(&before, &after))) {
         failed = true;
     }
-    CloseHandle(handle);
     if (!failed && !sha256_windows_same_generation(&after, path)) {
         failed = true;
     }
+    CloseHandle(handle);
     if (failed) {
         free(owned_data);
         return CBM_SHA256_FILE_ERROR;
