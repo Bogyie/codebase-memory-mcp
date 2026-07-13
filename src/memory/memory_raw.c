@@ -502,6 +502,13 @@ static bool memory_raw_final_path_from_handle(HANDLE handle, char out[CBM_MEMORY
     memory_raw_normalize_native_path(out);
     return true;
 }
+
+static bool memory_raw_windows_at_eof(HANDLE handle) {
+    unsigned char extra = 0;
+    DWORD extra_read = 0;
+    BOOL read_ok = ReadFile(handle, &extra, 1, &extra_read, NULL);
+    return (read_ok || GetLastError() == ERROR_HANDLE_EOF) && extra_read == 0;
+}
 #endif
 
 #ifndef _WIN32
@@ -872,13 +879,11 @@ cbm_memory_raw_read_result_t cbm_memory_raw_read_authorized_path(const char *pat
         }
         offset += got;
     }
-    unsigned char extra = 0;
-    DWORD extra_read = 0;
     BY_HANDLE_FILE_INFORMATION after;
     LARGE_INTEGER after_size;
     char after_path[CBM_MEMORY_RAW_PATH_MAX];
-    valid = ReadFile(handle, &extra, 1, &extra_read, NULL) && extra_read == 0 &&
-            GetFileInformationByHandle(handle, &after) && GetFileSizeEx(handle, &after_size) &&
+    valid = memory_raw_windows_at_eof(handle) && GetFileInformationByHandle(handle, &after) &&
+            GetFileSizeEx(handle, &after_size) &&
             after.dwVolumeSerialNumber == info.dwVolumeSerialNumber &&
             after.nFileIndexHigh == info.nFileIndexHigh &&
             after.nFileIndexLow == info.nFileIndexLow && after_size.QuadPart == size.QuadPart &&
@@ -1025,9 +1030,7 @@ static int memory_raw_read_regular_file_scoped(const char *path, const char *can
         }
         offset += got;
     }
-    unsigned char extra = 0;
-    DWORD extra_read = 0;
-    if (valid && (!ReadFile(handle, &extra, 1, &extra_read, NULL) || extra_read != 0)) {
+    if (valid && !memory_raw_windows_at_eof(handle)) {
         valid = false;
     }
     BY_HANDLE_FILE_INFORMATION after;

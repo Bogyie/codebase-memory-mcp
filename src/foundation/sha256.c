@@ -212,6 +212,117 @@ static bool sha256_windows_same_generation(const BY_HANDLE_FILE_INFORMATION *ope
     }
     return same;
 }
+
+static int sha256_file_process_windows(const char *path, size_t max_bytes, char **out_data,
+                                       size_t *out_len, char out[CBM_SHA256_HEX_LEN + 1],
+                                       int64_t *out_mtime_ns, int64_t *out_size) {
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return CBM_SHA256_FILE_ERROR;
+    }
+    /* Deliberately omit FILE_SHARE_WRITE. NTFS may defer LastWriteTime updates
+     * until a writer closes; excluding concurrent writers prevents a same-size
+     * in-place write from yielding mixed bytes with unchanged handle metadata. */
+    HANDLE handle =
+        CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    free(wide);
+    BY_HANDLE_FILE_INFORMATION before;
+    if (handle == INVALID_HANDLE_VALUE || GetFileType(handle) != FILE_TYPE_DISK ||
+        !GetFileInformationByHandle(handle, &before) ||
+        (before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+        }
+        return CBM_SHA256_FILE_ERROR;
+    }
+    uint64_t size64 = ((uint64_t)before.nFileSizeHigh << 32U) | before.nFileSizeLow;
+    int64_t file_mtime_ns = 0;
+    if (size64 > (uint64_t)INT64_MAX ||
+        !sha256_windows_mtime_ns(&before.ftLastWriteTime, &file_mtime_ns)) {
+        CloseHandle(handle);
+        return CBM_SHA256_FILE_ERROR;
+    }
+    if (out_mtime_ns) {
+        *out_mtime_ns = file_mtime_ns;
+    }
+    if (out_size) {
+        *out_size = (int64_t)size64;
+    }
+    bool size_limit_skipped = max_bytes > 0 && size64 > (uint64_t)max_bytes;
+    if (!size_limit_skipped && size64 > (uint64_t)SIZE_MAX - 1U) {
+        CloseHandle(handle);
+        return CBM_SHA256_FILE_ERROR;
+    }
+    size_t expected_size = size_limit_skipped ? 0 : (size_t)size64;
+    char *owned_data = NULL;
+    if (out_data && !size_limit_skipped) {
+        owned_data = (char *)malloc(expected_size + 1U);
+        if (!owned_data) {
+            CloseHandle(handle);
+            return CBM_SHA256_FILE_OUT_OF_MEMORY;
+        }
+    }
+
+    cbm_sha256_ctx ctx;
+    cbm_sha256_init(&ctx);
+    unsigned char buffer[64 * 1024];
+    size_t total = 0;
+    bool failed = false;
+    while (!size_limit_skipped) {
+        DWORD count = 0;
+        BOOL read_ok = ReadFile(handle, buffer, (DWORD)sizeof(buffer), &count, NULL);
+        if (!read_ok && GetLastError() != ERROR_HANDLE_EOF) {
+            failed = true;
+            break;
+        }
+        if (count == 0) {
+            break;
+        }
+        if ((size_t)count > expected_size - total) {
+            failed = true;
+            break;
+        }
+        cbm_sha256_update(&ctx, buffer, count);
+        if (owned_data) {
+            memcpy(owned_data + total, buffer, count);
+        }
+        total += count;
+    }
+    if (!size_limit_skipped && total != expected_size) {
+        failed = true;
+    }
+    BY_HANDLE_FILE_INFORMATION after = {0};
+    if (!failed && (!GetFileInformationByHandle(handle, &after) ||
+                    !sha256_windows_info_equal(&before, &after))) {
+        failed = true;
+    }
+    CloseHandle(handle);
+    if (!failed && !sha256_windows_same_generation(&after, path)) {
+        failed = true;
+    }
+    if (failed) {
+        free(owned_data);
+        return CBM_SHA256_FILE_ERROR;
+    }
+    if (size_limit_skipped) {
+        return CBM_SHA256_FILE_SKIPPED;
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&ctx, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+    if (owned_data) {
+        owned_data[total] = '\0';
+        *out_data = owned_data;
+        *out_len = total;
+    }
+    return CBM_SHA256_FILE_HASHED;
+}
 #endif
 
 static int sha256_file_process(const char *path, size_t max_bytes, char **out_data, size_t *out_len,
@@ -237,38 +348,8 @@ static int sha256_file_process(const char *path, size_t max_bytes, char **out_da
         return -1;
     }
 #ifdef _WIN32
-    wchar_t *wide = cbm_utf8_to_wide(path);
-    if (!wide) {
-        return -1;
-    }
-    /* Deliberately omit FILE_SHARE_WRITE. NTFS may defer LastWriteTime updates
-     * until a writer closes; excluding concurrent writers prevents a same-size
-     * in-place write from yielding mixed bytes with unchanged handle metadata. */
-    HANDLE opened_handle =
-        CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    free(wide);
-    if (opened_handle == INVALID_HANDLE_VALUE || GetFileType(opened_handle) != FILE_TYPE_DISK) {
-        if (opened_handle != INVALID_HANDLE_VALUE) {
-            CloseHandle(opened_handle);
-        }
-        return -1;
-    }
-    BY_HANDLE_FILE_INFORMATION opened_info;
-    if (!GetFileInformationByHandle(opened_handle, &opened_info)) {
-        CloseHandle(opened_handle);
-        return -1;
-    }
-    int fd = _open_osfhandle((intptr_t)opened_handle, _O_RDONLY | _O_BINARY);
-    if (fd < 0) {
-        CloseHandle(opened_handle);
-        return -1;
-    }
-    FILE *file = _fdopen(fd, "rb");
-    if (!file) {
-        _close(fd); /* owns and closes opened_handle after _open_osfhandle */
-        return -1;
-    }
+    return sha256_file_process_windows(path, max_bytes, out_data, out_len, out, out_mtime_ns,
+                                       out_size);
 #else
     int flags = O_RDONLY;
 #ifdef O_NONBLOCK
@@ -289,16 +370,6 @@ static int sha256_file_process(const char *path, size_t max_bytes, char **out_da
         close(fd);
         return -1;
     }
-#endif
-#ifdef _WIN32
-    uint64_t size64 = ((uint64_t)opened_info.nFileSizeHigh << 32U) | opened_info.nFileSizeLow;
-    int64_t file_size = size64 <= INT64_MAX ? (int64_t)size64 : -1;
-    int64_t file_mtime_ns = 0;
-    if (file_size < 0 || !sha256_windows_mtime_ns(&opened_info.ftLastWriteTime, &file_mtime_ns)) {
-        (void)fclose(file);
-        return -1;
-    }
-#else
     struct stat before;
     if (fstat(cbm_fileno(file), &before) != 0 || !S_ISREG(before.st_mode)) {
         (void)fclose(file);
@@ -306,7 +377,6 @@ static int sha256_file_process(const char *path, size_t max_bytes, char **out_da
     }
     int64_t file_size = (int64_t)before.st_size;
     int64_t file_mtime_ns = sha256_stat_mtime_ns(&before);
-#endif
     if (out_mtime_ns) {
         *out_mtime_ns = file_mtime_ns;
     }
@@ -328,9 +398,6 @@ static int sha256_file_process(const char *path, size_t max_bytes, char **out_da
             return CBM_SHA256_FILE_OUT_OF_MEMORY;
         }
     }
-#ifdef _WIN32
-    intptr_t os_handle = _get_osfhandle(cbm_fileno(file));
-#endif
     cbm_sha256_ctx ctx;
     cbm_sha256_init(&ctx);
     unsigned char buffer[64 * 1024];
@@ -355,26 +422,13 @@ static int sha256_file_process(const char *path, size_t max_bytes, char **out_da
     }
     bool failed = ferror(file) != 0 || limit_exceeded || size_changed ||
                   (owned_data && total != expected_size);
-#ifdef _WIN32
-    BY_HANDLE_FILE_INFORMATION after_info = {0};
-    if (!failed && (!GetFileInformationByHandle((HANDLE)os_handle, &after_info) ||
-                    !sha256_windows_info_equal(&opened_info, &after_info))) {
-        failed = true;
-    }
-#else
     struct stat after;
     if (fstat(cbm_fileno(file), &after) != 0 || !sha256_file_stat_equal(&before, &after)) {
         failed = true;
     }
-#endif
     if (fclose(file) != 0) {
         failed = true;
     }
-#ifdef _WIN32
-    if (!failed && !sha256_windows_same_generation(&after_info, path)) {
-        failed = true;
-    }
-#else
     /* fstat proves the opened inode was stable. Also ensure the path still
      * names that generation; otherwise an atomic replacement during hashing
      * could make callers compare a digest for an already-unlinked file.
@@ -384,7 +438,6 @@ static int sha256_file_process(const char *path, size_t max_bytes, char **out_da
     if (!failed && (stat(path, &live) != 0 || !sha256_file_stat_equal(&after, &live))) {
         failed = true;
     }
-#endif
     if (failed) {
         free(owned_data);
         return -1;
@@ -406,6 +459,7 @@ static int sha256_file_process(const char *path, size_t max_bytes, char **out_da
         *out_len = total;
     }
     return 0;
+#endif
 }
 
 int cbm_sha256_file_hex_limited(const char *path, size_t max_bytes,

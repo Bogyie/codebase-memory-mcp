@@ -294,7 +294,8 @@ static cbm_rooted_file_status_t rooted_windows_read(const char *root_path,
         }
         unsigned char extra;
         DWORD extra_count = 0;
-        if (!ReadFile(file, &extra, 1, &extra_count, NULL) || extra_count != 0) {
+        BOOL read_ok = ReadFile(file, &extra, 1, &extra_count, NULL);
+        if ((!read_ok && GetLastError() != ERROR_HANDLE_EOF) || extra_count != 0) {
             status = CBM_ROOTED_FILE_CHANGED;
             goto cleanup_data;
         }
