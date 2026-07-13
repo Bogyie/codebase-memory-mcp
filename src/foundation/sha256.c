@@ -144,6 +144,7 @@ void cbm_sha256_hex(const void *data, size_t len, char out[CBM_SHA256_HEX_LEN + 
     out[CBM_SHA256_HEX_LEN] = '\0';
 }
 
+#ifndef _WIN32
 static bool sha256_file_stat_equal(const struct stat *left, const struct stat *right) {
     if (left->st_dev != right->st_dev || left->st_ino != right->st_ino ||
         left->st_size != right->st_size || left->st_mtime != right->st_mtime ||
@@ -153,13 +154,12 @@ static bool sha256_file_stat_equal(const struct stat *left, const struct stat *r
 #ifdef __APPLE__
     return left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
            left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
-#elif defined(_WIN32)
-    return true;
 #else
     return left->st_mtim.tv_nsec == right->st_mtim.tv_nsec &&
            left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
 #endif
 }
+#endif
 
 static int64_t sha256_stat_mtime_ns(const struct stat *st) {
 #ifdef __APPLE__
