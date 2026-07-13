@@ -28,6 +28,7 @@ jobs:
     outputs:
       platforms: ${{ steps.matrix.outputs.platforms }}
       run_platforms: ${{ steps.matrix.outputs.run_platforms }}
+      compile_platforms: ${{ steps.matrix.outputs.compile_platforms }}
       shards: ${{ steps.matrix.outputs.shards }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -60,8 +61,11 @@ jobs:
           if [ "$PROFILE" = "pr" ]; then
             RUN_PLATFORMS=$(jq -cn --argjson platforms "$PLATFORMS" \
               '$platforms | map(select(.key == "ubuntu-x64"))')
+            COMPILE_PLATFORMS=$(jq -cn --argjson platforms "$PLATFORMS" \
+              '$platforms | map(select(.key != "ubuntu-x64"))')
           elif [ "$PROFILE" = "full" ]; then
             RUN_PLATFORMS="$PLATFORMS"
+            COMPILE_PLATFORMS='[]'
           else
             echo "unknown test profile: $PROFILE" >&2
             exit 1
@@ -71,6 +75,7 @@ jobs:
             .github/test-shards.json)
           echo "platforms=$PLATFORMS" >> "$GITHUB_OUTPUT"
           echo "run_platforms=$RUN_PLATFORMS" >> "$GITHUB_OUTPUT"
+          echo "compile_platforms=$COMPILE_PLATFORMS" >> "$GITHUB_OUTPUT"
           echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
 
   build-test-runners:
@@ -79,7 +84,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: ${{ fromJSON(needs.setup.outputs.platforms) }}
+        platform: ${{ fromJSON(needs.setup.outputs.run_platforms) }}
     runs-on: ${{ matrix.platform.os }}
     timeout-minutes: 60
     steps:
@@ -118,6 +123,48 @@ jobs:
             build/c/test-runner.exe
           if-no-files-found: error
           retention-days: 1
+
+  # PRs only need a runnable sanitizer artifact from Ubuntu x64. Compile the
+  # other platforms independently so a slow macOS/Windows link cannot delay
+  # the Linux suite shards. Full/main runs upload artifacts for every platform
+  # through build-test-runners instead.
+  compile-platforms:
+    if: ${{ inputs.profile == 'pr' }}
+    needs: setup
+    name: compile-only (${{ matrix.platform.key }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.setup.outputs.compile_platforms) }}
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install deps (Ubuntu)
+        if: startsWith(matrix.platform.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        if: matrix.platform.kind == 'windows'
+        with:
+          msystem: ${{ matrix.platform.msystem }}
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-${{ matrix.platform.pkg }}-clang
+            mingw-w64-clang-${{ matrix.platform.pkg }}-compiler-rt
+            mingw-w64-clang-${{ matrix.platform.pkg }}-zlib
+            make
+            git
+
+      - name: Compile sanitizer runner (Unix)
+        if: matrix.platform.kind == 'unix'
+        run: scripts/test.sh --build-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }} ${{ matrix.platform.sanitize }}
+
+      - name: Compile sanitizer runner (Windows)
+        if: matrix.platform.kind == 'windows'
+        shell: msys2 {0}
+        run: scripts/test.sh --build-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }} ${{ matrix.platform.sanitize }}
 
   test-shards:
     needs: [setup, build-test-runners]
