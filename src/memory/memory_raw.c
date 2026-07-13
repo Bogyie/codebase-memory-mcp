@@ -1179,11 +1179,6 @@ int cbm_memory_raw_read_regular_object(const char *home, const char *path, size_
     cbm_rooted_file_status_t status =
         cbm_rooted_file_read(normalized_home, relative, max_len, &file);
     if (status != CBM_ROOTED_FILE_OK) {
-        const char *diagnostics = getenv("CBM_WINDOWS_FILE_DIAGNOSTICS");
-        if (diagnostics && strcmp(diagnostics, "1") == 0) {
-            fprintf(stderr, "memory_raw.windows stage=rooted_read status=%d path=%s\n", (int)status,
-                    relative);
-        }
         cbm_rooted_file_free(&file);
         return -1;
     }
