@@ -101,6 +101,24 @@ static cbm_rooted_file_status_t rooted_windows_error_status(DWORD error) {
     return CBM_ROOTED_FILE_UNAVAILABLE;
 }
 
+static HANDLE rooted_windows_open_stable(const wchar_t *path, DWORD access, DWORD flags) {
+    DWORD error = ERROR_SUCCESS;
+    for (unsigned int attempt = 0; attempt < 50U; attempt++) {
+        HANDLE handle = CreateFileW(path, access, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                                    OPEN_EXISTING, flags, NULL);
+        if (handle != INVALID_HANDLE_VALUE) {
+            return handle;
+        }
+        error = GetLastError();
+        if (error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) {
+            break;
+        }
+        Sleep(10);
+    }
+    SetLastError(error);
+    return INVALID_HANDLE_VALUE;
+}
+
 static bool rooted_windows_info_same(const BY_HANDLE_FILE_INFORMATION *left,
                                      const BY_HANDLE_FILE_INFORMATION *right) {
     return left->dwVolumeSerialNumber == right->dwVolumeSerialNumber &&
@@ -232,10 +250,9 @@ static cbm_rooted_file_status_t rooted_windows_read(const char *root_path,
         CloseHandle(root);
         return CBM_ROOTED_FILE_OUT_OF_MEMORY;
     }
-    HANDLE file = CreateFileW(
-        wide_file, GENERIC_READ | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    HANDLE file = rooted_windows_open_stable(wide_file, GENERIC_READ | FILE_READ_ATTRIBUTES,
+                                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN |
+                                                 FILE_FLAG_OPEN_REPARSE_POINT);
     if (file == INVALID_HANDLE_VALUE) {
         cbm_rooted_file_status_t status = rooted_windows_error_status(GetLastError());
         free(wide_file);

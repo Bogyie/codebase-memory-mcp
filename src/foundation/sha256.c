@@ -169,6 +169,30 @@ static int64_t sha256_stat_mtime_ns(const struct stat *st) {
 #endif
 
 #ifdef _WIN32
+static bool sha256_windows_diagnostics_enabled(void) {
+    const char *value = getenv("CBM_WINDOWS_FILE_DIAGNOSTICS");
+    return value && strcmp(value, "1") == 0;
+}
+
+static HANDLE sha256_windows_open_stable(const wchar_t *path) {
+    DWORD error = ERROR_SUCCESS;
+    for (unsigned int attempt = 0; attempt < 50U; attempt++) {
+        HANDLE handle =
+            CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        if (handle != INVALID_HANDLE_VALUE) {
+            return handle;
+        }
+        error = GetLastError();
+        if (error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) {
+            break;
+        }
+        Sleep(10);
+    }
+    SetLastError(error);
+    return INVALID_HANDLE_VALUE;
+}
+
 static bool sha256_windows_mtime_ns(const FILETIME *mtime, int64_t *out) {
     const uint64_t windows_to_unix_epoch_100ns = 116444736000000000ULL;
     uint64_t ticks = ((uint64_t)mtime->dwHighDateTime << 32U) | mtime->dwLowDateTime;
@@ -223,14 +247,16 @@ static int sha256_file_process_windows(const char *path, size_t max_bytes, char 
     /* Deliberately omit FILE_SHARE_WRITE. NTFS may defer LastWriteTime updates
      * until a writer closes; excluding concurrent writers prevents a same-size
      * in-place write from yielding mixed bytes with unchanged handle metadata. */
-    HANDLE handle =
-        CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    HANDLE handle = sha256_windows_open_stable(wide);
     free(wide);
     BY_HANDLE_FILE_INFORMATION before;
     if (handle == INVALID_HANDLE_VALUE || GetFileType(handle) != FILE_TYPE_DISK ||
         !GetFileInformationByHandle(handle, &before) ||
         (before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (sha256_windows_diagnostics_enabled()) {
+            fprintf(stderr, "sha256.windows stage=open_or_metadata error=%lu path=%s\n",
+                    (unsigned long)GetLastError(), path);
+        }
         if (handle != INVALID_HANDLE_VALUE) {
             CloseHandle(handle);
         }
@@ -240,6 +266,9 @@ static int sha256_file_process_windows(const char *path, size_t max_bytes, char 
     int64_t file_mtime_ns = 0;
     if (size64 > (uint64_t)INT64_MAX ||
         !sha256_windows_mtime_ns(&before.ftLastWriteTime, &file_mtime_ns)) {
+        if (sha256_windows_diagnostics_enabled()) {
+            fprintf(stderr, "sha256.windows stage=metadata_range path=%s\n", path);
+        }
         CloseHandle(handle);
         return CBM_SHA256_FILE_ERROR;
     }
@@ -269,11 +298,15 @@ static int sha256_file_process_windows(const char *path, size_t max_bytes, char 
     unsigned char buffer[64 * 1024];
     size_t total = 0;
     bool failed = false;
+    const char *failure_stage = NULL;
+    DWORD failure_error = ERROR_SUCCESS;
     while (!size_limit_skipped) {
         DWORD count = 0;
         BOOL read_ok = ReadFile(handle, buffer, (DWORD)sizeof(buffer), &count, NULL);
         if (!read_ok && GetLastError() != ERROR_HANDLE_EOF) {
             failed = true;
+            failure_stage = "read";
+            failure_error = GetLastError();
             break;
         }
         if (count == 0) {
@@ -281,6 +314,7 @@ static int sha256_file_process_windows(const char *path, size_t max_bytes, char 
         }
         if ((size_t)count > expected_size - total) {
             failed = true;
+            failure_stage = "size_grew";
             break;
         }
         cbm_sha256_update(&ctx, buffer, count);
@@ -291,17 +325,26 @@ static int sha256_file_process_windows(const char *path, size_t max_bytes, char 
     }
     if (!size_limit_skipped && total != expected_size) {
         failed = true;
+        failure_stage = "short_read";
     }
     BY_HANDLE_FILE_INFORMATION after = {0};
     if (!failed && (!GetFileInformationByHandle(handle, &after) ||
                     !sha256_windows_info_equal(&before, &after))) {
         failed = true;
+        failure_stage = "handle_changed";
+        failure_error = GetLastError();
     }
     if (!failed && !sha256_windows_same_generation(&after, path)) {
         failed = true;
+        failure_stage = "path_changed";
+        failure_error = GetLastError();
     }
     CloseHandle(handle);
     if (failed) {
+        if (sha256_windows_diagnostics_enabled()) {
+            fprintf(stderr, "sha256.windows stage=%s error=%lu path=%s\n",
+                    failure_stage ? failure_stage : "unknown", (unsigned long)failure_error, path);
+        }
         free(owned_data);
         return CBM_SHA256_FILE_ERROR;
     }

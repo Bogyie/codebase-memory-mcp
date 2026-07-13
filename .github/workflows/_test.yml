@@ -192,6 +192,7 @@ jobs:
         env:
           CBM_SKIP_PERF: '1'
           CBM_TEST_SUITES: subprocess memory_share mcp design artifact
+          CBM_WINDOWS_FILE_DIAGNOSTICS: '1'
         run: scripts/test.sh --run-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }} ${{ matrix.platform.sanitize }}
 
   test-shards:
