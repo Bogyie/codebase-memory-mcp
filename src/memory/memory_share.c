@@ -1648,7 +1648,7 @@ static bool raw_stage_add_lease(raw_bundle_stage_t *stage, int lease_fd, const c
             return false;
         }
         int *leases = malloc(next * sizeof(*leases));
-        char(*names)[MEM_SHARE_NAME_CAP] = malloc(next * sizeof(*names));
+        char (*names)[MEM_SHARE_NAME_CAP] = malloc(next * sizeof(*names));
         if (!leases || !names) {
             free(leases);
             free(names);
