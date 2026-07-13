@@ -69,7 +69,14 @@ runs:
     - name: Activate ccache compiler wrappers (Windows)
       if: runner.os == 'Windows'
       shell: msys2 {0}
-      run: cygpath -w "$MINGW_PREFIX/lib/ccache/bin" >> "$GITHUB_PATH"
+      run: |
+        set -euo pipefail
+        # setup-msys2 starts every `msys2 {0}` step as a fresh login shell,
+        # which rebuilds PATH and places the real compiler before GITHUB_PATH.
+        # A profile fragment makes the masquerade directory win consistently
+        # in every later build step (CLANG64 and CLANGARM64 alike).
+        printf 'export PATH="%s/lib/ccache/bin:$PATH"\n' "$MINGW_PREFIX" \
+          > /etc/profile.d/zz-ccache.sh
 
     - name: Verify ccache compiler wrappers (Windows)
       if: runner.os == 'Windows'
