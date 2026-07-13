@@ -75,15 +75,32 @@ jobs:
           CURRENT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           ANALYSIS_SHA: ${{ github.sha }}
         run: |
-          echo "Waiting 60s for alert API to settle..."
-          sleep 60
+          ANALYSES='repos/${{ github.repository }}/code-scanning/analyses?tool_name=CodeQL&per_page=100'
+          analysis_ready=false
+          for attempt in $(seq 1 24); do
+            if JSON_ANALYSES=$(gh api "$ANALYSES") && \
+               jq -e --arg head "$CURRENT_SHA" --arg analysis "$ANALYSIS_SHA" \
+                 'any(.[]; .commit_sha == $head or .commit_sha == $analysis)' \
+                 <<<"$JSON_ANALYSES" >/dev/null; then
+              analysis_ready=true
+              echo "CodeQL analysis is visible in the API"
+              break
+            fi
+            echo "  $attempt/24: analysis result not visible yet..."
+            sleep 5
+          done
+          if [ "$analysis_ready" != "true" ]; then
+            echo "BLOCKED: completed CodeQL run has no matching analysis result" >&2
+            exit 1
+          fi
+
           API='repos/${{ github.repository }}/code-scanning/alerts?state=open&tool_name=CodeQL&per_page=100'
           if ! JSON=$(gh api --paginate --slurp "$API"); then
             echo "BLOCKED: unable to read code scanning alerts" >&2
             exit 1
           fi
           ALERTS=$(jq --arg head "$CURRENT_SHA" --arg analysis "$ANALYSIS_SHA" '[.[][] | select(.most_recent_instance.commit_sha == $head or .most_recent_instance.commit_sha == $analysis) | select(.most_recent_instance.location.path | startswith("internal/cbm/vendored/") | not)] | length' <<<"$JSON")
-          sleep 15
+          sleep 5
           if ! JSON2=$(gh api --paginate --slurp "$API"); then
             echo "BLOCKED: unable to re-read code scanning alerts" >&2
             exit 1

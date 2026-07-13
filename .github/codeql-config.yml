@@ -1,0 +1,8 @@
+paths:
+  - src
+  - internal/cbm
+
+paths-ignore:
+  - internal/cbm/vendored
+  - internal/cbm/lsp/generated
+  - internal/cbm/grammar_*.c
