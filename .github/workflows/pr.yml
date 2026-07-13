@@ -74,7 +74,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        include:
+          - os: ubuntu-latest
+            cache_key: ubuntu-x64
+          - os: macos-14
+            cache_key: macos-arm64
+          - os: windows-latest
+            cache_key: windows-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -82,7 +88,11 @@ jobs:
 
       - name: Install deps (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y ccache zlib1g-dev
+
+      - name: Install ccache (macOS)
+        if: matrix.os == 'macos-14'
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install ccache
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         if: matrix.os == 'windows-latest'
@@ -91,10 +101,16 @@ jobs:
           path-type: inherit
           install: >-
             mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-ccache
             mingw-w64-clang-x86_64-zlib
             mingw-w64-clang-x86_64-python3
             make
             coreutils
+
+      - uses: ./.github/actions/setup-ccache
+        with:
+          platform: ${{ matrix.cache_key }}
+          profile: prod
 
       - name: Build prod + smoke (Ubuntu)
         if: matrix.os == 'ubuntu-latest'

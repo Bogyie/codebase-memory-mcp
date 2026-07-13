@@ -29,21 +29,25 @@ jobs:
           - os: ubuntu-latest
             goos: linux
             goarch: amd64
+            cache_key: ubuntu-x64
             cc: gcc
             cxx: g++
           - os: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
+            cache_key: ubuntu-arm64
             cc: gcc
             cxx: g++
           - os: macos-14
             goos: darwin
             goarch: arm64
+            cache_key: macos-arm64
             cc: cc
             cxx: c++
           - os: macos-15-intel
             goos: darwin
             goarch: amd64
+            cache_key: macos-x64
             cc: cc
             cxx: c++
     runs-on: ${{ matrix.os }}
@@ -57,7 +61,14 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install deps (Linux)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
+        run: sudo apt-get update && sudo apt-get install -y ccache zlib1g-dev python3 git
+      - name: Install ccache (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install ccache
+      - uses: ./.github/actions/setup-ccache
+        with:
+          platform: ${{ matrix.cache_key }}
+          profile: prod
       - name: Build
         run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
       - name: Soak (${{ inputs.duration_minutes }} min)
@@ -98,11 +109,16 @@ jobs:
           path-type: inherit
           install: >-
             mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-ccache
             mingw-w64-clang-x86_64-zlib
             mingw-w64-clang-x86_64-python3
             make
             git
             coreutils
+      - uses: ./.github/actions/setup-ccache
+        with:
+          platform: windows-x64
+          profile: prod
       - name: Build
         shell: msys2 {0}
         run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
@@ -150,11 +166,16 @@ jobs:
           path-type: inherit
           install: >-
             mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-ccache
             mingw-w64-clang-aarch64-zlib
             mingw-w64-clang-aarch64-python3
             make
             git
             coreutils
+      - uses: ./.github/actions/setup-ccache
+        with:
+          platform: windows-arm64
+          profile: prod
       - name: Build
         shell: msys2 {0}
         run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
@@ -198,21 +219,25 @@ jobs:
           - os: ubuntu-latest
             goos: linux
             goarch: amd64
+            cache_key: ubuntu-x64
             cc: gcc
             cxx: g++
           - os: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
+            cache_key: ubuntu-arm64
             cc: gcc
             cxx: g++
           - os: macos-14
             goos: darwin
             goarch: arm64
+            cache_key: macos-arm64
             cc: cc
             cxx: c++
           - os: macos-15-intel
             goos: darwin
             goarch: amd64
+            cache_key: macos-x64
             cc: cc
             cxx: c++
     runs-on: ${{ matrix.os }}
@@ -226,7 +251,14 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install deps (Linux)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
+        run: sudo apt-get update && sudo apt-get install -y ccache zlib1g-dev python3 git
+      - name: Install ccache (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install ccache
+      - uses: ./.github/actions/setup-ccache
+        with:
+          platform: ${{ matrix.cache_key }}
+          profile: prod-asan
       - name: Build (ASan)
         run: |
           SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
@@ -258,11 +290,16 @@ jobs:
           path-type: inherit
           install: >-
             mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-ccache
             mingw-w64-clang-x86_64-zlib
             mingw-w64-clang-x86_64-python3
             make
             git
             coreutils
+      - uses: ./.github/actions/setup-ccache
+        with:
+          platform: windows-x64
+          profile: prod-asan
       - name: Build (ASan)
         shell: msys2 {0}
         run: |

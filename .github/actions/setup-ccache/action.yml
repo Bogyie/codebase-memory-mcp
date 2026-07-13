@@ -1,0 +1,70 @@
+name: Setup ccache
+description: Configure compiler wrappers and a platform-scoped persistent cache
+
+inputs:
+  platform:
+    description: Stable platform identifier used to isolate incompatible toolchains
+    required: true
+  profile:
+    description: Build profile such as test, prod, prod-static, or asan
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Configure ccache environment (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        CACHE_DIR: ${{ github.workspace }}/.ccache
+        CACHE_BASEDIR: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          echo "$(brew --prefix ccache)/libexec" >> "$GITHUB_PATH"
+        else
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+        fi
+        {
+          echo "CCACHE_DIR=$CACHE_DIR"
+          echo "CCACHE_BASEDIR=$CACHE_BASEDIR"
+          echo "CCACHE_COMPILERCHECK=content"
+        } >> "$GITHUB_ENV"
+
+    - name: Configure ccache environment (Windows)
+      if: runner.os == 'Windows'
+      shell: msys2 {0}
+      env:
+        CACHE_DIR: ${{ github.workspace }}/.ccache
+        CACHE_BASEDIR: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        wrapper_dir="$MINGW_PREFIX/lib/ccache/bin"
+        # The MSYS2 package puts compiler masquerade links in wrapper_dir and
+        # ccache.exe itself in $MINGW_PREFIX/bin. Keep one PATH entry whose
+        # precedence is unambiguous for both the Node action and later builds.
+        if [ ! -x "$wrapper_dir/ccache.exe" ]; then
+          cp "$(command -v ccache)" "$wrapper_dir/ccache.exe"
+        fi
+        cygpath -w "$wrapper_dir" >> "$GITHUB_PATH"
+        {
+          echo "CCACHE_DIR=$CACHE_DIR"
+          echo "CCACHE_BASEDIR=$CACHE_BASEDIR"
+          echo "CCACHE_COMPILERCHECK=content"
+        } >> "$GITHUB_ENV"
+
+    # The action owns restore/save, timestamped immutable keys, cache pruning,
+    # and post-job statistics. Pin the exact audited v1.2.23 commit: Marketplace
+    # actions are third-party code and tags are mutable.
+    - name: Restore ccache
+      uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
+      with:
+        key: v1-${{ inputs.platform }}-${{ inputs.profile }}
+        restore-keys: |
+          v1-${{ inputs.platform }}-${{ inputs.profile }}
+        max-size: 500M
+        install: no
+        append-timestamp: true
+        evict-old-files: job
+        verbose: 1
+        job-summary: ccache — ${{ inputs.platform }} / ${{ inputs.profile }}

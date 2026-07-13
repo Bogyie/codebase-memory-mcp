@@ -51,6 +51,7 @@ private/
 
 # Build artifacts
 build/
+.ccache/
 node_modules/
 graph-ui/dist/
 
