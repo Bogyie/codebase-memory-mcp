@@ -36,6 +36,7 @@ jobs:
       # Perf assertions are timing-sensitive on shared runners; they stay in
       # dry runs and releases where a flaky red does not block a merge.
       skip_perf: true
+      profile: pr
 
   # ── Which files changed? Gate the (heavier) build+smoke on product code so
   #    docs / CI / test-only PRs stay fast. ──
@@ -100,6 +101,9 @@ jobs:
         run: |
           scripts/build.sh CC=gcc CXX=g++
           scripts/smoke-test.sh "$(pwd)/build/c/codebase-memory-mcp"
+          tests/test_parent_watchdog.sh
+          tests/test_worker_watchdog.sh
+          tests/test_security_strings_allowlist.sh
 
       - name: Build prod + smoke (macOS)
         if: matrix.os == 'macos-14'
@@ -107,6 +111,9 @@ jobs:
           scripts/build.sh CC=cc CXX=c++
           codesign --sign - --force build/c/codebase-memory-mcp
           scripts/smoke-test.sh "$(pwd)/build/c/codebase-memory-mcp"
+          tests/test_parent_watchdog.sh
+          tests/test_worker_watchdog.sh
+          tests/test_security_strings_allowlist.sh
 
       - name: Build prod + smoke (Windows)
         if: matrix.os == 'windows-latest'
@@ -116,6 +123,9 @@ jobs:
           BIN="$(pwd)/build/c/codebase-memory-mcp"
           [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
           scripts/smoke-test.sh "$BIN"
+          tests/test_parent_watchdog.sh
+          tests/test_worker_watchdog.sh
+          tests/test_security_strings_allowlist.sh
 
   ci-ok:
     # The one required context (besides dco) — fails unless every PR stage

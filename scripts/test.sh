@@ -3,8 +3,12 @@
 #
 # Usage:
 #   scripts/test.sh                          # Auto-detect everything
+#   scripts/test.sh --build-only             # Build the sanitizer runner only
+#   scripts/test.sh --run-only               # Run an existing sanitizer runner only
+#   scripts/test.sh --guards-only            # Build prod and run process/security guards
 #   scripts/test.sh --arch x86_64            # Force x86_64 build
 #   scripts/test.sh CC=gcc-14 CXX=g++-14    # Override compiler
+#   CBM_TEST_SUITES="memory cli" scripts/test.sh --run-only
 #
 # This script is the SINGLE source of truth for running tests.
 # Used identically in local development and CI workflows.
@@ -38,11 +42,21 @@ done
 # shellcheck source=env.sh
 source "$ROOT/scripts/env.sh"
 
+TEST_MODE=all
+for arg in "$@"; do
+    case "$arg" in
+        --build-only) TEST_MODE=build ;;
+        --run-only) TEST_MODE=run ;;
+        --guards-only) TEST_MODE=guards ;;
+    esac
+done
+
 # Forward CC/CXX and collect make-passthrough args
 MAKE_ARGS=""
 for arg in "$@"; do
     case "$arg" in
         CC=*|CXX=*) export "${arg}" ;;
+        --build-only|--run-only|--guards-only) ;;
         --arch|--arch=*) ;; # already handled
         arm64|x86_64) ;; # already handled
         *=*) MAKE_ARGS="$MAKE_ARGS $arg" ;; # forward any VAR=VAL to make
@@ -54,11 +68,43 @@ print_env "test.sh"
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
+TEST_RUNNER="$ROOT/build/c/test-runner"
+if [[ -f "${TEST_RUNNER}.exe" ]]; then
+    TEST_RUNNER="${TEST_RUNNER}.exe"
+fi
+
+TEST_SUITE_ARGS=()
+if [[ -n "${CBM_TEST_SUITES:-}" ]]; then
+    read -r -a TEST_SUITE_ARGS <<< "$CBM_TEST_SUITES"
+fi
+
+if [[ "$TEST_MODE" == "run" ]]; then
+    if [[ ! -f "$TEST_RUNNER" ]]; then
+        echo "error: test runner not found: $TEST_RUNNER" >&2
+        exit 1
+    fi
+    chmod +x "$TEST_RUNNER" 2>/dev/null || true
+    "$TEST_RUNNER" "${TEST_SUITE_ARGS[@]}"
+    exit 0
+fi
+
 # Step 1: Clean
 scripts/clean.sh
 
-# Step 2 + 3: Build and run tests (Makefile applies $ARCHFLAGS on macOS)
-make -j"$NPROC" -f Makefile.cbm test $MAKE_ARGS
+if [[ "$TEST_MODE" == "build" ]]; then
+    make -j"$NPROC" -f Makefile.cbm test-build $MAKE_ARGS
+    exit 0
+fi
+
+if [[ "$TEST_MODE" != "guards" ]]; then
+    # Step 2 + 3: Build and run tests (Makefile applies $ARCHFLAGS on macOS)
+    make -j"$NPROC" -f Makefile.cbm test-build $MAKE_ARGS
+    TEST_RUNNER="$ROOT/build/c/test-runner"
+    if [[ -f "${TEST_RUNNER}.exe" ]]; then
+        TEST_RUNNER="${TEST_RUNNER}.exe"
+    fi
+    "$TEST_RUNNER" "${TEST_SUITE_ARGS[@]}"
+fi
 
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
 # in a subprocess with a wall-clock timeout — a hang must fail, not block the run.

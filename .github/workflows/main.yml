@@ -30,6 +30,7 @@ jobs:
     with:
       skip_perf: true
       broad_platforms: false
+      profile: full
 
   ci-ok:
     needs: [security, lint, test]

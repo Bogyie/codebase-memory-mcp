@@ -1,0 +1,26 @@
+{
+  "core": [
+    "arena", "hash_table", "dyn_array", "str_intern", "log", "str_util", "platform",
+    "subprocess", "rooted_file", "dump_verify", "ac", "extraction",
+    "extraction_inheritance", "extraction_imports", "parse_coverage", "grammar_regression",
+    "grammar_labels", "grammar_imports", "store_nodes", "store_edges", "store_search",
+    "store_bulk", "store_pragmas", "store_checkpoint", "dump_verify_io", "cypher", "memory",
+    "memory_share", "design", "mcp", "language", "userconfig", "gitignore", "git_context",
+    "discover", "graph_buffer", "registry", "pipeline", "index_resilience", "fqn",
+    "route_canon", "path_alias", "watcher", "lz4", "zstd", "sqlite_writer", "artifact",
+    "store_arch", "traces", "configlink", "infrascan", "cli", "system_info", "worker_pool",
+    "parallel", "slab_alloc", "mem", "ui", "httpd", "security", "yaml", "semantic",
+    "ast_profile", "simhash", "stack_overflow", "integration", "incremental"
+  ],
+  "languages": [
+    "scope", "type_rep", "go_lsp", "c_lsp", "php_lsp", "cs_lsp", "cs_lsp_bench",
+    "perl_lsp", "py_lsp", "kotlin_lsp", "rust_lsp", "py_lsp_bench", "py_lsp_stress",
+    "py_lsp_scale", "ts_lsp", "java_lsp", "java_lsp_coverage", "lang_contract",
+    "edge_imports", "edge_structural", "lsp_resolution_probe"
+  ],
+  "probes": [
+    "node_creation_probe", "edge_types_probe", "convergence_probe", "matrix_known_classes",
+    "matrix_new_constructs", "grammar_probe_a", "grammar_probe_b", "grammar_probe_c",
+    "grammar_probe_d", "grammar_probe_e", "grammar_probe_f", "grammar_probe_g"
+  ]
+}

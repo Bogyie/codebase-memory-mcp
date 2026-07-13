@@ -125,6 +125,14 @@ static int tf_maybe_run_socket_probe(int argc, char **argv) {
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
 
+static int64_t suite_elapsed_ms(struct timespec started) {
+    struct timespec finished;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &finished);
+    int64_t seconds = (int64_t)(finished.tv_sec - started.tv_sec) * 1000;
+    int64_t nanoseconds = (int64_t)finished.tv_nsec - (int64_t)started.tv_nsec;
+    return seconds + (nanoseconds / 1000000);
+}
+
 static bool suite_requested(const char *name) {
     if (g_suite_argc <= 1) {
         return true;
@@ -137,11 +145,20 @@ static bool suite_requested(const char *name) {
     return false;
 }
 
-#define RUN_SELECTED_SUITE(name)      \
-    do {                              \
-        if (suite_requested(#name)) { \
-            RUN_SUITE(name);          \
-        }                             \
+#define RUN_SELECTED_SUITE(name)                                                           \
+    do {                                                                                   \
+        if (suite_requested(#name)) {                                                      \
+            struct timespec _suite_started;                                                \
+            int _suite_passed_before = tf_pass_count;                                      \
+            int _suite_failed_before = tf_fail_count;                                      \
+            int _suite_skipped_before = tf_skip_count;                                     \
+            cbm_clock_gettime(CLOCK_MONOTONIC, &_suite_started);                           \
+            RUN_SUITE(name);                                                               \
+            printf("[SUITE_TIMING] name=%s elapsed_ms=%lld passed=%d failed=%d skipped=%d\n", \
+                   #name, (long long)suite_elapsed_ms(_suite_started),                     \
+                   tf_pass_count - _suite_passed_before, tf_fail_count - _suite_failed_before, \
+                   tf_skip_count - _suite_skipped_before);                                 \
+        }                                                                                  \
     } while (0)
 
 /* Forward declarations of suite functions */
