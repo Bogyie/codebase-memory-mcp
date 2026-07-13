@@ -1648,7 +1648,7 @@ static bool raw_stage_add_lease(raw_bundle_stage_t *stage, int lease_fd, const c
             return false;
         }
         int *leases = malloc(next * sizeof(*leases));
-        char (*names)[MEM_SHARE_NAME_CAP] = malloc(next * sizeof(*names));
+        char(*names)[MEM_SHARE_NAME_CAP] = malloc(next * sizeof(*names));
         if (!leases || !names) {
             free(leases);
             free(names);
@@ -2002,10 +2002,10 @@ static bool promote_raw_bundle(cbm_memory_t *memory, raw_bundle_stage_t *stage,
         bool parent_created = false;
         int rc = -1;
         if (parent_dir(item->target, target_parent, sizeof(target_parent)) &&
-            cbm_memory_raw_ensure_object_parent(
-                cbm_memory_home(memory), item->target, target_parent, &parent_created,
-                canonical_target, sizeof(canonical_target), canonical_parent,
-                sizeof(canonical_parent)) == 0) {
+            cbm_memory_raw_ensure_object_parent(cbm_memory_home(memory), item->target,
+                                                target_parent, &parent_created, canonical_target,
+                                                sizeof(canonical_target), canonical_parent,
+                                                sizeof(canonical_parent)) == 0) {
             item->target_parent_created = parent_created;
             rc = link_no_replace(item->staged, canonical_target);
         }
