@@ -10,6 +10,8 @@
 
 #include "memory/memory.h"
 
+#include <stdbool.h>
+
 #define CBM_MEMORY_BUNDLE_SCHEMA "cbm-global-memory-bundle"
 #define CBM_MEMORY_BUNDLE_VERSION 1
 #define CBM_MEMORY_EXPORT_FILENAME "memory-export.json"
@@ -37,5 +39,9 @@
 char *cbm_memory_export_json(cbm_memory_t *memory, const char *args_json);
 char *cbm_memory_import_json(cbm_memory_t *memory, const char *args_json);
 char *cbm_memory_sync_json(cbm_memory_t *memory, const char *args_json);
+
+/* Deterministic filesystem-race injection for regression tests. */
+typedef bool (*cbm_memory_share_test_hook_fn)(const char *stage, void *context);
+void cbm_memory_share_set_test_hook(cbm_memory_share_test_hook_fn hook, void *context);
 
 #endif /* CBM_MEMORY_SHARE_H */

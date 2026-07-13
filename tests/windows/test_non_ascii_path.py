@@ -31,6 +31,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp_stdio import McpServer  # noqa: E402
@@ -94,16 +95,28 @@ def index_and_count(binary, repo, cache):
         defs = 0
         for label in ("Function", "Class", "Method"):
             q = "MATCH (n:%s) RETURN count(n)" % label
-            r = s.call_tool("query_graph",
-                            {"query": q, "project": name, "format": "json"},
-                            timeout=60)
-            t, _ = s.tool_text(r)
-            try:
-                rows = json.loads(t).get("rows") or []
-                if rows and rows[0]:
+            last_error = None
+            for attempt in range(3):
+                r = s.call_tool("query_graph",
+                                {"query": q, "project": name, "format": "json"},
+                                timeout=60)
+                t, query_error = s.tool_text(r)
+                try:
+                    if query_error:
+                        raise ValueError("tool error: %r" % query_error)
+                    rows = json.loads(t).get("rows") or []
+                    if not rows or not rows[0]:
+                        raise ValueError("missing count row: %r" % t)
                     defs += int(rows[0][0])
-            except Exception:
-                pass
+                    last_error = None
+                    break
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    last_error = str(exc)
+                    if attempt < 2:
+                        time.sleep(0.2)
+            if last_error is not None:
+                return {"error": "unable to read %s count after 3 attempts: %s" %
+                        (label, last_error)}
         out["definition_nodes"] = defs
         return out
 

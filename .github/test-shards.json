@@ -1,0 +1,28 @@
+{
+  "shard-1": [
+    "incremental", "edge_structural", "watcher", "extraction", "memory_share",
+    "git_context", "memory", "subprocess", "py_lsp", "store_pragmas", "php_lsp",
+    "extraction_inheritance", "store_checkpoint", "discover", "cs_lsp",
+    "parse_coverage", "grammar_regression", "gitignore", "semantic", "perl_lsp",
+    "path_alias", "scope", "registry", "str_util", "fqn"
+  ],
+  "shard-2": [
+    "pipeline", "node_creation_probe", "matrix_new_constructs", "grammar_probe_f",
+    "edge_imports", "grammar_probe_a", "grammar_probe_g", "mcp", "grammar_probe_c",
+    "store_arch", "simhash", "py_lsp_scale", "integration", "c_lsp", "rust_lsp",
+    "java_lsp_coverage", "store_nodes", "security", "store_search",
+    "extraction_imports", "mem", "py_lsp_stress", "graph_buffer", "sqlite_writer",
+    "grammar_imports", "zstd", "hash_table", "worker_pool", "ac", "language",
+    "arena", "lz4"
+  ],
+  "shard-3": [
+    "lang_contract", "lsp_resolution_probe", "grammar_probe_d", "edge_types_probe",
+    "grammar_probe_e", "convergence_probe", "matrix_known_classes", "grammar_probe_b",
+    "stack_overflow", "index_resilience", "httpd", "artifact", "ts_lsp", "cypher",
+    "ui", "dump_verify_io", "cli", "java_lsp", "store_edges", "go_lsp", "parallel",
+    "kotlin_lsp", "store_bulk", "grammar_labels", "py_lsp_bench", "cs_lsp_bench",
+    "design", "str_intern", "platform", "userconfig", "configlink", "yaml",
+    "type_rep", "dyn_array", "log", "rooted_file", "dump_verify", "route_canon",
+    "traces", "infrascan", "system_info", "slab_alloc", "ast_profile"
+  ]
+}

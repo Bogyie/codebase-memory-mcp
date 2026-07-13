@@ -200,14 +200,11 @@ static bool sync_file(FILE *fp) {
 #endif
 }
 
+#ifndef _WIN32
 static bool sync_directory(const artifact_dir_t *dir) {
-#ifdef _WIN32
-    (void)dir;
-    return true;
-#else
     return dir && dir->fd >= 0 && fsync(dir->fd) == 0;
-#endif
 }
+#endif
 
 static void artifact_dir_close(artifact_dir_t *dir) {
     if (!dir) {

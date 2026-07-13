@@ -1422,12 +1422,12 @@ TEST(cli_update_target_uses_official_install_receipt) {
 
     char config_dir[512];
     snprintf(config_dir, sizeof(config_dir), "%s/.config/codebase-memory-mcp", home);
-    ASSERT(cbm_mkdir_p(config_dir, 0755) >= 0);
+    ASSERT(cbm_mkdir_p(config_dir, 0755));
     char receipt[512];
     snprintf(receipt, sizeof(receipt), "%s/install.conf", config_dir);
     char managed_dir[512];
     snprintf(managed_dir, sizeof(managed_dir), "%s/custom/bin", home);
-    ASSERT(cbm_mkdir_p(managed_dir, 0755) >= 0);
+    ASSERT(cbm_mkdir_p(managed_dir, 0755));
     char managed[512];
     snprintf(managed, sizeof(managed), "%s/custom/bin/codebase-memory-mcp", home);
     write_test_file(managed, "managed binary");
@@ -1470,14 +1470,14 @@ TEST(cli_update_target_rejects_stale_official_receipt) {
 
     char config_dir[512];
     snprintf(config_dir, sizeof(config_dir), "%s/.config/codebase-memory-mcp", home);
-    ASSERT(cbm_mkdir_p(config_dir, 0755) >= 0);
+    ASSERT(cbm_mkdir_p(config_dir, 0755));
     char receipt[512];
     snprintf(receipt, sizeof(receipt), "%s/install.conf", config_dir);
     char managed[512];
     snprintf(managed, sizeof(managed), "%s/old/codebase-memory-mcp", home);
     char managed_dir[512];
     snprintf(managed_dir, sizeof(managed_dir), "%s/old", home);
-    ASSERT(cbm_mkdir_p(managed_dir, 0755) >= 0);
+    ASSERT(cbm_mkdir_p(managed_dir, 0755));
     write_test_file(managed, "old official binary");
     char body[1400];
     snprintf(body, sizeof(body),
@@ -1490,7 +1490,7 @@ TEST(cli_update_target_rejects_stale_official_receipt) {
     snprintf(package_managed, sizeof(package_managed), "%s/package/codebase-memory-mcp", home);
     char package_dir[512];
     snprintf(package_dir, sizeof(package_dir), "%s/package", home);
-    ASSERT(cbm_mkdir_p(package_dir, 0755) >= 0);
+    ASSERT(cbm_mkdir_p(package_dir, 0755));
     write_test_file(package_managed, "package manager binary");
 
     char out[1024];
@@ -1509,7 +1509,7 @@ TEST(cli_update_target_accepts_canonical_legacy_install) {
 
     char bin_dir[512];
     snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
-    ASSERT(cbm_mkdir_p(bin_dir, 0755) >= 0);
+    ASSERT(cbm_mkdir_p(bin_dir, 0755));
     char canonical[512];
 #ifdef _WIN32
     snprintf(canonical, sizeof(canonical), "%s/codebase-memory-mcp.exe", bin_dir);

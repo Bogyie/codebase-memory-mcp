@@ -1,4 +1,5 @@
-# Reusable: unit + integration tests on all platforms
+# Reusable sanitizer test workflow. Each platform builds its runner once; suite
+# shards then reuse that exact binary instead of recompiling the entire codebase.
 name: Test
 
 on:
@@ -9,139 +10,310 @@ on:
         type: boolean
         default: true
       broad_platforms:
-        description: 'Test the broad platform matrix (older glibc + extra OS versions) instead of the core set'
+        description: 'Add older glibc and extra OS versions'
         type: boolean
         default: false
+      profile:
+        description: 'pr runs full suites on Linux only; full runs them everywhere'
+        type: string
+        default: full
 
 permissions:
   contents: read
 
 jobs:
-  # Emit the platform matrices as JSON. The CORE set is the default (fast,
-  # unchanged); the BROAD set adds extra free runners (older glibc /
-  # additional OS versions) for a wider "does it build everywhere" picture.
-  setup-matrix:
+  setup:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      unix: ${{ steps.set.outputs.unix }}
-      windows: ${{ steps.set.outputs.windows }}
+      platforms: ${{ steps.matrix.outputs.platforms }}
+      run_platforms: ${{ steps.matrix.outputs.run_platforms }}
+      compile_platforms: ${{ steps.matrix.outputs.compile_platforms }}
+      shards: ${{ steps.matrix.outputs.shards }}
     steps:
-      - name: Compute matrices
-        id: set
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Compute platform and suite matrices
+        id: matrix
         env:
           BROAD: ${{ inputs.broad_platforms }}
+          PROFILE: ${{ inputs.profile }}
         run: |
-          CORE_UNIX='[
-            {"os":"ubuntu-latest","cc":"gcc","cxx":"g++"},
-            {"os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++"},
-            {"os":"macos-14","cc":"cc","cxx":"c++"},
-            {"os":"macos-15-intel","cc":"cc","cxx":"c++"}
+          CORE='[
+            {"key":"ubuntu-x64","cache_key":"ubuntu-x64","os":"ubuntu-latest","kind":"unix","cc":"gcc","cxx":"g++","sanitize":""},
+            {"key":"ubuntu-arm64","cache_key":"ubuntu-arm64","os":"ubuntu-24.04-arm","kind":"unix","cc":"gcc","cxx":"g++","sanitize":""},
+            {"key":"macos-arm64","cache_key":"macos-arm64","os":"macos-14","kind":"unix","cc":"cc","cxx":"c++","sanitize":""},
+            {"key":"macos-x64","cache_key":"macos-x64","os":"macos-15-intel","kind":"unix","cc":"cc","cxx":"c++","sanitize":""},
+            {"key":"windows-x64","cache_key":"windows-x64","os":"windows-latest","kind":"windows","cc":"clang","cxx":"clang++","msystem":"CLANG64","pkg":"x86_64","sanitize":""}
           ]'
-          # Broad matrix legs are REQUIRED gates (no optional/continue-on-error
-          # escape hatches): the release dry run must be all-green, every platform.
-          BROAD_UNIX='[
-            {"os":"ubuntu-22.04","cc":"gcc","cxx":"g++"},
-            {"os":"ubuntu-22.04-arm","cc":"gcc","cxx":"g++"},
-            {"os":"macos-15","cc":"cc","cxx":"c++"}
+          EXTRA='[
+            {"key":"ubuntu22-x64","cache_key":"ubuntu22-x64","os":"ubuntu-22.04","kind":"unix","cc":"gcc","cxx":"g++","sanitize":""},
+            {"key":"ubuntu22-arm64","cache_key":"ubuntu22-arm64","os":"ubuntu-22.04-arm","kind":"unix","cc":"gcc","cxx":"g++","sanitize":""},
+            {"key":"macos15-arm64","cache_key":"macos15-arm64","os":"macos-15","kind":"unix","cc":"cc","cxx":"c++","sanitize":""},
+            {"key":"windows2025-x64","cache_key":"windows2025-x64","os":"windows-2025","kind":"windows","cc":"clang","cxx":"clang++","msystem":"CLANG64","pkg":"x86_64","sanitize":""},
+            {"key":"windows11-arm64","cache_key":"windows-arm64","os":"windows-11-arm","kind":"windows","cc":"clang","cxx":"clang++","msystem":"CLANGARM64","pkg":"aarch64","sanitize":"SANITIZE="}
           ]'
-          # Each Windows leg pins the msys2 environment + package arch to the
-          # RUNNER architecture so the build is native, never emulated:
-          #   x86-64 runners -> CLANG64 (mingw-w64-clang-x86_64-*)
-          #   ARM64  runner  -> CLANGARM64 (mingw-w64-clang-aarch64-*)
-          # windows-11-arm previously used the x86-64 CLANG64 toolchain, so its
-          # binary ran under Windows-on-ARM x86-64 emulation and ASan's function
-          # interception crashed (interception_win: unhandled instruction). With
-          # the native ARM64 toolchain ASan instruments native ARM64 code, so it
-          # is a real (non-optional) gate, not a tolerated emulated-flake.
-          CORE_WIN='[{"os":"windows-latest","msystem":"CLANG64","pkg":"x86_64"}]'
-          BROAD_WIN='[{"os":"windows-2025","msystem":"CLANG64","pkg":"x86_64"},{"os":"windows-11-arm","msystem":"CLANGARM64","pkg":"aarch64"}]'
           if [ "$BROAD" = "true" ]; then
-            UNIX=$(jq -cn --argjson a "$CORE_UNIX" --argjson b "$BROAD_UNIX" '$a + $b')
-            WIN=$(jq -cn --argjson a "$CORE_WIN" --argjson b "$BROAD_WIN" '$a + $b')
+            PLATFORMS=$(jq -cn --argjson core "$CORE" --argjson extra "$EXTRA" '$core + $extra')
           else
-            UNIX=$(jq -cn --argjson a "$CORE_UNIX" '$a')
-            WIN=$(jq -cn --argjson a "$CORE_WIN" '$a')
+            PLATFORMS=$(jq -cn --argjson core "$CORE" '$core')
           fi
-          echo "unix={\"include\":$UNIX}" >> "$GITHUB_OUTPUT"
-          echo "windows={\"include\":$WIN}" >> "$GITHUB_OUTPUT"
+          if [ "$PROFILE" = "pr" ]; then
+            RUN_PLATFORMS=$(jq -cn --argjson platforms "$PLATFORMS" \
+              '$platforms | map(select(.key == "ubuntu-x64"))')
+            COMPILE_PLATFORMS=$(jq -cn --argjson platforms "$PLATFORMS" \
+              '$platforms | map(select(.key != "ubuntu-x64"))')
+          elif [ "$PROFILE" = "full" ]; then
+            RUN_PLATFORMS="$PLATFORMS"
+            COMPILE_PLATFORMS='[]'
+          else
+            echo "unknown test profile: $PROFILE" >&2
+            exit 1
+          fi
+          SHARDS=$(jq -c \
+            '[to_entries[] | {name: .key, suites: (.value | join(" "))}]' \
+            .github/test-shards.json)
+          echo "platforms=$PLATFORMS" >> "$GITHUB_OUTPUT"
+          echo "run_platforms=$RUN_PLATFORMS" >> "$GITHUB_OUTPUT"
+          echo "compile_platforms=$COMPILE_PLATFORMS" >> "$GITHUB_OUTPUT"
+          echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
 
-  test-unix:
-    needs: setup-matrix
+  build-test-runners:
+    needs: setup
+    name: build-runner (${{ matrix.platform.key }})
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.setup-matrix.outputs.unix) }}
-    runs-on: ${{ matrix.os }}
-    # Broad-only legs (extra OS versions) are informational: visible but
-    # non-blocking, so a flaky/less-common runner can't block a release.
-    continue-on-error: ${{ matrix.optional == true }}
-    timeout-minutes: 240
+      matrix:
+        platform: ${{ fromJSON(needs.setup.outputs.run_platforms) }}
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install deps (Ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
+        if: startsWith(matrix.platform.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y ccache zlib1g-dev
+
+      - name: Install ccache (macOS)
+        if: startsWith(matrix.platform.os, 'macos')
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install ccache
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        if: matrix.platform.kind == 'windows'
+        with:
+          msystem: ${{ matrix.platform.msystem }}
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-${{ matrix.platform.pkg }}-clang
+            mingw-w64-clang-${{ matrix.platform.pkg }}-ccache
+            mingw-w64-clang-${{ matrix.platform.pkg }}-compiler-rt
+            mingw-w64-clang-${{ matrix.platform.pkg }}-zlib
+            make
+            git
+
+      - uses: ./.github/actions/setup-ccache
+        with:
+          platform: ${{ matrix.platform.cache_key }}
+          profile: test-sanitizer
+
+      - name: Build sanitizer runner (Unix)
+        if: matrix.platform.kind == 'unix'
+        run: scripts/test.sh --build-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }} ${{ matrix.platform.sanitize }}
+
+      - name: Build sanitizer runner (Windows)
+        if: matrix.platform.kind == 'windows'
+        shell: msys2 {0}
+        run: scripts/test.sh --build-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }} ${{ matrix.platform.sanitize }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-runner-${{ matrix.platform.key }}
+          path: |
+            build/c/test-runner
+            build/c/test-runner.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  # PRs only need a runnable sanitizer artifact from Ubuntu x64. Compile the
+  # other platforms independently so a slow macOS/Windows link cannot delay
+  # the Linux suite shards. Full/main runs upload artifacts for every platform
+  # through build-test-runners instead.
+  compile-platforms:
+    if: ${{ inputs.profile == 'pr' }}
+    needs: setup
+    name: compile-only (${{ matrix.platform.key }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.setup.outputs.compile_platforms) }}
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install deps (Ubuntu)
+        if: startsWith(matrix.platform.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y ccache zlib1g-dev
+
+      - name: Install ccache (macOS)
+        if: startsWith(matrix.platform.os, 'macos')
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install ccache
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        if: matrix.platform.kind == 'windows'
+        with:
+          msystem: ${{ matrix.platform.msystem }}
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-${{ matrix.platform.pkg }}-clang
+            mingw-w64-clang-${{ matrix.platform.pkg }}-ccache
+            mingw-w64-clang-${{ matrix.platform.pkg }}-compiler-rt
+            mingw-w64-clang-${{ matrix.platform.pkg }}-zlib
+            make
+            git
+
+      - uses: ./.github/actions/setup-ccache
+        with:
+          platform: ${{ matrix.platform.cache_key }}
+          profile: test-sanitizer
+
+      - name: Compile sanitizer runner (Unix)
+        if: matrix.platform.kind == 'unix'
+        run: scripts/test.sh --build-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }} ${{ matrix.platform.sanitize }}
+
+      - name: Compile sanitizer runner (Windows)
+        if: matrix.platform.kind == 'windows'
+        shell: msys2 {0}
+        run: scripts/test.sh --build-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }} ${{ matrix.platform.sanitize }}
+
+  test-shards:
+    needs: [setup, build-test-runners]
+    name: test (${{ matrix.platform.key }}, ${{ matrix.shard.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.setup.outputs.run_platforms) }}
+        shard: ${{ fromJSON(needs.setup.outputs.shards) }}
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install deps (Ubuntu)
+        if: startsWith(matrix.platform.os, 'ubuntu')
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
 
-      - name: Test
-        run: scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        if: matrix.platform.kind == 'windows'
+        with:
+          msystem: ${{ matrix.platform.msystem }}
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-${{ matrix.platform.pkg }}-clang
+            mingw-w64-clang-${{ matrix.platform.pkg }}-compiler-rt
+            mingw-w64-clang-${{ matrix.platform.pkg }}-zlib
+            make
+            git
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: test-runner-${{ matrix.platform.key }}
+          path: build/c
+
+      - name: Run suite shard (Unix)
+        if: matrix.platform.kind == 'unix'
         env:
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+          CBM_TEST_SUITES: ${{ matrix.shard.suites }}
+        run: |
+          set +e
+          scripts/test.sh --run-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }} 2>&1 | tee suite-output.log
+          status=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "### ${{ matrix.platform.key }} / ${{ matrix.shard.name }}"
+            grep '^\[SUITE_TIMING\]' suite-output.log || true
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Run suite shard (Windows)
+        if: matrix.platform.kind == 'windows'
+        shell: msys2 {0}
+        env:
+          CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+          CBM_TEST_SUITES: ${{ matrix.shard.suites }}
+        run: |
+          set +e
+          scripts/test.sh --run-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }} 2>&1 | tee suite-output.log
+          status=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "### ${{ matrix.platform.key }} / ${{ matrix.shard.name }}"
+            grep '^\[SUITE_TIMING\]' suite-output.log || true
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+  product-guards:
+    if: ${{ inputs.profile == 'full' }}
+    needs: setup
+    name: product-guards (${{ matrix.platform.key }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.setup.outputs.run_platforms) }}
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install deps (Ubuntu)
+        if: startsWith(matrix.platform.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y ccache zlib1g-dev
+
+      - name: Install ccache (macOS)
+        if: startsWith(matrix.platform.os, 'macos')
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install ccache
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        if: matrix.platform.kind == 'windows'
+        with:
+          msystem: ${{ matrix.platform.msystem }}
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-${{ matrix.platform.pkg }}-clang
+            mingw-w64-clang-${{ matrix.platform.pkg }}-ccache
+            mingw-w64-clang-${{ matrix.platform.pkg }}-zlib
+            make
+            git
+
+      - uses: ./.github/actions/setup-ccache
+        with:
+          platform: ${{ matrix.platform.cache_key }}
+          profile: prod
+
+      - name: Product process and binary guards (Unix)
+        if: matrix.platform.kind == 'unix'
+        run: scripts/test.sh --guards-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }}
+
+      - name: Product process and binary guards (Windows)
+        if: matrix.platform.kind == 'windows'
+        shell: msys2 {0}
+        run: scripts/test.sh --guards-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }} ${{ matrix.platform.sanitize }}
 
   test-tsan:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
       - name: Install deps (Ubuntu)
-        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
-
+        run: sudo apt-get update && sudo apt-get install -y ccache clang zlib1g-dev
+      - uses: ./.github/actions/setup-ccache
+        with:
+          platform: ubuntu-x64
+          profile: test-tsan
       - name: ThreadSanitizer tests
         run: make -f Makefile.cbm test-tsan CC=clang CXX=clang++
 
-  test-windows:
-    needs: setup-matrix
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.setup-matrix.outputs.windows) }}
-    runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.optional == true }}
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
-        with:
-          msystem: ${{ matrix.msystem }}
-          path-type: inherit
-          install: >-
-            mingw-w64-clang-${{ matrix.pkg }}-clang
-            mingw-w64-clang-${{ matrix.pkg }}-compiler-rt
-            mingw-w64-clang-${{ matrix.pkg }}-zlib
-            make
-            git
-
-      - name: Test
-        shell: msys2 {0}
-        # AddressSanitizer is unavailable on native ARM64 Windows (LLVM ships no
-        # libclang_rt.asan for aarch64-w64-windows-gnu) and cannot intercept the
-        # system DLLs under x86-64 emulation either, so windows-11-arm runs the
-        # native ARM64 build with SANITIZE= (no sanitizer) — still a real
-        # functional gate. ASan/UBSan coverage comes from the other 9 legs,
-        # including native-ARM Linux/macOS. x86-64 Windows keeps full sanitizers.
-        run: scripts/test.sh CC=clang CXX=clang++ ${{ matrix.os == 'windows-11-arm' && 'SANITIZE=' || '' }}
-        env:
-          CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
-
-  # Windows product-surface regression guards. Distinct from test-windows above
-  # (the sanitizer C suite): these drive a real product binary + embedded HTTP UI
-  # over stdio / CLI / HTTP and fail if a Windows bug already fixed on main comes
-  # back -- non-ASCII repo paths dropping definitions (#636/#357, fixed by #700),
-  # the PreToolUse hook augmenter no-op on drive-letter cwd (#618, fixed by #619),
-  # the UI directory picker not enumerating drives (#548, roots field), and non-ASCII
-  # CLI arguments being mangled by the narrow-argv main() (#423/#20, fixed by the
-  # wide-argv entrypoint that reads GetCommandLineW).
   test-windows-guards:
     runs-on: windows-latest
     timeout-minutes: 60
@@ -154,9 +326,15 @@ jobs:
           path-type: inherit
           install: >-
             mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-ccache
             mingw-w64-clang-x86_64-zlib
             make
             git
+
+      - uses: ./.github/actions/setup-ccache
+        with:
+          platform: windows-x64
+          profile: prod-ui
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
@@ -164,14 +342,8 @@ jobs:
 
       - name: Build product binary with embedded UI
         shell: msys2 {0}
-        # --with-ui builds the frontend (npm) and embeds it, so the drive-picker
-        # guard's HTTP UI is available. Functional gate only (no sanitizers).
         run: scripts/build.sh --with-ui CC=clang CXX=clang++
 
-      - name: Windows regression guards (#636/#357, #618, #548, #423/#20)
+      - name: Windows regression guards
         shell: pwsh
-        # -GuardsOnly runs the four green guards and gates on them. The runner sets
-        # CBM_INDEX_SUPERVISOR=0 for determinism, but the non-ASCII CLI guard drops that
-        # override so it exercises the real supervisor->worker spawn (where #423/#20's
-        # second half lives); the other guards test path/hook/drive fixes in-process.
         run: ./scripts/test-windows.ps1 -GuardsOnly -Binary build/c/codebase-memory-mcp.exe

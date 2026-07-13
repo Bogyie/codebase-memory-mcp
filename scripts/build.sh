@@ -4,6 +4,7 @@
 # Usage:
 #   scripts/build.sh                              # Standard binary
 #   scripts/build.sh --with-ui                    # Binary with embedded UI
+#   scripts/build.sh --reuse-build --with-ui      # Reuse compatible build/c objects
 #   scripts/build.sh --version v0.8.0             # With version stamp
 #   scripts/build.sh --arch x86_64                # Force x86_64 build
 #   scripts/build.sh CC=gcc-14 CXX=g++-14        # Override compiler
@@ -35,6 +36,7 @@ source "$ROOT/scripts/env.sh"
 
 # Parse remaining arguments
 WITH_UI=false
+REUSE_BUILD=false
 VERSION=""
 EXTRA_MAKE_ARGS=()
 
@@ -48,6 +50,9 @@ for arg in "$@"; do
     case "$arg" in
         --with-ui)
             WITH_UI=true
+            ;;
+        --reuse-build)
+            REUSE_BUILD=true
             ;;
         --version)
             prev_arg="$arg"
@@ -79,13 +84,16 @@ if [[ -n "$VERSION" ]]; then
 fi
 
 print_env "build.sh"
-echo "  ui=$WITH_UI version=${VERSION:-dev}"
+echo "  ui=$WITH_UI reuse_build=$REUSE_BUILD version=${VERSION:-dev}"
 
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
-# Step 1: Clean C build artifacts only (not node_modules — npm ci handles that)
-rm -rf "$ROOT/build/c"
+# Step 1: Clean C build artifacts unless the caller is deliberately reusing
+# objects from a compatible build (same compiler, target, flags, and version).
+if ! $REUSE_BUILD; then
+    rm -rf "$ROOT/build/c"
+fi
 
 # Step 2: Build (Makefile applies $ARCHFLAGS for the target arch on macOS)
 if $WITH_UI; then
