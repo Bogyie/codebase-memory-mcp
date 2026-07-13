@@ -103,10 +103,10 @@ typedef struct {
     char *target;
     char *staged;
     char hash[CBM_SHA256_HEX_LEN + 1];
+    bool target_parent_created;
 #ifndef _WIN32
     int target_parent_fd;
     bool target_parent_fd_open;
-    bool target_parent_created;
     char target_name[MEM_SHARE_NAME_CAP];
     char target_parent_name[4];
     char staged_name[MEM_SHARE_NAME_CAP];
@@ -1733,7 +1733,9 @@ static void raw_stage_dispose(raw_bundle_stage_t *stage, bool rollback_installed
         if (item->staged) {
             (void)cbm_unlink(item->staged);
         }
-        raw_remove_empty_target_parent(item->target);
+        if (item->target_parent_created) {
+            raw_remove_empty_target_parent(item->target);
+        }
 #endif
         free(item->target);
         free(item->staged);
@@ -1886,7 +1888,6 @@ static bool stage_raw_bundle(cbm_memory_t *memory, yyjson_val *root, raw_bundle_
 #endif
 #ifdef _WIN32
         if (!raw_stage_open(memory, stage) || !raw_stage_reserve(stage)) {
-            raw_remove_empty_target_parent(target);
             *error = "failed to create raw object staging area";
             return false;
         }
@@ -1910,8 +1911,6 @@ static bool stage_raw_bundle(cbm_memory_t *memory, yyjson_val *root, raw_bundle_
             if (target_parent_created) {
                 (void)unlinkat(stage->raw_root_fd, target_parent_name, AT_REMOVEDIR);
             }
-#else
-            raw_remove_empty_target_parent(target);
 #endif
             *error = "raw object staging path is too long";
             return false;
@@ -1926,8 +1925,6 @@ static bool stage_raw_bundle(cbm_memory_t *memory, yyjson_val *root, raw_bundle_
             if (target_parent_created) {
                 (void)unlinkat(stage->raw_root_fd, target_parent_name, AT_REMOVEDIR);
             }
-#else
-            raw_remove_empty_target_parent(target);
 #endif
             *error = "out of memory while staging raw object";
             return false;
@@ -1978,7 +1975,8 @@ static bool stage_raw_bundle(cbm_memory_t *memory, yyjson_val *root, raw_bundle_
     return true;
 }
 
-static bool promote_raw_bundle(raw_bundle_stage_t *stage, const char **error) {
+static bool promote_raw_bundle(cbm_memory_t *memory, raw_bundle_stage_t *stage,
+                               const char **error) {
     for (size_t i = 0; i < stage->count; i++) {
         raw_stage_item_t *item = &stage->items[i];
 #ifndef _WIN32
@@ -1998,12 +1996,24 @@ static bool promote_raw_bundle(raw_bundle_stage_t *stage, const char **error) {
             continue;
         }
 #else
-        int rc = link_no_replace(item->staged, item->target);
+        char target_parent[MEM_SHARE_PATH_CAP] = {0};
+        char canonical_target[MEM_SHARE_PATH_CAP] = {0};
+        char canonical_parent[MEM_SHARE_PATH_CAP] = {0};
+        bool parent_created = false;
+        int rc = -1;
+        if (parent_dir(item->target, target_parent, sizeof(target_parent)) &&
+            cbm_memory_raw_ensure_object_parent(
+                cbm_memory_home(memory), item->target, target_parent, &parent_created,
+                canonical_target, sizeof(canonical_target), canonical_parent,
+                sizeof(canonical_parent)) == 0) {
+            item->target_parent_created = parent_created;
+            rc = link_no_replace(item->staged, canonical_target);
+        }
         if (rc == 0) {
             stage->added++;
             continue;
         }
-        if (rc == 1 && raw_object_matches(item->target, item->hash)) {
+        if (rc == 1 && canonical_target[0] && raw_object_matches(canonical_target, item->hash)) {
             stage->skipped++;
             continue;
         }
@@ -3085,7 +3095,7 @@ char *cbm_memory_import_json(cbm_memory_t *memory, const char *args_json) {
         import_rc = -1;
         error = "failed to enqueue imported wiki materialization";
     }
-    if (import_rc == 0 && !promote_raw_bundle(&raw_stage, &error)) {
+    if (import_rc == 0 && !promote_raw_bundle(memory, &raw_stage, &error)) {
         import_rc = -1;
     }
     if (import_rc == 0 && !import_state_integrity_ok(db, cbm_memory_home(memory))) {
