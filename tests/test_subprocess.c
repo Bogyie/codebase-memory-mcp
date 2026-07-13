@@ -18,7 +18,18 @@
 #include <stdlib.h>
 
 #ifdef _WIN32
+#include "foundation/win_utf8.h"
 #include <io.h>
+#include <windows.h>
+
+static char *subprocess_test_binary(void) {
+    wchar_t wide[32768];
+    DWORD length = GetModuleFileNameW(NULL, wide, (DWORD)(sizeof(wide) / sizeof(wide[0])));
+    if (length == 0 || length >= (DWORD)(sizeof(wide) / sizeof(wide[0]))) {
+        return NULL;
+    }
+    return cbm_wide_to_utf8(wide);
+}
 #else
 #include <fcntl.h>
 #include <signal.h>
@@ -314,13 +325,13 @@ TEST(subprocess_output_fd_is_tailed_without_reopening_path) {
 #endif
 
 #ifdef _WIN32
-    const char *comspec = getenv("COMSPEC");
-    if (!comspec || !comspec[0]) {
+    char *test_binary = subprocess_test_binary();
+    if (!test_binary) {
         _close(output_fd);
         cbm_unlink(output_path);
-        SKIP_PLATFORM("COMSPEC unavailable");
+        SKIP_PLATFORM("test executable path unavailable");
     }
-    const char *argv[] = {comspec, "/d", "/s", "/c", "echo alpha&&echo beta", NULL};
+    const char *argv[] = {test_binary, "__cbm_subprocess_emit", NULL};
 #else
     const char *argv[] = {"/bin/sh", "-c", "printf 'alpha\\nbeta\\n'", NULL};
 #endif
@@ -329,7 +340,7 @@ TEST(subprocess_output_fd_is_tailed_without_reopening_path) {
     subprocess_log_capture_t capture = {.control = &control};
     cbm_proc_opts_t opts = {
 #ifdef _WIN32
-        .bin = comspec,
+        .bin = test_binary,
 #else
         .bin = "/bin/sh",
 #endif
@@ -352,6 +363,7 @@ TEST(subprocess_output_fd_is_tailed_without_reopening_path) {
 #ifdef _WIN32
     ASSERT_EQ(_close(output_fd), 0);
     ASSERT_EQ(cbm_unlink(output_path), 0);
+    free(test_binary);
 #else
     ASSERT_EQ(close(output_fd), 0);
 #endif
@@ -372,10 +384,11 @@ static void *run_controlled_subprocess(void *arg) {
 
 TEST(subprocess_control_kill_is_consumed_by_owner) {
 #ifdef _WIN32
-    const char *bin = getenv("COMSPEC");
-    if (!bin || !bin[0])
-        SKIP_PLATFORM("COMSPEC unavailable");
-    const char *argv[] = {bin, "/d", "/s", "/c", "for /L %i in (1,1,2147483647) do @rem", NULL};
+    char *test_binary = subprocess_test_binary();
+    if (!test_binary)
+        SKIP_PLATFORM("test executable path unavailable");
+    const char *bin = test_binary;
+    const char *argv[] = {bin, "__cbm_subprocess_spin", NULL};
 #else
     const char *bin = "/bin/sh";
     const char *argv[] = {bin, "-c", "while :; do :; done", NULL};
@@ -411,6 +424,9 @@ TEST(subprocess_control_kill_is_consumed_by_owner) {
     ASSERT_EQ(run.result.outcome, CBM_PROC_KILLED);
     ASSERT_EQ(cbm_proc_control_pid(&control), 0);
     ASSERT_FALSE(cbm_proc_control_request_kill(&control, pid));
+#ifdef _WIN32
+    free(test_binary);
+#endif
     PASS();
 }
 

@@ -121,10 +121,14 @@ static bool rooted_windows_mtime_ns(const FILETIME *mtime, int64_t *out) {
         return true;
     }
     uint64_t unix_ticks = ticks - windows_to_unix_epoch_100ns;
-    if (unix_ticks > (uint64_t)INT64_MAX / 100U) {
+    uint64_t seconds = unix_ticks / 10000000ULL;
+    if (seconds > (uint64_t)INT64_MAX / 1000000000ULL) {
         return false;
     }
-    *out = (int64_t)(unix_ticks * 100U);
+    /* MinGW's stat() exposes second-resolution mtimes. File versions stored
+     * during indexing use that representation, so expose the same precision
+     * here. Generation checks above still compare the full FILETIME value. */
+    *out = (int64_t)(seconds * 1000000000ULL);
     return true;
 }
 
@@ -290,7 +294,8 @@ static cbm_rooted_file_status_t rooted_windows_read(const char *root_path,
         }
         unsigned char extra;
         DWORD extra_count = 0;
-        if (!ReadFile(file, &extra, 1, &extra_count, NULL) || extra_count != 0) {
+        BOOL read_ok = ReadFile(file, &extra, 1, &extra_count, NULL);
+        if ((!read_ok && GetLastError() != ERROR_HANDLE_EOF) || extra_count != 0) {
             status = CBM_ROOTED_FILE_CHANGED;
             goto cleanup_data;
         }

@@ -979,9 +979,18 @@ int cbm_rename_replace(const char *src, const char *dst) {
     wchar_t *wdst = cbm_utf8_to_wide(dst);
     int ret = CBM_NOT_FOUND;
     if (wsrc && wdst) {
-        ret = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
-                  ? 0
-                  : CBM_NOT_FOUND;
+        for (unsigned int attempt = 0; attempt < 8U; attempt++) {
+            if (MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                ret = 0;
+                break;
+            }
+            DWORD error = GetLastError();
+            if (error != ERROR_ACCESS_DENIED && error != ERROR_SHARING_VIOLATION &&
+                error != ERROR_LOCK_VIOLATION) {
+                break;
+            }
+            Sleep(1U << attempt);
+        }
     }
     free(wsrc);
     free(wdst);

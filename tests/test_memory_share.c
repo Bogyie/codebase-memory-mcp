@@ -51,6 +51,9 @@ static bool result_ok(const char *json) {
     }
     yyjson_val *ok = yyjson_obj_get(yyjson_doc_get_root(doc), "ok");
     bool value = ok && yyjson_is_bool(ok) && yyjson_get_bool(ok);
+    if (!value && json) {
+        fprintf(stderr, "memory_share operation failed: %s\n", json);
+    }
     yyjson_doc_free(doc);
     return value;
 }

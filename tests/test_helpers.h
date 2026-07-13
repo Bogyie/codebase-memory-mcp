@@ -37,7 +37,9 @@ static inline const char *th_path_join(const char *base, const char *rel) {
 
 /* ── File writing ─────────────────────────────────────────────── */
 
-/* Write content to a file, creating parent directories as needed. */
+/* Write the exact content bytes to a file, creating parent directories as
+ * needed. Binary mode avoids Windows translating LF to CRLF, which would make
+ * fixture sizes and hashes platform-dependent. */
 static inline int th_write_file(const char *path, const char *content) {
     /* Create parent directories */
     char dir[1024];
@@ -54,7 +56,7 @@ static inline int th_write_file(const char *path, const char *content) {
         cbm_mkdir_p(dir, 0755);
     }
 
-    FILE *f = fopen(path, "w");
+    FILE *f = fopen(path, "wb");
     if (!f) {
         return -1;
     }
@@ -67,7 +69,7 @@ static inline int th_write_file(const char *path, const char *content) {
 
 /* Append content to a file. */
 static inline int th_append_file(const char *path, const char *content) {
-    FILE *f = fopen(path, "a");
+    FILE *f = fopen(path, "ab");
     if (!f) {
         return -1;
     }

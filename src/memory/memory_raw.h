@@ -31,6 +31,11 @@ cbm_memory_raw_read_result_t cbm_memory_raw_read_authorized_path(const char *pat
 int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned char **out_bytes,
                                      size_t *out_len);
 
+/* Read an immutable raw object and, on Windows, prove from the same open
+ * handle that its final path remains below home/raw/objects. */
+int cbm_memory_raw_read_regular_object(const char *home, const char *path, size_t max_len,
+                                       unsigned char **out_bytes, size_t *out_len);
+
 #ifndef _WIN32
 /* Read a single regular-file entry relative to an already-open directory.
  * name must be one component.  The directory descriptor anchors all checks and

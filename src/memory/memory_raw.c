@@ -6,6 +6,7 @@
 
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
+#include "foundation/rooted_file.h"
 #include "foundation/sha256.h"
 
 #include <errno.h>
@@ -502,6 +503,13 @@ static bool memory_raw_final_path_from_handle(HANDLE handle, char out[CBM_MEMORY
     memory_raw_normalize_native_path(out);
     return true;
 }
+
+static bool memory_raw_windows_at_eof(HANDLE handle) {
+    unsigned char extra = 0;
+    DWORD extra_read = 0;
+    BOOL read_ok = ReadFile(handle, &extra, 1, &extra_read, NULL);
+    return (read_ok || GetLastError() == ERROR_HANDLE_EOF) && extra_read == 0;
+}
 #endif
 
 #ifndef _WIN32
@@ -872,13 +880,11 @@ cbm_memory_raw_read_result_t cbm_memory_raw_read_authorized_path(const char *pat
         }
         offset += got;
     }
-    unsigned char extra = 0;
-    DWORD extra_read = 0;
     BY_HANDLE_FILE_INFORMATION after;
     LARGE_INTEGER after_size;
     char after_path[CBM_MEMORY_RAW_PATH_MAX];
-    valid = ReadFile(handle, &extra, 1, &extra_read, NULL) && extra_read == 0 &&
-            GetFileInformationByHandle(handle, &after) && GetFileSizeEx(handle, &after_size) &&
+    valid = memory_raw_windows_at_eof(handle) && GetFileInformationByHandle(handle, &after) &&
+            GetFileSizeEx(handle, &after_size) &&
             after.dwVolumeSerialNumber == info.dwVolumeSerialNumber &&
             after.nFileIndexHigh == info.nFileIndexHigh &&
             after.nFileIndexLow == info.nFileIndexLow && after_size.QuadPart == size.QuadPart &&
@@ -978,8 +984,9 @@ cbm_memory_raw_read_result_t cbm_memory_raw_read_authorized_path(const char *pat
     return CBM_MEMORY_RAW_READ_OK;
 }
 
-int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned char **out_bytes,
-                                     size_t *out_len) {
+static int memory_raw_read_regular_file_scoped(const char *path, const char *canonical_root,
+                                               size_t max_len, unsigned char **out_bytes,
+                                               size_t *out_len) {
     if (!path || !out_bytes || !out_len) {
         return -1;
     }
@@ -999,12 +1006,16 @@ int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned 
     }
     BY_HANDLE_FILE_INFORMATION before;
     LARGE_INTEGER before_size;
-    bool valid = GetFileInformationByHandle(handle, &before) &&
-                 !(before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-                 !(before.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-                 GetFileSizeEx(handle, &before_size) && before_size.QuadPart >= 0 &&
-                 (uint64_t)before_size.QuadPart <= (uint64_t)max_len &&
-                 (uint64_t)before_size.QuadPart < (uint64_t)SIZE_MAX;
+    char canonical_file[CBM_MEMORY_RAW_PATH_MAX];
+    bool valid =
+        GetFileInformationByHandle(handle, &before) &&
+        !(before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+        !(before.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+        GetFileSizeEx(handle, &before_size) && before_size.QuadPart >= 0 &&
+        (uint64_t)before_size.QuadPart <= (uint64_t)max_len &&
+        (uint64_t)before_size.QuadPart < (uint64_t)SIZE_MAX &&
+        (!canonical_root || (memory_raw_final_path_from_handle(handle, canonical_file) &&
+                             memory_raw_canonical_within_root(canonical_root, canonical_file)));
     size_t len = valid ? (size_t)before_size.QuadPart : 0;
     unsigned char *bytes = valid ? malloc(len + 1U) : NULL;
     if (!bytes) {
@@ -1020,9 +1031,7 @@ int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned 
         }
         offset += got;
     }
-    unsigned char extra = 0;
-    DWORD extra_read = 0;
-    if (valid && (!ReadFile(handle, &extra, 1, &extra_read, NULL) || extra_read != 0)) {
+    if (valid && !memory_raw_windows_at_eof(handle)) {
         valid = false;
     }
     BY_HANDLE_FILE_INFORMATION after;
@@ -1058,6 +1067,7 @@ int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned 
     CloseHandle(handle);
     free(wide);
 #else
+    (void)canonical_root;
     int flags = O_RDONLY;
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
@@ -1123,6 +1133,64 @@ int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned 
     *out_bytes = bytes;
     *out_len = len;
     return 0;
+}
+
+int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned char **out_bytes,
+                                     size_t *out_len) {
+    return memory_raw_read_regular_file_scoped(path, NULL, max_len, out_bytes, out_len);
+}
+
+int cbm_memory_raw_read_regular_object(const char *home, const char *path, size_t max_len,
+                                       unsigned char **out_bytes, size_t *out_len) {
+    if (!out_bytes || !out_len) {
+        return -1;
+    }
+    *out_bytes = NULL;
+    *out_len = 0;
+#ifdef _WIN32
+    if (!home || !path || max_len == 0) {
+        return -1;
+    }
+    char normalized_home[CBM_MEMORY_RAW_PATH_MAX];
+    char normalized_path[CBM_MEMORY_RAW_PATH_MAX];
+    int home_n = snprintf(normalized_home, sizeof(normalized_home), "%s", home);
+    int path_n = snprintf(normalized_path, sizeof(normalized_path), "%s", path);
+    if (home_n < 0 || home_n >= (int)sizeof(normalized_home) || path_n < 0 ||
+        path_n >= (int)sizeof(normalized_path)) {
+        return -1;
+    }
+    memory_raw_normalize_native_path(normalized_home);
+    memory_raw_normalize_native_path(normalized_path);
+    size_t home_len = strlen(normalized_home);
+    while (home_len > 3U &&
+           (normalized_home[home_len - 1U] == '/' || normalized_home[home_len - 1U] == '\\')) {
+        normalized_home[--home_len] = '\0';
+    }
+    if (_strnicmp(normalized_home, normalized_path, home_len) != 0 ||
+        (normalized_path[home_len] != '/' && normalized_path[home_len] != '\\')) {
+        return -1;
+    }
+    const char *relative = normalized_path + home_len + 1U;
+    static const char raw_prefix[] = "raw/objects/";
+    if (_strnicmp(relative, raw_prefix, sizeof(raw_prefix) - 1U) != 0) {
+        return -1;
+    }
+    cbm_rooted_file_t file;
+    cbm_rooted_file_status_t status =
+        cbm_rooted_file_read(normalized_home, relative, max_len, &file);
+    if (status != CBM_ROOTED_FILE_OK) {
+        cbm_rooted_file_free(&file);
+        return -1;
+    }
+    *out_bytes = (unsigned char *)file.data;
+    *out_len = file.len;
+    file.data = NULL;
+    cbm_rooted_file_free(&file);
+    return 0;
+#else
+    (void)home;
+    return memory_raw_read_regular_file_scoped(path, NULL, max_len, out_bytes, out_len);
+#endif
 }
 
 #ifdef _WIN32
@@ -1275,11 +1343,13 @@ static int memory_raw_link_no_replace(const char *staged, const char *target) {
         free(wide_target);
         return -1;
     }
-    BOOL linked = CreateHardLinkW(wide_target, wide_staged, NULL);
-    DWORD error = linked ? ERROR_SUCCESS : GetLastError();
+    /* Keep immutable-object publication available on ReFS/Dev Drive volumes:
+     * a same-volume move is atomic and fails if the target already exists. */
+    BOOL installed = MoveFileExW(wide_staged, wide_target, MOVEFILE_WRITE_THROUGH);
+    DWORD error = installed ? ERROR_SUCCESS : GetLastError();
     free(wide_staged);
     free(wide_target);
-    if (linked) {
+    if (installed) {
         return 0;
     }
     return error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS ? 1 : -1;
