@@ -18,6 +18,7 @@
 #include <stdlib.h>
 
 #ifdef _WIN32
+#include "foundation/win_utf8.h"
 #include <io.h>
 #include <windows.h>
 
