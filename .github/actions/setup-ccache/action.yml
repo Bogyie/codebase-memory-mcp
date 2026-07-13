@@ -39,14 +39,11 @@ runs:
         CACHE_BASEDIR: ${{ github.workspace }}
       run: |
         set -euo pipefail
-        wrapper_dir="$MINGW_PREFIX/lib/ccache/bin"
-        # The MSYS2 package puts compiler masquerade links in wrapper_dir and
-        # ccache.exe itself in $MINGW_PREFIX/bin. Keep one PATH entry whose
-        # precedence is unambiguous for both the Node action and later builds.
-        if [ ! -x "$wrapper_dir/ccache.exe" ]; then
-          cp "$(command -v ccache)" "$wrapper_dir/ccache.exe"
-        fi
-        cygpath -w "$wrapper_dir" >> "$GITHUB_PATH"
+        # The Marketplace action executes ccache through Git for Windows sh.
+        # Keep the real executable beside its MSYS2 runtime DLLs while the
+        # action restores/configures the cache; compiler masquerade wrappers
+        # are activated only after that step.
+        cygpath -w "$MINGW_PREFIX/bin" >> "$GITHUB_PATH"
         {
           echo "CCACHE_DIR=$CACHE_DIR"
           echo "CCACHE_BASEDIR=$CACHE_BASEDIR"
@@ -68,3 +65,20 @@ runs:
         evict-old-files: job
         verbose: 1
         job-summary: ccache — ${{ inputs.platform }} / ${{ inputs.profile }}
+
+    - name: Activate ccache compiler wrappers (Windows)
+      if: runner.os == 'Windows'
+      shell: msys2 {0}
+      run: cygpath -w "$MINGW_PREFIX/lib/ccache/bin" >> "$GITHUB_PATH"
+
+    - name: Verify ccache compiler wrappers (Windows)
+      if: runner.os == 'Windows'
+      shell: msys2 {0}
+      run: |
+        set -euo pipefail
+        ccache --version | head -1
+        compiler=$(command -v clang)
+        case "$compiler" in
+          "$MINGW_PREFIX/lib/ccache/bin/"*) ;;
+          *) echo "clang does not resolve through ccache: $compiler" >&2; exit 1 ;;
+        esac
