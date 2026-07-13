@@ -39,6 +39,7 @@ static int arena_grow(CBMArena *a, size_t min_size) {
     if (a->nblocks >= CBM_ARENA_MAX_BLOCKS) {
         return 0;
     }
+    /* Grow geometrically while honoring oversized allocation requests. */
     size_t new_size = a->block_size * PAIR_LEN;
     if (new_size < min_size) {
         new_size = min_size;
