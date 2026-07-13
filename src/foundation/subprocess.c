@@ -482,15 +482,6 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         return -1;
     }
 
-    wchar_t *wbin = cbm_utf8_to_wide(bin);
-    if (!wbin) {
-        free(wcmd);
-        out->outcome = CBM_PROC_SPAWN_FAILED;
-        out->exit_code = -1;
-        out->term_signal = 0;
-        return -1;
-    }
-
     HANDLE hlog = INVALID_HANDLE_VALUE;
     HANDLE herr = INVALID_HANDLE_VALUE;
     HANDLE hin = INVALID_HANDLE_VALUE;
@@ -559,8 +550,11 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     }
 
     PROCESS_INFORMATION pi = {0};
+    /* A NULL application name makes CreateProcess resolve argv[0] through the
+     * normal executable search path. Passing a bare name as lpApplicationName
+     * does not search PATH, which made tools such as git fail to spawn. */
     BOOL ok =
-        startup_ok && CreateProcessW(wbin, wcmd, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT,
+        startup_ok && CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT,
                                      NULL, NULL, &sx.StartupInfo, &pi);
     if (sx.lpAttributeList) {
         if (attributes_initialized) {
@@ -568,7 +562,6 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         }
         HeapFree(GetProcessHeap(), 0, sx.lpAttributeList);
     }
-    free(wbin);
     free(wcmd);
     if (hlog != INVALID_HANDLE_VALUE) {
         CloseHandle(hlog);

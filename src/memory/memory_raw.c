@@ -978,8 +978,9 @@ cbm_memory_raw_read_result_t cbm_memory_raw_read_authorized_path(const char *pat
     return CBM_MEMORY_RAW_READ_OK;
 }
 
-int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned char **out_bytes,
-                                     size_t *out_len) {
+static int memory_raw_read_regular_file_scoped(const char *path, const char *canonical_root,
+                                               size_t max_len, unsigned char **out_bytes,
+                                               size_t *out_len) {
     if (!path || !out_bytes || !out_len) {
         return -1;
     }
@@ -999,12 +1000,16 @@ int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned 
     }
     BY_HANDLE_FILE_INFORMATION before;
     LARGE_INTEGER before_size;
-    bool valid = GetFileInformationByHandle(handle, &before) &&
-                 !(before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-                 !(before.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-                 GetFileSizeEx(handle, &before_size) && before_size.QuadPart >= 0 &&
-                 (uint64_t)before_size.QuadPart <= (uint64_t)max_len &&
-                 (uint64_t)before_size.QuadPart < (uint64_t)SIZE_MAX;
+    char canonical_file[CBM_MEMORY_RAW_PATH_MAX];
+    bool valid =
+        GetFileInformationByHandle(handle, &before) &&
+        !(before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+        !(before.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+        GetFileSizeEx(handle, &before_size) && before_size.QuadPart >= 0 &&
+        (uint64_t)before_size.QuadPart <= (uint64_t)max_len &&
+        (uint64_t)before_size.QuadPart < (uint64_t)SIZE_MAX &&
+        (!canonical_root || (memory_raw_final_path_from_handle(handle, canonical_file) &&
+                             memory_raw_canonical_within_root(canonical_root, canonical_file)));
     size_t len = valid ? (size_t)before_size.QuadPart : 0;
     unsigned char *bytes = valid ? malloc(len + 1U) : NULL;
     if (!bytes) {
@@ -1058,6 +1063,7 @@ int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned 
     CloseHandle(handle);
     free(wide);
 #else
+    (void)canonical_root;
     int flags = O_RDONLY;
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
@@ -1123,6 +1129,27 @@ int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned 
     *out_bytes = bytes;
     *out_len = len;
     return 0;
+}
+
+int cbm_memory_raw_read_regular_file(const char *path, size_t max_len, unsigned char **out_bytes,
+                                     size_t *out_len) {
+    return memory_raw_read_regular_file_scoped(path, NULL, max_len, out_bytes, out_len);
+}
+
+int cbm_memory_raw_read_regular_object(const char *home, const char *path, size_t max_len,
+                                       unsigned char **out_bytes, size_t *out_len) {
+#ifdef _WIN32
+    char raw_root[CBM_MEMORY_RAW_PATH_MAX];
+    char canonical_root[CBM_MEMORY_RAW_PATH_MAX];
+    if (!home || !memory_raw_path_join(raw_root, sizeof(raw_root), home, "raw/objects") ||
+        cbm_memory_raw_resolve_directory(raw_root, canonical_root, sizeof(canonical_root)) != 0) {
+        return -1;
+    }
+    return memory_raw_read_regular_file_scoped(path, canonical_root, max_len, out_bytes, out_len);
+#else
+    (void)home;
+    return memory_raw_read_regular_file_scoped(path, NULL, max_len, out_bytes, out_len);
+#endif
 }
 
 #ifdef _WIN32

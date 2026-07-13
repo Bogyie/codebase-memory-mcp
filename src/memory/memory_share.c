@@ -865,15 +865,20 @@ static yyjson_mut_val *export_raw_objects(yyjson_mut_doc *doc, sqlite3 *db, cons
             break;
         }
         char object_parent[MEM_SHARE_PATH_CAP];
-        if (!parent_dir(absolute, object_parent, sizeof(object_parent)) ||
-            cbm_memory_raw_validate_object_parent(home, absolute, object_parent, absolute,
-                                                  sizeof(absolute), object_parent,
-                                                  sizeof(object_parent)) != 0) {
+        if (!parent_dir(absolute, object_parent, sizeof(object_parent))) {
             *ok = false;
             break;
         }
         unsigned char *data = NULL;
-        if (cbm_memory_raw_read_regular_file(absolute, MEM_SHARE_RAW_MAX, &data, &len) != 0) {
+#ifdef _WIN32
+        if (cbm_memory_raw_read_regular_object(home, absolute, MEM_SHARE_RAW_MAX, &data, &len) !=
+            0) {
+#else
+        if (cbm_memory_raw_validate_object_parent(home, absolute, object_parent, absolute,
+                                                  sizeof(absolute), object_parent,
+                                                  sizeof(object_parent)) != 0 ||
+            cbm_memory_raw_read_regular_file(absolute, MEM_SHARE_RAW_MAX, &data, &len) != 0) {
+#endif
             *ok = false;
             break;
         }

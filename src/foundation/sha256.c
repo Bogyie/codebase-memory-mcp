@@ -159,19 +159,31 @@ static bool sha256_file_stat_equal(const struct stat *left, const struct stat *r
            left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
 #endif
 }
-#endif
-
 static int64_t sha256_stat_mtime_ns(const struct stat *st) {
 #ifdef __APPLE__
     return ((int64_t)st->st_mtimespec.tv_sec * 1000000000LL) + st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * 1000000000LL;
 #else
     return ((int64_t)st->st_mtim.tv_sec * 1000000000LL) + st->st_mtim.tv_nsec;
 #endif
 }
+#endif
 
 #ifdef _WIN32
+static bool sha256_windows_mtime_ns(const FILETIME *mtime, int64_t *out) {
+    const uint64_t windows_to_unix_epoch_100ns = 116444736000000000ULL;
+    uint64_t ticks = ((uint64_t)mtime->dwHighDateTime << 32U) | mtime->dwLowDateTime;
+    if (ticks < windows_to_unix_epoch_100ns) {
+        *out = 0;
+        return true;
+    }
+    uint64_t seconds = (ticks - windows_to_unix_epoch_100ns) / 10000000ULL;
+    if (seconds > (uint64_t)INT64_MAX / 1000000000ULL) {
+        return false;
+    }
+    *out = (int64_t)(seconds * 1000000000ULL);
+    return true;
+}
+
 static bool sha256_windows_info_equal(const BY_HANDLE_FILE_INFORMATION *left,
                                       const BY_HANDLE_FILE_INFORMATION *right) {
     return left->dwVolumeSerialNumber == right->dwVolumeSerialNumber &&
@@ -278,27 +290,38 @@ static int sha256_file_process(const char *path, size_t max_bytes, char **out_da
         return -1;
     }
 #endif
+#ifdef _WIN32
+    uint64_t size64 = ((uint64_t)opened_info.nFileSizeHigh << 32U) | opened_info.nFileSizeLow;
+    int64_t file_size = size64 <= INT64_MAX ? (int64_t)size64 : -1;
+    int64_t file_mtime_ns = 0;
+    if (file_size < 0 || !sha256_windows_mtime_ns(&opened_info.ftLastWriteTime, &file_mtime_ns)) {
+        (void)fclose(file);
+        return -1;
+    }
+#else
     struct stat before;
     if (fstat(cbm_fileno(file), &before) != 0 || !S_ISREG(before.st_mode)) {
         (void)fclose(file);
         return -1;
     }
+    int64_t file_size = (int64_t)before.st_size;
+    int64_t file_mtime_ns = sha256_stat_mtime_ns(&before);
+#endif
     if (out_mtime_ns) {
-        *out_mtime_ns = sha256_stat_mtime_ns(&before);
+        *out_mtime_ns = file_mtime_ns;
     }
     if (out_size) {
-        *out_size = (int64_t)before.st_size;
+        *out_size = file_size;
     }
-    bool size_limit_skipped =
-        max_bytes > 0 && before.st_size > 0 && (uintmax_t)before.st_size > max_bytes;
+    bool size_limit_skipped = max_bytes > 0 && file_size > 0 && (uintmax_t)file_size > max_bytes;
     char *owned_data = NULL;
     size_t expected_size = 0;
     if (out_data && !size_limit_skipped) {
-        if (before.st_size < 0 || (uintmax_t)before.st_size > SIZE_MAX - 1) {
+        if (file_size < 0 || (uintmax_t)file_size > SIZE_MAX - 1) {
             (void)fclose(file);
             return -1;
         }
-        expected_size = (size_t)before.st_size;
+        expected_size = (size_t)file_size;
         owned_data = (char *)malloc(expected_size + 1);
         if (!owned_data) {
             (void)fclose(file);
