@@ -751,6 +751,27 @@ fi
 echo "OK: uninstall --dry-run completed"
 
 # 6c: update --dry-run --standard -y
+# The update command intentionally refuses package-manager or arbitrary build
+# outputs unless an official-installer receipt owns the exact running binary.
+# This smoke test runs a freshly built binary, so model that installer contract
+# explicitly instead of weakening the production ownership check. On MSYS2,
+# record the native path that GetModuleFileNameW reports.
+RECEIPT_BINARY="$BINARY"
+if command -v cygpath &>/dev/null; then
+  RECEIPT_BINARY=$(cygpath -w "$BINARY")
+fi
+mkdir -p "$DRYRUN_HOME/.config/codebase-memory-mcp"
+(
+  umask 077
+  printf '%s\n' \
+    'format=1' \
+    'method=official-script' \
+    'repository=bogyie/codebase-memory-mcp' \
+    'variant=standard' \
+    "install_path=$RECEIPT_BINARY" \
+    > "$DRYRUN_HOME/.config/codebase-memory-mcp/install.conf"
+)
+
 echo "--- Phase 6c: update --dry-run ---"
 UPDATE_OUT=$(run_dryrun_env "$BINARY" update --dry-run --standard -y 2>&1)
 if ! echo "$UPDATE_OUT" | grep -qi 'dry-run'; then
