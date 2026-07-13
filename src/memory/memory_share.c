@@ -268,11 +268,13 @@ static int link_no_replace(const char *staged, const char *target) {
         free(wide_target);
         return -1;
     }
-    BOOL linked = CreateHardLinkW(wide_target, wide_staged, NULL);
-    DWORD error = linked ? ERROR_SUCCESS : GetLastError();
+    /* A same-volume move without REPLACE_EXISTING is an atomic no-replace
+     * install and works on Windows filesystems that do not support hardlinks. */
+    BOOL installed = MoveFileExW(wide_staged, wide_target, MOVEFILE_WRITE_THROUGH);
+    DWORD error = installed ? ERROR_SUCCESS : GetLastError();
     free(wide_staged);
     free(wide_target);
-    if (linked) {
+    if (installed) {
         return 0;
     }
     return error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS ? 1 : -1;

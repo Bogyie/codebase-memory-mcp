@@ -14,6 +14,7 @@ int tf_skip_count = 0;
 #include "foundation/mem.h"       /* cbm_mem_init — worker budget */
 #include "mcp/index_supervisor.h" /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"              /* cbm_mcp_handle_tool — act as a real worker */
+#include "test_child_modes.h"     /* deterministic subprocess child probes */
 #include "test_helpers.h"         /* th_rmtree — isolate user-global memory in tests */
 #include <sqlite3.h>
 #include <stdbool.h>
@@ -274,6 +275,11 @@ int main(int argc, char **argv) {
     int probe_rc = tf_maybe_run_socket_probe(argc, argv);
     if (probe_rc >= 0) {
         return probe_rc;
+    }
+
+    int subprocess_rc = tf_maybe_run_subprocess_child(argc, argv);
+    if (subprocess_rc >= 0) {
+        return subprocess_rc;
     }
 
     /* #832: if spawned as a supervised index worker, do the real work and exit

@@ -332,14 +332,15 @@ static int sha256_file_process(const char *path, size_t max_bytes, char **out_da
     }
     bool failed = ferror(file) != 0 || limit_exceeded || size_changed ||
                   (owned_data && total != expected_size);
-    struct stat after;
-    if (fstat(cbm_fileno(file), &after) != 0 || !sha256_file_stat_equal(&before, &after)) {
-        failed = true;
-    }
 #ifdef _WIN32
     BY_HANDLE_FILE_INFORMATION after_info = {0};
     if (!failed && (!GetFileInformationByHandle((HANDLE)os_handle, &after_info) ||
                     !sha256_windows_info_equal(&opened_info, &after_info))) {
+        failed = true;
+    }
+#else
+    struct stat after;
+    if (fstat(cbm_fileno(file), &after) != 0 || !sha256_file_stat_equal(&before, &after)) {
         failed = true;
     }
 #endif

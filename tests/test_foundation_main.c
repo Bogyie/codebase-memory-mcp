@@ -10,6 +10,7 @@ int tf_fail_count = 0;
 int tf_skip_count = 0;
 
 #include "test_framework.h"
+#include "test_child_modes.h"
 
 #include <stdio.h>
 
@@ -24,7 +25,11 @@ extern void suite_subprocess(void);
 extern void suite_dump_verify(void);
 extern void suite_rooted_file(void);
 
-int main(void) {
+int main(int argc, char **argv) {
+    int subprocess_rc = tf_maybe_run_subprocess_child(argc, argv);
+    if (subprocess_rc >= 0) {
+        return subprocess_rc;
+    }
     printf("\n  codebase-memory-mcp  foundation test suite\n");
     RUN_SUITE(arena);
     RUN_SUITE(hash_table);

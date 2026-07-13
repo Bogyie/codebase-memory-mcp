@@ -186,6 +186,14 @@ jobs:
         shell: msys2 {0}
         run: scripts/test.sh --build-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }} ${{ matrix.platform.sanitize }}
 
+      - name: Run targeted Windows runtime suites
+        if: matrix.platform.key == 'windows-x64'
+        shell: msys2 {0}
+        env:
+          CBM_SKIP_PERF: '1'
+          CBM_TEST_SUITES: subprocess memory_share mcp design artifact
+        run: scripts/test.sh --run-only CC=${{ matrix.platform.cc }} CXX=${{ matrix.platform.cxx }} ${{ matrix.platform.sanitize }}
+
   test-shards:
     needs: [setup, build-test-runners]
     name: test (${{ matrix.platform.key }}, ${{ matrix.shard.name }})
