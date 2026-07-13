@@ -1,26 +1,28 @@
 {
-  "core": [
-    "arena", "hash_table", "dyn_array", "str_intern", "log", "str_util", "platform",
-    "subprocess", "rooted_file", "dump_verify", "ac", "extraction",
-    "extraction_inheritance", "extraction_imports", "parse_coverage", "grammar_regression",
-    "grammar_labels", "grammar_imports", "store_nodes", "store_edges", "store_search",
-    "store_bulk", "store_pragmas", "store_checkpoint", "dump_verify_io", "cypher", "memory",
-    "memory_share", "design", "mcp", "language", "userconfig", "gitignore", "git_context",
-    "discover", "graph_buffer", "registry", "pipeline", "index_resilience", "fqn",
-    "route_canon", "path_alias", "watcher", "lz4", "zstd", "sqlite_writer", "artifact",
-    "store_arch", "traces", "configlink", "infrascan", "cli", "system_info", "worker_pool",
-    "parallel", "slab_alloc", "mem", "ui", "httpd", "security", "yaml", "semantic",
-    "ast_profile", "simhash", "stack_overflow", "integration", "incremental"
+  "shard-1": [
+    "incremental", "edge_structural", "watcher", "extraction", "memory_share",
+    "git_context", "memory", "subprocess", "py_lsp", "store_pragmas", "php_lsp",
+    "extraction_inheritance", "store_checkpoint", "discover", "cs_lsp",
+    "parse_coverage", "grammar_regression", "gitignore", "semantic", "perl_lsp",
+    "path_alias", "scope", "registry", "str_util", "fqn"
   ],
-  "languages": [
-    "scope", "type_rep", "go_lsp", "c_lsp", "php_lsp", "cs_lsp", "cs_lsp_bench",
-    "perl_lsp", "py_lsp", "kotlin_lsp", "rust_lsp", "py_lsp_bench", "py_lsp_stress",
-    "py_lsp_scale", "ts_lsp", "java_lsp", "java_lsp_coverage", "lang_contract",
-    "edge_imports", "edge_structural", "lsp_resolution_probe"
+  "shard-2": [
+    "pipeline", "node_creation_probe", "matrix_new_constructs", "grammar_probe_f",
+    "edge_imports", "grammar_probe_a", "grammar_probe_g", "mcp", "grammar_probe_c",
+    "store_arch", "simhash", "py_lsp_scale", "integration", "c_lsp", "rust_lsp",
+    "java_lsp_coverage", "store_nodes", "security", "store_search",
+    "extraction_imports", "mem", "py_lsp_stress", "graph_buffer", "sqlite_writer",
+    "grammar_imports", "zstd", "hash_table", "worker_pool", "ac", "language",
+    "arena", "lz4"
   ],
-  "probes": [
-    "node_creation_probe", "edge_types_probe", "convergence_probe", "matrix_known_classes",
-    "matrix_new_constructs", "grammar_probe_a", "grammar_probe_b", "grammar_probe_c",
-    "grammar_probe_d", "grammar_probe_e", "grammar_probe_f", "grammar_probe_g"
+  "shard-3": [
+    "lang_contract", "lsp_resolution_probe", "grammar_probe_d", "edge_types_probe",
+    "grammar_probe_e", "convergence_probe", "matrix_known_classes", "grammar_probe_b",
+    "stack_overflow", "index_resilience", "httpd", "artifact", "ts_lsp", "cypher",
+    "ui", "dump_verify_io", "cli", "java_lsp", "store_edges", "go_lsp", "parallel",
+    "kotlin_lsp", "store_bulk", "grammar_labels", "py_lsp_bench", "cs_lsp_bench",
+    "design", "str_intern", "platform", "userconfig", "configlink", "yaml",
+    "type_rep", "dyn_array", "log", "rooted_file", "dump_verify", "route_canon",
+    "traces", "infrascan", "system_info", "slab_alloc", "ast_profile"
   ]
 }
