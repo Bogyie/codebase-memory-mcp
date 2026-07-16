@@ -71,13 +71,18 @@ static cbm_store_t *lang_open_indexed(LangProj *lp) {
     if (!lp->project) {
         return NULL;
     }
-    const char *home = getenv("HOME");
-    if (!home) {
-        home = "/tmp";
-    }
     char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
+    const char *configured_cache = getenv("CBM_CACHE_DIR");
+    if (configured_cache && configured_cache[0]) {
+        snprintf(cache_dir, sizeof(cache_dir), "%s", configured_cache);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home) {
+            home = "/tmp";
+        }
+        snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+    }
+    cbm_mkdir_p(cache_dir, 0755);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
     lp->srv = cbm_mcp_server_new(NULL);
@@ -1237,6 +1242,32 @@ static int calls_edge_between(cbm_store_t *store, const char *project, const cha
     return found;
 }
 
+/* True if some CALLS edge's TARGET node carries `label` and a QN ending with
+ * `qn_suffix` — i.e. the call resolved to that specific definition. */
+static int calls_edge_targets(cbm_store_t *store, const char *project, const char *label,
+                              const char *qn_suffix) {
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (cbm_store_find_edges_by_type(store, project, "CALLS", &edges, &n) != CBM_STORE_OK)
+        return 0;
+    int found = 0;
+    size_t sl = strlen(qn_suffix);
+    for (int i = 0; i < n && !found; i++) {
+        cbm_node_t tgt;
+        if (cbm_store_find_node_by_id(store, edges[i].target_id, &tgt) != CBM_STORE_OK)
+            continue;
+        const char *qn = tgt.qualified_name;
+        if (qn && tgt.label && strcmp(tgt.label, label) == 0) {
+            size_t ql = strlen(qn);
+            if (ql >= sl && strcmp(qn + ql - sl, qn_suffix) == 0)
+                found = 1;
+        }
+        cbm_node_free_fields(&tgt);
+    }
+    cbm_store_free_edges(edges, n);
+    return found;
+}
+
 /* #988: `from m import f as g; g()` produced NO CALLS edge — the Python LSP
  * bound the alias as MODULE("m.f") (the from-style heuristic keys on the
  * local name matching the module-path tail, which an alias never does), so
@@ -1282,6 +1313,42 @@ TEST(contract_edge_python_aliased_import_call_resolves_issue988) {
     ASSERT_TRUE(plain);
     ASSERT_TRUE(modalias);
     ASSERT_TRUE(dotalias);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
+/* #871: a CommonJS require() binding shadowed call resolution. `const doThing
+ * = require("../bs/doThing")` emitted a Variable def for `doThing` in the
+ * importing module, so the call `doThing(...)` resolved to that same-module
+ * Variable (an import ALIAS, not a definition) instead of following the
+ * recorded import to the exported function — which stayed at zero inbound
+ * CALLS (the reporter's disconnected-node symptom). ESM `import` bindings
+ * never materialize as Variables; the identifier-bound require form must
+ * behave identically: no shadowing Variable, CALLS edge lands on the real
+ * Function. Fixture = the reporter's exact two-file repro. */
+TEST(contract_edge_commonjs_require_call_resolves_issue871) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"src/bs/doThing.js",
+         "module.exports = async function doThing({ id }) {\n  return id;\n};\n"},
+        {"src/mutations/doThing.js",
+         "const doThing = require(\"../bs/doThing\");\n\n"
+         "module.exports = async (parent, args) => {\n  return doThing({ id: args.id });\n};\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_TRUE(store != NULL);
+    /* The call resolves THROUGH the require to the exported function. */
+    int resolved = calls_edge_targets(store, lp.project, "Function", ".bs.doThing.doThing");
+    /* The alias must not swallow the call: no CALLS edge may terminate on a
+     * Variable in the importing module (ESM parity: the binding is an import,
+     * not a definition). */
+    int shadowed = calls_edge_targets(store, lp.project, "Variable", ".mutations.doThing.doThing");
+    if (!resolved || shadowed) {
+        fprintf(stderr, "  [871] FAIL resolved=%d shadowed=%d (require binding must resolve to "
+                        "the exported Function, not the local alias Variable)\n",
+                resolved, shadowed);
+    }
+    ASSERT_TRUE(resolved);
+    ASSERT_TRUE(!shadowed);
     lang_cleanup(&lp, store);
     PASS();
 }
@@ -1496,6 +1563,7 @@ SUITE(lang_contract) {
     RUN_TEST(contract_edge_imports_alias_no_phantom_folder_edge_issue767);
     RUN_TEST(contract_edge_imports_alias_resolves_real_file_issue767);
     RUN_TEST(contract_edge_python_aliased_import_call_resolves_issue988);
+    RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871);
     RUN_TEST(contract_edge_depends_on);
     RUN_TEST(contract_edge_parallel_service_edges);
     RUN_TEST(contract_edge_file_changes_with);

@@ -22,6 +22,8 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "graph_buffer/graph_buffer.h"
 #include "git/git_context.h"
 #include "store/store.h"
+#include "macro_table.h"
+#include "arena.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
 #include "foundation/platform.h"
@@ -722,7 +724,6 @@ static void predump_cfg(cbm_pipeline_ctx_t *ctx) {
 static void predump_complexity(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_complexity(ctx);
 }
-
 static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
         predump_pass_fn fn;
@@ -766,6 +767,62 @@ static int seq_pass_lsp_cross_dispatch(cbm_pipeline_ctx_t *ctx, const cbm_file_i
 }
 
 /* Run the sequential pipeline path: definitions, k8s, lsp_cross, calls, usages, semantic. */
+/* Build the ObjectScript $$$macro table from .inc include files in the repo.
+ * Returns NULL (and does no work) when no ObjectScript include files exist.
+ * Caller owns the returned heap table (free via cbm_macro_table_free). */
+CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
+                                                const char *repo_path) {
+    (void)repo_path;
+    bool has_inc = false;
+    for (int i = 0; i < count; i++) {
+        if (files[i].language == CBM_LANG_OBJECTSCRIPT_ROUTINE && files[i].path &&
+            (strrchr(files[i].path, '.') != NULL &&
+             strcmp(strrchr(files[i].path, '.'), ".inc") == 0)) {
+            has_inc = true;
+            break;
+        }
+    }
+    if (!has_inc) {
+        return NULL;
+    }
+
+    CBMMacroTable *mt = (CBMMacroTable *)calloc(1, sizeof(CBMMacroTable));
+    if (!mt) {
+        return NULL;
+    }
+
+    cbm_arena_init(&mt->arena);
+    cbm_macro_table_init_system(mt);
+
+    for (int i = 0; i < count; i++) {
+        if (files[i].language != CBM_LANG_OBJECTSCRIPT_ROUTINE) {
+            continue;
+        }
+        if (!files[i].path || !(strrchr(files[i].path, '.') != NULL &&
+                                strcmp(strrchr(files[i].path, '.'), ".inc") == 0)) {
+            continue;
+        }
+        FILE *f = cbm_fopen(files[i].path, "rb");
+        if (!f) {
+            continue;
+        }
+        fseek(f, 0, SEEK_END);
+        long fsize = ftell(f);
+        rewind(f);
+        if (fsize > 0) {
+            char *src = (char *)malloc((size_t)fsize + 1);
+            if (src) {
+                size_t nread = fread(src, 1, (size_t)fsize, f);
+                src[nread] = '\0';
+                cbm_parse_inc_file(mt, &mt->arena, src);
+                free(src);
+            }
+        }
+        (void)fclose(f);
+    }
+    return mt;
+}
+
 static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                    const cbm_file_info_t *files, int file_count,
                                    struct timespec *t) {
@@ -782,6 +839,13 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBMFileResult **seq_cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
     if (seq_cache) {
         ctx->result_cache = seq_cache;
+    }
+
+    /* ObjectScript: build the $$$macro table from .inc include files so that
+     * pass_calls can resolve macro-mediated dispatch. NULL when not present. */
+    CBMMacroTable *mt = cbm_build_macro_table_from_files(files, file_count, ctx->repo_path);
+    if (mt) {
+        ctx->macro_table = mt;
     }
     typedef int (*seq_pass_fn)(cbm_pipeline_ctx_t *, const cbm_file_info_t *, int);
     static const struct {
@@ -840,6 +904,18 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * mimalloc-epoch memory through slab_free -> plain free() and libmalloc
      * aborts — the #773 second-index SIGABRT. */
     cbm_destroy_thread_parser();
+    /* ObjectScript: free the macro / return-type tables built for this run. */
+    if (ctx->macro_table) {
+        cbm_macro_table_free((CBMMacroTable *)ctx->macro_table);
+        ctx->macro_table = NULL;
+    }
+    if (ctx->return_type_table) {
+        for (int i = 0; i < ctx->return_type_table->count; i++) {
+            free((void *)ctx->return_type_table->entries[i].return_type);
+        }
+        free((void *)ctx->return_type_table);
+        ctx->return_type_table = NULL;
+    }
     return rc;
 }
 
@@ -1055,6 +1131,19 @@ static int64_t stat_mtime_ns(const struct stat *fst) {
 #endif
 }
 
+static const char *pipeline_mode_name(cbm_index_mode_t mode) {
+    switch (mode) {
+    case CBM_MODE_FULL:
+        return "full";
+    case CBM_MODE_MODERATE:
+        return "moderate";
+    case CBM_MODE_FAST:
+        return "fast";
+    default:
+        return "unknown";
+    }
+}
+
 /* Dump graph to SQLite and persist file hashes for incremental indexing. */
 static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count,
                                    struct timespec *t) {
@@ -1094,8 +1183,11 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     CBM_PROF_END("persist", "1_reopen", t_reopen);
     if (hash_store) {
+        bool hash_records_complete = true;
         CBM_PROF_START(t_delhash);
-        cbm_store_delete_file_hashes(hash_store, p->project_name);
+        if (cbm_store_delete_file_hashes(hash_store, p->project_name) != CBM_STORE_OK) {
+            hash_records_complete = false;
+        }
         CBM_PROF_END("persist", "2_delete_file_hashes", t_delhash);
 
         /* Restore the ADR captured before the dump. Surface a failed restore
@@ -1128,11 +1220,14 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
                     fhashes[fh_n].mtime_ns = stat_mtime_ns(&fst);
                     fhashes[fh_n].size = fst.st_size;
                     fh_n++;
+                } else {
+                    hash_records_complete = false;
                 }
             }
             if (cbm_store_upsert_file_hash_batch(hash_store, fhashes, fh_n) != CBM_STORE_OK) {
                 cbm_log_error("pipeline.err", "phase", "persist_file_hashes", "project",
                               p->project_name);
+                hash_records_complete = false;
             }
             free(fhashes);
         } else {
@@ -1140,8 +1235,13 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
             for (int i = 0; i < file_count; i++) {
                 struct stat fst;
                 if (stat(files[i].path, &fst) == 0) {
-                    cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path, "",
-                                               stat_mtime_ns(&fst), fst.st_size);
+                    if (cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path,
+                                                   "", stat_mtime_ns(&fst),
+                                                   fst.st_size) != CBM_STORE_OK) {
+                        hash_records_complete = false;
+                    }
+                } else {
+                    hash_records_complete = false;
                 }
             }
         }
@@ -1155,11 +1255,13 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
          * replace sees the live file set; not_indexed_* kinds are exempt from
          * that prune — deliberately-unindexed paths have no hash rows). */
         int cov_total = p->file_errors_count + p->excluded_count + p->ignored_count;
+        cbm_coverage_row_t *cov = NULL;
+        int cn = 0;
+        bool coverage_rows_available = cov_total == 0;
         if (cov_total > 0) {
-            cbm_coverage_row_t *cov =
-                (cbm_coverage_row_t *)malloc((size_t)cov_total * sizeof(*cov));
+            cov = (cbm_coverage_row_t *)malloc((size_t)cov_total * sizeof(*cov));
             if (cov) {
-                int cn = 0;
+                coverage_rows_available = true;
                 for (int i = 0; i < p->file_errors_count; i++) {
                     cov[cn].rel_path = p->file_errors[i].path;
                     cov[cn].kind = p->file_errors[i].phase;
@@ -1178,13 +1280,32 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
                     cov[cn].detail = p->ignored_files[i].reason;
                     cn++;
                 }
-                if (cbm_store_coverage_replace(hash_store, p->project_name, cov, cn) !=
-                    CBM_STORE_OK) {
-                    cbm_log_error("pipeline.err", "phase", "persist_coverage", "project",
-                                  p->project_name);
-                }
-                free(cov);
             }
+        }
+
+        cbm_project_t project_info = {0};
+        bool have_project_info =
+            cbm_store_get_project(hash_store, p->project_name, &project_info) == CBM_STORE_OK;
+        const char *recording_status =
+            !coverage_rows_available
+                ? "unavailable"
+                : (p->ignored_total > p->ignored_count ? "truncated" : "complete");
+        cbm_coverage_meta_t coverage_meta = {
+            .generation = have_project_info ? project_info.indexed_at : NULL,
+            .index_mode = pipeline_mode_name(p->mode),
+            .recording_status = recording_status,
+            .ignored_files_stored = p->ignored_count,
+            .ignored_files_total = p->ignored_total,
+            .coverage_version = 1,
+            .hash_records_complete = hash_records_complete,
+        };
+        if (cbm_store_coverage_replace_ex(hash_store, p->project_name, cov, cn, &coverage_meta) !=
+            CBM_STORE_OK) {
+            cbm_log_error("pipeline.err", "phase", "persist_coverage", "project", p->project_name);
+        }
+        free(cov);
+        if (have_project_info) {
+            cbm_project_free_fields(&project_info);
         }
         if (p->ignored_total > p->ignored_count) {
             cbm_log_warn("index.ignored_capped", "stored", itoa_buf(p->ignored_count), "total",
@@ -1399,7 +1520,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     /* Check for existing DB → try incremental or delete for reindex */
     rc = try_incremental_or_delete_db(p, files, file_count);
-    if (rc >= 0) {
+    if (rc == CBM_PIPELINE_ABORT_PRESERVE_DB || rc >= 0) {
         cbm_discover_free(files, file_count);
         return rc;
     }

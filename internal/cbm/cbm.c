@@ -721,11 +721,6 @@ static bool cbm_source_nesting_exceeds(const char *source, int source_len, int c
     return false;
 }
 
-static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
-                                            CBMLanguage language, const char *project,
-                                            const char *rel_path, int64_t timeout_micros,
-                                            const char **extra_defines, const char **include_paths);
-
 /* Best-effort parse-coverage collection (#963). Walks only the has_error paths
  * of the tree and records the 1-based line ranges of the TOP-MOST ERROR/MISSING
  * nodes (does not descend into an error subtree — one range per failed region).
@@ -817,6 +812,138 @@ static bool cbm_region_is_recovered(uint32_t rs, uint32_t re, const CBMDefArray 
     return covered_to >= re;
 }
 
+/* #961: true when 1-based `line` of `src` contains `name` (used to verify a
+ * def recovered from EXPANDED source really lives on that ORIGINAL line —
+ * rejects header-inlined defs whose physical expanded lines alias unrelated
+ * raw lines when compile_commands include paths are present). */
+static bool cbm_line_contains(const char *src, int src_len, uint32_t line, const char *name) {
+    if (!src || !name || !name[0] || line == 0) {
+        return false;
+    }
+    uint32_t cur = 1;
+    int i = 0;
+    while (i < src_len && cur < line) {
+        if (src[i] == '\n') {
+            cur++;
+        }
+        i++;
+    }
+    if (cur != line) {
+        return false;
+    }
+    int end = i;
+    while (end < src_len && src[end] != '\n') {
+        end++;
+    }
+    size_t nlen = strlen(name);
+    for (int j = i; j + (int)nlen <= end; j++) {
+        if (strncmp(src + j, name, nlen) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cbm_identifier_char(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+/* Verify that the mapped original span contains callable-definition syntax,
+ * not merely the name at a macro invocation or call site. */
+static bool cbm_span_contains_callable_def(const char *src, int src_len, uint32_t start_line,
+                                           uint32_t end_line, const char *name) {
+    if (!src || src_len <= 0 || !name || !name[0] || start_line == 0 || end_line < start_line) {
+        return false;
+    }
+    int span_start = 0;
+    uint32_t line = 1;
+    while (span_start < src_len && line < start_line) {
+        if (src[span_start++] == '\n') {
+            line++;
+        }
+    }
+    if (line != start_line) {
+        return false;
+    }
+    int span_end = span_start;
+    while (span_end < src_len && line <= end_line) {
+        if (src[span_end++] == '\n') {
+            line++;
+        }
+    }
+    size_t name_len = strlen(name);
+    for (int pos = span_start; pos + (int)name_len <= span_end; pos++) {
+        if (strncmp(src + pos, name, name_len) != 0 ||
+            (pos > 0 && cbm_identifier_char(src[pos - 1])) ||
+            (pos + (int)name_len < src_len && cbm_identifier_char(src[pos + name_len]))) {
+            continue;
+        }
+        int before = pos;
+        while (before > span_start && isspace((unsigned char)src[before - 1])) {
+            before--;
+        }
+        if (before > span_start && strchr("(,=!?[.", src[before - 1])) {
+            continue;
+        }
+        int open = pos + (int)name_len;
+        while (open < span_end && isspace((unsigned char)src[open])) {
+            open++;
+        }
+        if (open >= span_end || src[open] != '(') {
+            continue;
+        }
+        int depth = 0;
+        int close = -1;
+        for (int i = open; i < span_end; i++) {
+            if (src[i] == '(') {
+                depth++;
+            } else if (src[i] == ')' && --depth == 0) {
+                close = i;
+                break;
+            }
+        }
+        if (close < 0) {
+            continue;
+        }
+        for (int i = close + 1; i < span_end; i++) {
+            if (src[i] == '{') {
+                return true;
+            }
+            if (src[i] == ';') {
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+/* Remap an expanded-source definition back to the original input file. Every
+ * line in the definition must be attributable to the main file; generated
+ * macro bodies, included headers, and ambiguous spans fail closed. */
+static bool cbm_remap_preprocessed_def(CBMDefinition *def, const CBMPreprocessedSource *pp) {
+    if (!def || !pp || !pp->original_line_by_expanded_line || !pp->belongs_to_main_file ||
+        def->start_line == 0 || def->end_line < def->start_line ||
+        def->end_line > (uint32_t)pp->expanded_line_count) {
+        return false;
+    }
+
+    uint32_t original_start = pp->original_line_by_expanded_line[def->start_line];
+    uint32_t original_end = pp->original_line_by_expanded_line[def->end_line];
+    if (!original_start || !original_end || original_end < original_start) {
+        return false;
+    }
+    for (uint32_t line = def->start_line; line <= def->end_line; line++) {
+        if (!pp->belongs_to_main_file[line] || !pp->original_line_by_expanded_line[line]) {
+            return false;
+        }
+    }
+
+    def->start_line = original_start;
+    def->end_line = original_end;
+    def->lines = (int)(original_end - original_start + 1);
+    return true;
+}
+
 static void cbm_subtract_recovered_regions(cbm_error_regions_t *regs, const CBMDefArray *defs) {
     int kept = 0;
     for (int i = 0; i < regs->count; i++) {
@@ -854,17 +981,17 @@ static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
-    CBMFileResult *r = cbm_extract_file_impl(source, source_len, language, project, rel_path,
-                                             timeout_micros, extra_defines, include_paths);
-    cbm_index_mark_done(rel_path);
+    CBMFileResult *r =
+        cbm_extract_file_ex(source, source_len, language, project, rel_path, timeout_micros,
+                            extra_defines, include_paths, NULL, NULL);
     return r;
 }
 
-static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
-                                            CBMLanguage language, const char *project,
-                                            const char *rel_path, int64_t timeout_micros,
-                                            const char **extra_defines,
-                                            const char **include_paths) {
+CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLanguage language,
+                                   const char *project, const char *rel_path,
+                                   int64_t timeout_micros, const char **extra_defines,
+                                   const char **include_paths, const CBMMacroTable *macro_table,
+                                   const CBMReturnTypeTable *return_type_table) {
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
     CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
@@ -894,6 +1021,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     if (!spec) {
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "unsupported language");
+        cbm_index_mark_done(rel_path);
         return result;
     }
 
@@ -902,6 +1030,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     if (!ts_lang) {
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "no tree-sitter grammar");
+        cbm_index_mark_done(rel_path);
         return result;
     }
 
@@ -921,6 +1050,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     if (!parser) {
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "parser alloc failed");
+        cbm_index_mark_done(rel_path);
         return result;
     }
 
@@ -953,6 +1083,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         result->has_error = true;
         result->error_msg =
             cbm_arena_strdup(a, timeout_micros > 0 ? "parse timeout" : "parse failed");
+        cbm_index_mark_done(rel_path);
         return result;
     }
 
@@ -977,6 +1108,8 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         .rel_path = rel_path,
         .module_qn = result->module_qn,
         .root = root,
+        .macro_table = macro_table,
+        .return_type_table = return_type_table,
     };
 
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
@@ -1056,9 +1189,10 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // Defs keep original-source line numbers; only CALLS are extracted from expanded source.
     if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
         uint64_t pp_start = now_ns();
-        char *expanded = cbm_preprocess(source, source_len, rel_path, extra_defines, include_paths,
-                                        language != CBM_LANG_C);
-        if (expanded) {
+        CBMPreprocessedSource *preprocessed = cbm_preprocess_with_map(
+            source, source_len, rel_path, extra_defines, include_paths, language != CBM_LANG_C);
+        if (preprocessed && preprocessed->source) {
+            char *expanded = preprocessed->source;
             int expanded_len = (int)strlen(expanded);
             // Record calls count before second pass
             int calls_before = result->calls.count;
@@ -1103,12 +1237,65 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                     cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
                                   language != CBM_LANG_C);
 
+                    /* #961: a def whose body braces are split across
+                     * #ifdef/#else branches parses as an ERROR region on the
+                     * RAW source (both branches present at once -> unbalanced
+                     * braces), so the raw defs walk silently dropped it. The
+                     * expanded tree parses clean (simplecpp picked one
+                     * branch) and same-file token lines stay aligned, so
+                     * recover defs from it — adopting ONLY those that
+                     * intersect a raw ERROR region, whose name is visible on
+                     * the raw source line, and whose QN the raw pass did not
+                     * already extract. */
+                    if (ts_node_has_error(root)) {
+                        cbm_error_regions_t raw_regs = {{0}, {0}, 0};
+                        cbm_collect_error_regions(root, &raw_regs);
+                        if (raw_regs.count > 0) {
+                            int defs_before = result->defs.count;
+                            cbm_extract_definitions(&pp_ctx);
+                            int w = defs_before;
+                            for (int i = defs_before; i < result->defs.count; i++) {
+                                CBMDefinition *d = &result->defs.items[i];
+                                bool adopt = false;
+                                if (cbm_remap_preprocessed_def(d, preprocessed)) {
+                                    for (int rj = 0; rj < raw_regs.count && !adopt; rj++) {
+                                        if (d->start_line <= raw_regs.ends[rj] &&
+                                            d->end_line >= raw_regs.starts[rj]) {
+                                            adopt = true;
+                                        }
+                                    }
+                                }
+                                if (adopt && (!d->name ||
+                                              !cbm_line_contains(source, source_len, d->start_line,
+                                                                 d->name) ||
+                                              !cbm_span_contains_callable_def(
+                                                  source, source_len, d->start_line, d->end_line,
+                                                  d->name))) {
+                                    adopt = false;
+                                }
+                                for (int j = 0; j < defs_before && adopt; j++) {
+                                    const char *q = result->defs.items[j].qualified_name;
+                                    if (q && d->qualified_name &&
+                                        strcmp(q, d->qualified_name) == 0) {
+                                        adopt = false;
+                                    }
+                                }
+                                if (adopt) {
+                                    result->defs.items[w++] = *d;
+                                }
+                            }
+                            result->defs.count = w;
+                        }
+                    }
+
                     ts_tree_delete(pp_tree);
                 }
             }
-            cbm_preprocess_free(expanded);
+            cbm_preprocessed_source_free(preprocessed);
             atomic_fetch_add(&total_files_preprocessed, 1);
             (void)calls_before; // used for future logging
+        } else {
+            cbm_preprocessed_source_free(preprocessed);
         }
         atomic_fetch_add(&total_preprocess_ns, now_ns() - pp_start);
     }
@@ -1240,6 +1427,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // Retain tree for cross-file LSP reuse (caller frees via cbm_free_tree)
     result->cached_tree = tree;
     result->cached_lang = language;
+    cbm_index_mark_done(rel_path);
     return result;
 }
 

@@ -72,6 +72,7 @@ enum {
 #include <fcntl.h>
 #endif
 #include <yyjson/yyjson.h>
+#include <ctype.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,6 +96,8 @@ enum {
 /* JSON-RPC 2.0 standard error codes */
 #define JSONRPC_PARSE_ERROR (-32700)
 #define JSONRPC_METHOD_NOT_FOUND (-32601)
+#define JSONRPC_INVALID_PARAMS (-32602)
+#define JSONRPC_INTERNAL_ERROR (-32603)
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -258,16 +261,29 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
     yyjson_mut_arr_add_val(content, item);
     yyjson_mut_obj_add_val(doc, root, "content", content);
 
-    if (!is_error && text) {
+    bool has_structured_content = false;
+    if (text) {
         yyjson_doc *structured_doc = yyjson_read(text, strlen(text), 0);
         if (structured_doc) {
             yyjson_val *structured_root = yyjson_doc_get_root(structured_doc);
             if (yyjson_is_obj(structured_root)) {
                 yyjson_mut_val *structured = yyjson_val_mut_copy(doc, structured_root);
-                yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
+                if (structured) {
+                    yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
+                    has_structured_content = true;
+                }
             }
             yyjson_doc_free(structured_doc);
         }
+    }
+    if (!has_structured_content) {
+        /* Every advertised MCP tool has an object outputSchema, so even compact
+         * TOON/plain-text and error results must carry a conforming structured
+         * object. Keep the text Content block above for model visibility and
+         * backwards compatibility. */
+        yyjson_mut_val *structured = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, structured, is_error ? "error" : "text", text ? text : "");
+        yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
     }
     yyjson_mut_obj_add_bool(doc, root, "isError", is_error);
 
@@ -539,6 +555,24 @@ static const tool_def_t TOOLS[] = {
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
 
+    {"check_index_coverage", "Check index coverage",
+     "Check authoritative indexing-coverage metadata for exact repository-relative paths and "
+     "bounded path scopes. Use this after graph discovery for every cited or operated-on file; "
+     "use scopes before negative/exhaustive claims because fully skipped files cannot appear in "
+     "normal graph results. Returns coverage status separately from filesystem metadata freshness, "
+     "plus structured parse-error ranges and direct-source fallback actions. The signal is "
+     "best-effort: indexed_no_recorded_gap is not a completeness guarantee.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"project\":{\"type\":\"string\"},"
+     "\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"maxItems\":128,"
+     "\"description\":\"Repository-relative files to check exactly.\"},"
+     "\"scopes\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"maxItems\":32,"
+     "\"description\":\"Repository-relative path prefixes; use . for the project root.\"},"
+     "\"scope_limit\":{\"type\":\"integer\",\"default\":200,\"minimum\":1,\"maximum\":1000},"
+     "\"scope_offset\":{\"type\":\"integer\",\"default\":0,\"minimum\":0}},"
+     "\"required\":[\"project\"],\"anyOf\":[{\"required\":[\"paths\"]},{\"required\":[\"scopes\"]}]"
+     "}"},
+
     {"detect_changes", "Detect changes", "Detect code changes and their impact",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"scope\":{\"type\":"
      "\"string\"},\"depth\":{\"type\":\"integer\",\"default\":2},\"base_branch\":{\"type\":"
@@ -564,6 +598,44 @@ static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
 
 static const char MCP_TOOL_OUTPUT_SCHEMA[] = "{\"type\":\"object\",\"additionalProperties\":true}";
 
+typedef struct {
+    const char *name;
+    bool read_only;
+    bool destructive;
+    bool idempotent;
+    bool open_world;
+} tool_annotation_def_t;
+
+/* Tool annotations are deliberately explicit. All tools operate on the local
+ * repository/index domain, so none cross an open-world trust boundary. */
+static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
+    {"index_repository", false, false, true, false},
+    {"search_graph", false, true, true, false},
+    {"query_graph", false, true, true, false},
+    {"trace_path", false, true, true, false},
+    {"get_code_snippet", false, true, true, false},
+    {"get_graph_schema", false, true, true, false},
+    {"get_architecture", false, true, true, false},
+    {"search_code", false, true, true, false},
+    {"list_projects", true, false, true, false},
+    {"delete_project", false, true, true, false},
+    {"index_status", false, true, true, false},
+    {"check_index_coverage", false, true, true, false},
+    {"detect_changes", false, true, true, false},
+    {"manage_adr", false, true, false, false},
+    {"ingest_traces", false, false, false, false},
+};
+
+static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
+    size_t count = sizeof(TOOL_ANNOTATIONS) / sizeof(TOOL_ANNOTATIONS[0]);
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(TOOL_ANNOTATIONS[i].name, name) == 0) {
+            return &TOOL_ANNOTATIONS[i];
+        }
+    }
+    return NULL;
+}
+
 static void mcp_add_json_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
                                 const char *schema_json) {
     yyjson_doc *schema_doc = yyjson_read(schema_json, strlen(schema_json), 0);
@@ -585,10 +657,110 @@ static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) 
     mcp_add_json_schema(doc, tool, "inputSchema", TOOLS[i].input_schema);
     mcp_add_json_schema(doc, tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
 
+    const tool_annotation_def_t *def = mcp_tool_annotations(TOOLS[i].name);
+    yyjson_mut_val *annotations = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, annotations, "readOnlyHint", def ? def->read_only : false);
+    yyjson_mut_obj_add_bool(doc, annotations, "destructiveHint", def ? def->destructive : true);
+    yyjson_mut_obj_add_bool(doc, annotations, "idempotentHint", def ? def->idempotent : false);
+    yyjson_mut_obj_add_bool(doc, annotations, "openWorldHint", def ? def->open_world : true);
+    yyjson_mut_obj_add_val(doc, tool, "annotations", annotations);
+
     yyjson_mut_arr_add_val(tools, tool);
 }
 
-static char *cbm_mcp_tools_list_range(int offset, int limit, bool include_next_cursor) {
+static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
+    static const char *const analysis_tools[] = {
+        "search_graph",     "query_graph",          "trace_path",     "get_code_snippet",
+        "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
+        "index_status",     "check_index_coverage", "detect_changes",
+    };
+    static const char *const scout_tools[] = {
+        "search_graph",  "trace_path",   "get_code_snippet",     "get_architecture",
+        "list_projects", "index_status", "check_index_coverage",
+    };
+    if (!name) {
+        return false;
+    }
+    if (profile == CBM_MCP_TOOL_PROFILE_ALL) {
+        return true;
+    }
+    const char *const *allowed = NULL;
+    size_t allowed_count = 0U;
+    if (profile == CBM_MCP_TOOL_PROFILE_ANALYSIS) {
+        allowed = analysis_tools;
+        allowed_count = sizeof(analysis_tools) / sizeof(analysis_tools[0]);
+    } else if (profile == CBM_MCP_TOOL_PROFILE_SCOUT) {
+        allowed = scout_tools;
+        allowed_count = sizeof(scout_tools) / sizeof(scout_tools[0]);
+    }
+    for (size_t i = 0U; i < allowed_count; i++) {
+        if (strcmp(name, allowed[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *mcp_tool_profile_name(cbm_mcp_tool_profile_t profile) {
+    return profile == CBM_MCP_TOOL_PROFILE_SCOUT ? "scout" : "analysis";
+}
+
+int cbm_mcp_parse_tool_profile_args(int argc, const char *const argv[const],
+                                    cbm_mcp_tool_profile_t *profile_out) {
+    if (argc < 0 || !argv || !profile_out) {
+        return -1;
+    }
+    *profile_out = CBM_MCP_TOOL_PROFILE_ALL;
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (!arg) {
+            return -1;
+        }
+        if (strcmp(arg, "--tool-profile=analysis") == 0) {
+            *profile_out = CBM_MCP_TOOL_PROFILE_ANALYSIS;
+            continue;
+        }
+        if (strcmp(arg, "--tool-profile=scout") == 0) {
+            *profile_out = CBM_MCP_TOOL_PROFILE_SCOUT;
+            continue;
+        }
+        if (strcmp(arg, "--tool-profile") == 0) {
+            if (i + 1 >= argc || !argv[i + 1]) {
+                return -1;
+            }
+            if (strcmp(argv[i + 1], "analysis") == 0) {
+                *profile_out = CBM_MCP_TOOL_PROFILE_ANALYSIS;
+            } else if (strcmp(argv[i + 1], "scout") == 0) {
+                *profile_out = CBM_MCP_TOOL_PROFILE_SCOUT;
+            } else {
+                return -1;
+            }
+            i++;
+            continue;
+        }
+        if (strncmp(arg, "--tool-profile=", strlen("--tool-profile=")) == 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+bool cbm_mcp_tool_profile_allows_http(cbm_mcp_tool_profile_t profile) {
+    return profile == CBM_MCP_TOOL_PROFILE_ALL;
+}
+
+static int mcp_allowed_tool_count(cbm_mcp_tool_profile_t profile) {
+    int count = 0;
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        if (mcp_tool_allowed(profile, TOOLS[i].name)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static char *cbm_mcp_tools_list_range(cbm_mcp_tool_profile_t profile, int offset, int limit,
+                                      bool include_next_cursor) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
@@ -598,24 +770,32 @@ static char *cbm_mcp_tools_list_range(int offset, int limit, bool include_next_c
     if (offset < 0) {
         offset = 0;
     }
-    if (offset > TOOL_COUNT) {
-        offset = TOOL_COUNT;
+    int allowed_count = mcp_allowed_tool_count(profile);
+    if (offset > allowed_count) {
+        offset = allowed_count;
     }
-    if (limit < 0 || limit > TOOL_COUNT) {
-        limit = TOOL_COUNT;
+    if (limit < 0 || limit > allowed_count) {
+        limit = allowed_count;
     }
 
     int end = offset + limit;
-    if (end > TOOL_COUNT) {
-        end = TOOL_COUNT;
+    if (end > allowed_count) {
+        end = allowed_count;
     }
 
-    for (int i = offset; i < end; i++) {
-        mcp_add_tool_def(doc, tools, i);
+    int visible = 0;
+    for (int i = 0; i < TOOL_COUNT && visible < end; i++) {
+        if (!mcp_tool_allowed(profile, TOOLS[i].name)) {
+            continue;
+        }
+        if (visible >= offset) {
+            mcp_add_tool_def(doc, tools, i);
+        }
+        visible++;
     }
 
     yyjson_mut_obj_add_val(doc, root, "tools", tools);
-    if (include_next_cursor && end < TOOL_COUNT) {
+    if (include_next_cursor && end < allowed_count) {
         char cursor[32];
         snprintf(cursor, sizeof(cursor), "%d", end);
         yyjson_mut_obj_add_strcpy(doc, root, "nextCursor", cursor);
@@ -627,7 +807,7 @@ static char *cbm_mcp_tools_list_range(int offset, int limit, bool include_next_c
 }
 
 char *cbm_mcp_tools_list(void) {
-    return cbm_mcp_tools_list_range(0, TOOL_COUNT, false);
+    return cbm_mcp_tools_list_range(CBM_MCP_TOOL_PROFILE_ALL, 0, TOOL_COUNT, false);
 }
 
 /* Return the JSON input_schema string for a tool by name, or NULL if unknown.
@@ -683,13 +863,191 @@ static int mcp_tools_cursor_offset(const char *params_json, bool *has_cursor_out
     return offset;
 }
 
-static char *cbm_mcp_tools_list_page(const char *params_json) {
+static char *cbm_mcp_tools_list_page(cbm_mcp_tool_profile_t profile, const char *params_json) {
     bool has_cursor = false;
     int offset = mcp_tools_cursor_offset(params_json, &has_cursor);
     if (!has_cursor) {
-        return cbm_mcp_tools_list();
+        return cbm_mcp_tools_list_range(profile, 0, TOOL_COUNT, false);
     }
-    return cbm_mcp_tools_list_range(offset, MCP_TOOLS_PAGE_SIZE, true);
+    return cbm_mcp_tools_list_range(profile, offset, MCP_TOOLS_PAGE_SIZE, true);
+}
+
+/* ── Prompt definitions ───────────────────────────────────────── */
+
+static void mcp_add_prompt_argument(yyjson_mut_doc *doc, yyjson_mut_val *arguments,
+                                    const char *name, const char *title, const char *description,
+                                    bool required) {
+    yyjson_mut_val *argument = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, argument, "name", name);
+    yyjson_mut_obj_add_str(doc, argument, "title", title);
+    yyjson_mut_obj_add_str(doc, argument, "description", description);
+    yyjson_mut_obj_add_bool(doc, argument, "required", required);
+    yyjson_mut_arr_add_val(arguments, argument);
+}
+
+static char *cbm_mcp_prompts_list(void) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_val *prompts = yyjson_mut_arr(doc);
+
+    yyjson_mut_val *explore = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, explore, "name", "explore_codebase");
+    yyjson_mut_obj_add_str(doc, explore, "title", "Explore codebase");
+    yyjson_mut_obj_add_str(doc, explore, "description",
+                           "Explore a codebase with graph-first structural discovery.");
+    yyjson_mut_val *explore_arguments = yyjson_mut_arr(doc);
+    mcp_add_prompt_argument(doc, explore_arguments, "project", "Project",
+                            "Indexed project name from list_projects.", true);
+    mcp_add_prompt_argument(doc, explore_arguments, "question", "Question",
+                            "Architecture or implementation question to investigate.", true);
+    yyjson_mut_obj_add_val(doc, explore, "arguments", explore_arguments);
+    yyjson_mut_arr_add_val(prompts, explore);
+
+    yyjson_mut_val *review = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, review, "name", "review_change_impact");
+    yyjson_mut_obj_add_str(doc, review, "title", "Review change impact");
+    yyjson_mut_obj_add_str(doc, review, "description",
+                           "Review affected callers, tests, boundaries, and risks.");
+    yyjson_mut_val *review_arguments = yyjson_mut_arr(doc);
+    mcp_add_prompt_argument(doc, review_arguments, "project", "Project",
+                            "Indexed project name from list_projects.", true);
+    mcp_add_prompt_argument(doc, review_arguments, "change", "Change",
+                            "Change, symbol, or area whose impact should be reviewed.", true);
+    mcp_add_prompt_argument(doc, review_arguments, "base_branch", "Base branch",
+                            "Git branch or ref for detect_changes; defaults to main.", false);
+    yyjson_mut_obj_add_val(doc, review, "arguments", review_arguments);
+    yyjson_mut_arr_add_val(prompts, review);
+
+    yyjson_mut_obj_add_val(doc, root, "prompts", prompts);
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return out;
+}
+
+static const char *mcp_prompt_string_argument(yyjson_val *arguments, const char *name) {
+    if (!arguments || !yyjson_is_obj(arguments)) {
+        return NULL;
+    }
+    yyjson_val *value = yyjson_obj_get(arguments, name);
+    if (!value || !yyjson_is_str(value)) {
+        return NULL;
+    }
+    const char *text = yyjson_get_str(value);
+    return text && text[0] ? text : NULL;
+}
+
+static char *mcp_prompt_result(const char *description, const char *text) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "description", description);
+
+    yyjson_mut_val *messages = yyjson_mut_arr(doc);
+    yyjson_mut_val *message = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, message, "role", "user");
+    yyjson_mut_val *content = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, content, "type", "text");
+    yyjson_mut_obj_add_str(doc, content, "text", text);
+    yyjson_mut_obj_add_val(doc, message, "content", content);
+    yyjson_mut_arr_add_val(messages, message);
+    yyjson_mut_obj_add_val(doc, root, "messages", messages);
+
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return out;
+}
+
+static char *mcp_prompt_error_json(int code, const char *message) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_int(doc, root, "code", code);
+    yyjson_mut_obj_add_str(doc, root, "message", message);
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return out;
+}
+
+static char *cbm_mcp_prompt_get(const char *params_json, char **error_json) {
+    *error_json = NULL;
+    yyjson_doc *params_doc = params_json ? yyjson_read(params_json, strlen(params_json), 0) : NULL;
+    yyjson_val *params = params_doc ? yyjson_doc_get_root(params_doc) : NULL;
+    yyjson_val *name_value =
+        params && yyjson_is_obj(params) ? yyjson_obj_get(params, "name") : NULL;
+    if (!name_value || !yyjson_is_str(name_value)) {
+        *error_json = mcp_prompt_error_json(JSONRPC_INVALID_PARAMS, "Invalid prompt name");
+        if (params_doc) {
+            yyjson_doc_free(params_doc);
+        }
+        return NULL;
+    }
+
+    const char *name = yyjson_get_str(name_value);
+    bool is_explore = strcmp(name, "explore_codebase") == 0;
+    bool is_review = strcmp(name, "review_change_impact") == 0;
+    if (!is_explore && !is_review) {
+        *error_json = mcp_prompt_error_json(JSONRPC_INVALID_PARAMS, "Invalid prompt name");
+        yyjson_doc_free(params_doc);
+        return NULL;
+    }
+
+    yyjson_val *arguments = yyjson_obj_get(params, "arguments");
+    const char *project = mcp_prompt_string_argument(arguments, "project");
+    const char *request = mcp_prompt_string_argument(arguments, is_explore ? "question" : "change");
+    if (!project || !request) {
+        *error_json =
+            mcp_prompt_error_json(JSONRPC_INVALID_PARAMS, "Missing required prompt arguments");
+        yyjson_doc_free(params_doc);
+        return NULL;
+    }
+
+    const char *base_branch = "main";
+    yyjson_val *base_branch_value = is_review && arguments && yyjson_is_obj(arguments)
+                                        ? yyjson_obj_get(arguments, "base_branch")
+                                        : NULL;
+    if (base_branch_value) {
+        if (!yyjson_is_str(base_branch_value) || !yyjson_get_str(base_branch_value)[0]) {
+            *error_json = mcp_prompt_error_json(JSONRPC_INVALID_PARAMS, "Invalid prompt arguments");
+            yyjson_doc_free(params_doc);
+            return NULL;
+        }
+        base_branch = yyjson_get_str(base_branch_value);
+    }
+
+    static const char EXPLORE_TEMPLATE[] =
+        "Explore project \"%s\" to answer: %s\n\n"
+        "Use graph tools first: search_graph to find relevant symbols, get_code_snippet for "
+        "exact source, and trace_path(direction=\"both\") for callers and callees. Use "
+        "get_architecture for broad orientation and query_graph only for multi-hop patterns. "
+        "Check has_more and paginate. Fall back to search_code or grep only for literal or "
+        "non-code text, or where graph coverage is incomplete.";
+    static const char REVIEW_TEMPLATE[] =
+        "Review change impact in project \"%s\" for: %s\n\n"
+        "Use detect_changes with base_branch \"%s\", then trace_path(direction=\"both\", "
+        "include_tests=true) for affected callers, callees, and tests. Read exact definitions "
+        "with get_code_snippet and use query_graph for cross-boundary patterns. Report affected "
+        "callers, tests, boundaries, and risks; do not modify files.";
+
+    size_t text_size = strlen(project) + strlen(request) + strlen(base_branch) +
+                       (is_explore ? sizeof(EXPLORE_TEMPLATE) : sizeof(REVIEW_TEMPLATE));
+    char *text = malloc(text_size);
+    if (!text) {
+        *error_json = mcp_prompt_error_json(JSONRPC_INTERNAL_ERROR, "Internal error");
+        yyjson_doc_free(params_doc);
+        return NULL;
+    }
+    if (is_explore) {
+        snprintf(text, text_size, EXPLORE_TEMPLATE, project, request);
+    } else {
+        snprintf(text, text_size, REVIEW_TEMPLATE, project, request, base_branch);
+    }
+
+    char *result = mcp_prompt_result(
+        is_explore ? "Graph-first codebase exploration" : "Graph-first change-impact review", text);
+    free(text);
+    yyjson_doc_free(params_doc);
+    return result;
 }
 
 /* Supported protocol versions, newest first. The server picks the newest
@@ -703,7 +1061,37 @@ static const char *SUPPORTED_PROTOCOL_VERSIONS[] = {
 static const int SUPPORTED_VERSION_COUNT =
     (int)(sizeof(SUPPORTED_PROTOCOL_VERSIONS) / sizeof(SUPPORTED_PROTOCOL_VERSIONS[0]));
 
-char *cbm_mcp_initialize_response(const char *params_json) {
+static const char MCP_SERVER_INSTRUCTIONS[] =
+    "Use graph tools first for structural code discovery: search_graph to find symbols, "
+    "trace_path for callers and callees, get_code_snippet for exact source, query_graph for "
+    "complex multi-hop patterns, and get_architecture for orientation. Use search_code or "
+    "filesystem grep for literal or non-code text, or when graph coverage is insufficient. "
+    "Call list_projects before initial use and index_repository only when a repository is not "
+    "indexed or to force immediate freshness after a large external update. Once indexed, "
+    "watched projects auto-refresh in the background; use index_status for project health and "
+    "check_index_coverage for every cited path and for scopes behind negative or exhaustive "
+    "claims. Coverage is best-effort, never proof of completeness. Check has_more or nextCursor "
+    "and paginate when present.";
+
+static const char MCP_ANALYSIS_SERVER_INSTRUCTIONS[] =
+    "This is the analysis tool profile; graph and index mutation tools are unavailable. Use "
+    "list_projects and index_status to select a current graph project, then use search_graph, "
+    "trace_path, get_code_snippet, query_graph, get_architecture, and search_code for read-only "
+    "analysis. Call check_index_coverage for every cited path and for scopes behind negative or "
+    "exhaustive claims; read flagged ranges or skipped files directly. Coverage is best-effort, "
+    "never proof of completeness. Check has_more or nextCursor and paginate when present. If the "
+    "project is missing or stale, ask the parent agent to index or refresh it.";
+
+static const char MCP_SCOUT_SERVER_INSTRUCTIONS[] =
+    "This is the scout tool profile; only the fast positive-discovery graph tools are available. "
+    "Use list_projects and index_status to select a current graph project, then use search_graph, "
+    "trace_path, get_code_snippet, and get_architecture with narrow limits. Call "
+    "check_index_coverage once for every cited path and read flagged ranges directly. Findings "
+    "are provisional: do not make absence, exhaustive-impact, or dead-code claims. If the project "
+    "is missing or stale, ask the parent agent to index or refresh it.";
+
+static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
+                                                     cbm_mcp_tool_profile_t profile) {
     /* Determine protocol version: if client requests a version we support,
      * echo it back; otherwise respond with our latest. */
     const char *version = SUPPORTED_PROTOCOL_VERSIONS[0]; /* default: latest */
@@ -739,11 +1127,25 @@ char *cbm_mcp_initialize_response(const char *params_json) {
     yyjson_mut_val *tools_cap = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_bool(doc, tools_cap, "listChanged", false);
     yyjson_mut_obj_add_val(doc, caps, "tools", tools_cap);
+    yyjson_mut_val *prompts_cap = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, prompts_cap, "listChanged", false);
+    yyjson_mut_obj_add_val(doc, caps, "prompts", prompts_cap);
     yyjson_mut_obj_add_val(doc, root, "capabilities", caps);
+    const char *instructions = MCP_SERVER_INSTRUCTIONS;
+    if (profile == CBM_MCP_TOOL_PROFILE_ANALYSIS) {
+        instructions = MCP_ANALYSIS_SERVER_INSTRUCTIONS;
+    } else if (profile == CBM_MCP_TOOL_PROFILE_SCOUT) {
+        instructions = MCP_SCOUT_SERVER_INSTRUCTIONS;
+    }
+    yyjson_mut_obj_add_str(doc, root, "instructions", instructions);
 
     char *out = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return out;
+}
+
+char *cbm_mcp_initialize_response(const char *params_json) {
+    return cbm_mcp_initialize_response_for_profile(params_json, CBM_MCP_TOOL_PROFILE_ALL);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -840,6 +1242,67 @@ static char *normalize_project_arg(char *project) {
     return project;
 }
 
+/* Forward decls — defined below alongside store resolution. */
+static const char *cache_dir(char *buf, size_t bufsz);
+static bool is_project_db_file(const char *name, size_t len);
+bool cbm_validate_project_name(const char *project);
+
+/* #1025: agents naturally pass the repo FOLDER name ("codebase-memory-mcp"),
+ * but indexed project names derive from the full path
+ * (E:\project\graph\x -> "E-project-graph-x"), so the exact lookup fails
+ * while list_projects clearly shows the project. When no <project>.db exists,
+ * scan cache-dir FILENAMES for a segment-aligned tail match ("-<project>.db"):
+ * exactly one match adopts the full name; zero or several keep the original so
+ * the existing not-found error (which lists all candidates) fires. Filename-
+ * level only — internal-name drift stays #704's fallback in resolve_store. */
+static char *resolve_project_tail(char *project) {
+    if (!project || !cbm_validate_project_name(project)) {
+        return project;
+    }
+    char dir[CBM_SZ_1K];
+    cache_dir(dir, sizeof(dir));
+    char exact[CBM_SZ_2K];
+    snprintf(exact, sizeof(exact), "%s/%s.db", dir, project);
+    if (cbm_file_exists(exact)) {
+        return project; /* exact name — untouched fast path */
+    }
+    size_t plen = strlen(project);
+    char match[CBM_SZ_1K] = "";
+    int matches = 0;
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return project;
+    }
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        const char *n = entry->name;
+        size_t len = strlen(n);
+        if (!is_project_db_file(n, len)) {
+            continue;
+        }
+        size_t stem_len = len - MCP_DB_EXT; /* strip ".db" */
+        if (stem_len <= plen + 1 || stem_len >= sizeof(match)) {
+            continue;
+        }
+        if (n[stem_len - plen - 1] != '-' || strncmp(n + stem_len - plen, project, plen) != 0) {
+            continue;
+        }
+        matches++;
+        if (matches > 1) {
+            break; /* ambiguous — keep the original name */
+        }
+        memcpy(match, n, stem_len);
+        match[stem_len] = '\0';
+    }
+    cbm_closedir(d);
+    if (matches == 1) {
+        cbm_log_info("mcp.project_tail_resolved", "passed", project, "resolved", match);
+        free(project);
+        return heap_strdup(match);
+    }
+    return project;
+}
+
 /* Resolve the project argument, accepting the canonical "project" key plus the
  * aliases a caller naturally reaches for (#640): list_projects surfaces the
  * field as "name" and the not-found hint says "pass the project name", so
@@ -857,7 +1320,7 @@ static char *get_project_arg(const char *args_json) {
     if (!p) {
         p = cbm_mcp_get_string_arg(args_json, "projectName");
     }
-    return normalize_project_arg(p);
+    return resolve_project_tail(normalize_project_arg(p));
 }
 
 int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val) {
@@ -917,6 +1380,7 @@ struct cbm_mcp_server {
     cbm_pipeline_t *active_pipeline; /* non-NULL while index_repository runs */
     int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
     char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
+    cbm_mcp_tool_profile_t tool_profile;
 };
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
@@ -934,8 +1398,15 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
         srv->store = cbm_store_open_memory();
     }
     srv->owns_store = true;
+    srv->tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
 
     return srv;
+}
+
+void cbm_mcp_server_set_tool_profile(cbm_mcp_server_t *srv, cbm_mcp_tool_profile_t profile) {
+    if (srv) {
+        srv->tool_profile = profile;
+    }
 }
 
 cbm_store_t *cbm_mcp_server_store(cbm_mcp_server_t *srv) {
@@ -1335,10 +1806,23 @@ static bool db_internal_project_name(const char *full_path, char *name_out, size
     cbm_project_t *projs = NULL;
     int n = 0;
     bool ok = false;
-    if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK && n == 1 && projs[0].name &&
-        projs[0].name[0]) {
-        snprintf(name_out, name_sz, "%s", projs[0].name);
-        ok = true;
+    if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK) {
+        /* Ignore internal shadow projects ("<name>::missed" miss-graph rows):
+         * they share the db with the primary project and must not make it
+         * unresolvable — requiring n == 1 over ALL rows made every project
+         * with a miss graph vanish from list_projects and the UI (#1044). */
+        int primary = -1;
+        int primary_count = 0;
+        for (int i = 0; i < n; i++) {
+            if (projs[i].name && projs[i].name[0] && !strstr(projs[i].name, "::")) {
+                primary = i;
+                primary_count++;
+            }
+        }
+        if (primary_count == 1) {
+            snprintf(name_out, name_sz, "%s", projs[primary].name);
+            ok = true;
+        }
     }
     cbm_store_free_projects(projs, n);
     if (ok && out_store) {
@@ -1384,7 +1868,8 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project) {
 /* Open a .db file briefly, collect node/edge counts and root_path,
  * then append a JSON entry to arr. */
 static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
-                                     const char *name, size_t name_len, int64_t size_bytes) {
+                                     const char *name, size_t name_len, int64_t size_bytes,
+                                     bool metadata_only) {
     (void)name_len;
 
     char full_path[CBM_SZ_2K];
@@ -1401,8 +1886,12 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
         return; /* ghost / unreadable — not a resolvable project */
     }
 
-    int nodes = cbm_store_count_nodes(pstore, project_name);
-    int edges = cbm_store_count_edges(pstore, project_name);
+    int nodes = 0;
+    int edges = 0;
+    if (!metadata_only) {
+        nodes = cbm_store_count_nodes(pstore, project_name);
+        edges = cbm_store_count_edges(pstore, project_name);
+    }
     char root_path_buf[CBM_SZ_1K] = "";
     cbm_project_t proj = {0};
     if (cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK) {
@@ -1420,7 +1909,7 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
      * disambiguates same-repo projects). The 12-field git block — mostly
      * null for non-git roots — cost ~10KB across a full cache and is one
      * index_status call away for the project you actually care about. */
-    if (root_path_buf[0]) {
+    if (!metadata_only && root_path_buf[0]) {
         cbm_git_context_t gctx = {0};
         (void)cbm_git_context_resolve(root_path_buf, &gctx);
         if (gctx.is_git && gctx.branch) {
@@ -1428,9 +1917,11 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
         }
         cbm_git_context_free(&gctx);
     }
-    yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
-    yyjson_mut_obj_add_int(doc, p, "edges", edges);
-    yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
+    if (!metadata_only) {
+        yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
+        yyjson_mut_obj_add_int(doc, p, "edges", edges);
+        yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
+    }
     yyjson_mut_arr_add_val(arr, p);
 }
 
@@ -1438,7 +1929,15 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
  * Each project is a single .db file — no central registry needed. */
 static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     (void)srv;
-    (void)args;
+    bool metadata_only = false;
+    yyjson_doc *args_doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
+    yyjson_val *metadata_value =
+        args_root && yyjson_is_obj(args_root) ? yyjson_obj_get(args_root, "metadata_only") : NULL;
+    metadata_only = metadata_value && yyjson_is_true(metadata_value);
+    if (args_doc) {
+        yyjson_doc_free(args_doc);
+    }
 
     char dir_path[CBM_SZ_1K];
     cache_dir(dir_path, sizeof(dir_path));
@@ -1473,7 +1972,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         if (size_bytes < 0) {
             continue;
         }
-        build_project_json_entry(doc, arr, dir_path, name, len, size_bytes);
+        build_project_json_entry(doc, arr, dir_path, name, len, size_bytes, metadata_only);
     }
     cbm_closedir(d);
 
@@ -2638,6 +3137,432 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
             "are NOT guaranteed to be fully indexed. (not_indexed entries are a separate, "
             "BY-DESIGN class — deliberate ignore rules, not failures.)");
     }
+}
+
+enum {
+    COVERAGE_PATH_MAX = 128,
+    COVERAGE_SCOPE_MAX = 32,
+    COVERAGE_SCOPE_DEFAULT_LIMIT = 200,
+    COVERAGE_SCOPE_MAX_LIMIT = 1000,
+    COVERAGE_RANGE_MAX = 128,
+};
+
+bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
+
+typedef enum {
+    COVERAGE_PATH_OK = 0,
+    COVERAGE_PATH_OUTSIDE,
+    COVERAGE_PATH_INVALID,
+} coverage_path_result_t;
+
+/* Normalize an untrusted repository-relative path without touching the
+ * filesystem. Absolute paths, drive/UNC paths, control bytes, and any `..`
+ * component are rejected. A root scope (`.`) normalizes to the empty prefix. */
+static coverage_path_result_t coverage_normalize_rel(const char *input, bool allow_root, char *out,
+                                                     size_t out_size) {
+    if (!input || !out || out_size == 0U) {
+        return COVERAGE_PATH_INVALID;
+    }
+    out[0] = '\0';
+    size_t len = strlen(input);
+    if (len == 0U || len >= out_size || input[0] == '/' || input[0] == '\\' ||
+        (len >= 2U && isalpha((unsigned char)input[0]) && input[1] == ':')) {
+        return COVERAGE_PATH_OUTSIDE;
+    }
+
+    size_t in = 0U;
+    size_t written = 0U;
+    while (in < len) {
+        while (in < len && (input[in] == '/' || input[in] == '\\')) {
+            in++;
+        }
+        if (in >= len) {
+            break;
+        }
+        size_t start = in;
+        while (in < len && input[in] != '/' && input[in] != '\\') {
+            unsigned char c = (unsigned char)input[in];
+            if (c < 0x20U) {
+                return COVERAGE_PATH_INVALID;
+            }
+            in++;
+        }
+        size_t part_len = in - start;
+        if (part_len == 1U && input[start] == '.') {
+            continue;
+        }
+        if (part_len == 2U && input[start] == '.' && input[start + 1U] == '.') {
+            return COVERAGE_PATH_OUTSIDE;
+        }
+        if (written > 0U) {
+            if (written + 1U >= out_size) {
+                return COVERAGE_PATH_INVALID;
+            }
+            out[written++] = '/';
+        }
+        if (written + part_len >= out_size) {
+            return COVERAGE_PATH_INVALID;
+        }
+        memcpy(out + written, input + start, part_len);
+        written += part_len;
+    }
+    out[written] = '\0';
+    return written > 0U || allow_root ? COVERAGE_PATH_OK : COVERAGE_PATH_INVALID;
+}
+
+static int64_t coverage_stat_mtime_ns(const struct stat *st) {
+#ifdef __APPLE__
+    return ((int64_t)st->st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+           (int64_t)st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
+#else
+    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
+#endif
+}
+
+static const char *coverage_path_freshness(cbm_store_t *store, const char *project,
+                                           const char *root_path, const char *rel_path,
+                                           bool *outside) {
+    *outside = false;
+    if (!root_path || !root_path[0]) {
+        return "unavailable";
+    }
+    char abs_path[CBM_SZ_4K];
+    int n = snprintf(abs_path, sizeof(abs_path), "%s%s%s", root_path,
+                     root_path[strlen(root_path) - 1U] == '/' ? "" : "/", rel_path);
+    if (n < 0 || (size_t)n >= sizeof(abs_path)) {
+        return "unavailable";
+    }
+    struct stat st;
+    if (stat(abs_path, &st) != 0) {
+        return "missing";
+    }
+    if (!cbm_path_within_root(root_path, abs_path)) {
+        *outside = true;
+        return "outside_project";
+    }
+
+    cbm_file_hash_t hash = {0};
+    int rc = cbm_store_get_file_hash(store, project, rel_path, &hash);
+    if (rc == CBM_STORE_NOT_FOUND) {
+        return "not_tracked";
+    }
+    if (rc != CBM_STORE_OK) {
+        return "unavailable";
+    }
+    bool matches = hash.mtime_ns == coverage_stat_mtime_ns(&st) && hash.size == st.st_size;
+    cbm_store_clear_file_hash(&hash);
+    return matches ? "metadata_match" : "metadata_changed";
+}
+
+static void coverage_add_ranges(yyjson_mut_doc *doc, yyjson_mut_val *row, const char *detail) {
+    if (!detail || !detail[0]) {
+        return;
+    }
+    yyjson_mut_val *ranges = yyjson_mut_arr(doc);
+    const char *p = detail;
+    int emitted = 0;
+    while (*p && emitted < COVERAGE_RANGE_MAX) {
+        while (*p == ' ' || *p == ',') {
+            p++;
+        }
+        if (!isdigit((unsigned char)*p)) {
+            break;
+        }
+        char *endptr = NULL;
+        long start = strtol(p, &endptr, 10);
+        if (endptr == p || start <= 0 || start > INT32_MAX) {
+            break;
+        }
+        p = endptr;
+        long end = start;
+        if (*p == '-') {
+            p++;
+            long parsed = strtol(p, &endptr, 10);
+            if (endptr == p || parsed < start || parsed > INT32_MAX) {
+                break;
+            }
+            end = parsed;
+            p = endptr;
+        }
+        yyjson_mut_val *range = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_int(doc, range, "start", start);
+        yyjson_mut_obj_add_int(doc, range, "end", end);
+        yyjson_mut_arr_add_val(ranges, range);
+        emitted++;
+        while (*p == ' ') {
+            p++;
+        }
+        if (*p && *p != ',') {
+            break;
+        }
+    }
+    if (emitted > 0) {
+        yyjson_mut_obj_add_val(doc, row, "ranges", ranges);
+    }
+}
+
+static void coverage_add_row_json(yyjson_mut_doc *doc, yyjson_mut_val *array,
+                                  const cbm_coverage_row_t *row, const char *requested_path) {
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, item, "path", row->rel_path ? row->rel_path : "");
+    yyjson_mut_obj_add_strcpy(doc, item, "kind", row->kind ? row->kind : "");
+    yyjson_mut_obj_add_strcpy(doc, item, "detail", row->detail ? row->detail : "");
+    if (requested_path) {
+        yyjson_mut_obj_add_str(
+            doc, item, "match",
+            row->rel_path && strcmp(row->rel_path, requested_path) == 0 ? "exact" : "ancestor");
+    }
+    if (row->kind && strcmp(row->kind, "parse_partial") == 0) {
+        coverage_add_ranges(doc, item, row->detail);
+    }
+    yyjson_mut_arr_add_val(array, item);
+}
+
+static const char *coverage_status(const cbm_coverage_row_t *rows, int count,
+                                   const char *requested_path, const char *recording_status,
+                                   bool generation_matches, bool lookup_ok) {
+    if (!lookup_ok) {
+        return "coverage_unavailable";
+    }
+    bool exact = false;
+    for (int i = 0; i < count; i++) {
+        if (rows[i].rel_path && strcmp(rows[i].rel_path, requested_path) == 0) {
+            exact = true;
+            break;
+        }
+    }
+    for (int pass = 0; pass < 3; pass++) {
+        for (int i = 0; i < count; i++) {
+            if (exact && (!rows[i].rel_path || strcmp(rows[i].rel_path, requested_path) != 0)) {
+                continue;
+            }
+            const char *kind = rows[i].kind ? rows[i].kind : "";
+            if (pass == 0 && strcmp(kind, "parse_partial") == 0) {
+                return "partial";
+            }
+            if (pass == 1 && strncmp(kind, "not_indexed", 11) == 0) {
+                return "excluded";
+            }
+            if (pass == 2 && kind[0]) {
+                return "skipped";
+            }
+        }
+    }
+    if (!generation_matches || !recording_status || strcmp(recording_status, "complete") != 0) {
+        return "coverage_unavailable";
+    }
+    return "no_recorded_issue";
+}
+
+static const char *coverage_recommended_action(const char *status, const char *freshness) {
+    if (!freshness || strcmp(freshness, "metadata_match") != 0) {
+        return "read_source_and_reindex";
+    }
+    if (strcmp(status, "partial") == 0) {
+        return "read_ranges_and_verify_scope";
+    }
+    if (strcmp(status, "skipped") == 0) {
+        return "read_source_directly";
+    }
+    if (strcmp(status, "excluded") == 0) {
+        return "read_source_or_change_ignore_rules";
+    }
+    if (strcmp(status, "no_recorded_issue") == 0) {
+        return "use_graph_with_best_effort_caveat";
+    }
+    return "read_source_and_reindex";
+}
+
+static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    yyjson_doc *adoc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *aroot = adoc ? yyjson_doc_get_root(adoc) : NULL;
+    yyjson_val *paths = aroot ? yyjson_obj_get(aroot, "paths") : NULL;
+    yyjson_val *scopes = aroot ? yyjson_obj_get(aroot, "scopes") : NULL;
+    size_t path_count = paths && yyjson_is_arr(paths) ? yyjson_arr_size(paths) : 0U;
+    size_t scope_count = scopes && yyjson_is_arr(scopes) ? yyjson_arr_size(scopes) : 0U;
+    if (!aroot || (paths && !yyjson_is_arr(paths)) || (scopes && !yyjson_is_arr(scopes)) ||
+        (path_count == 0U && scope_count == 0U) || path_count > COVERAGE_PATH_MAX ||
+        scope_count > COVERAGE_SCOPE_MAX) {
+        if (adoc) {
+            yyjson_doc_free(adoc);
+        }
+        free(project);
+        return cbm_mcp_text_result(
+            "paths or scopes is required (arrays; max 128 paths and 32 scopes)", true);
+    }
+
+    cbm_project_t proj = {0};
+    bool have_project = cbm_store_get_project(store, project, &proj) == CBM_STORE_OK;
+    cbm_coverage_meta_t meta = {0};
+    bool have_meta = cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK;
+    bool generation_matches = have_project && have_meta && proj.indexed_at && meta.generation &&
+                              strcmp(proj.indexed_at, meta.generation) == 0;
+    const char *recording_status =
+        have_meta && meta.recording_status ? meta.recording_status : "unknown";
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project);
+    yyjson_mut_obj_add_str(doc, root, "signal", "best_effort");
+    yyjson_mut_obj_add_strcpy(doc, root, "indexed_at",
+                              have_project && proj.indexed_at ? proj.indexed_at : "");
+
+    yyjson_mut_val *meta_obj = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, meta_obj, "generation",
+                              have_meta && meta.generation ? meta.generation : "");
+    yyjson_mut_obj_add_strcpy(doc, meta_obj, "index_mode",
+                              have_meta && meta.index_mode ? meta.index_mode : "unknown");
+    yyjson_mut_obj_add_strcpy(doc, meta_obj, "recorded_at",
+                              have_meta && meta.recorded_at ? meta.recorded_at : "");
+    yyjson_mut_obj_add_strcpy(doc, meta_obj, "recording_status", recording_status);
+    yyjson_mut_obj_add_int(doc, meta_obj, "ignored_files_stored",
+                           have_meta ? meta.ignored_files_stored : 0);
+    yyjson_mut_obj_add_int(doc, meta_obj, "ignored_files_total",
+                           have_meta ? meta.ignored_files_total : 0);
+    yyjson_mut_obj_add_bool(doc, meta_obj, "hash_records_complete",
+                            have_meta && meta.hash_records_complete);
+    yyjson_mut_obj_add_int(doc, meta_obj, "coverage_version",
+                           have_meta ? meta.coverage_version : 0);
+    yyjson_mut_obj_add_bool(doc, meta_obj, "generation_matches", generation_matches);
+    yyjson_mut_obj_add_val(doc, root, "metadata", meta_obj);
+
+    yyjson_mut_val *path_results = yyjson_mut_arr(doc);
+    size_t idx;
+    size_t max;
+    yyjson_val *value;
+    if (paths) {
+        yyjson_arr_foreach(paths, idx, max, value) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            const char *input = yyjson_is_str(value) ? yyjson_get_str(value) : NULL;
+            yyjson_mut_obj_add_strcpy(doc, item, "requested_path", input ? input : "");
+            char rel[CBM_SZ_4K];
+            coverage_path_result_t normalized =
+                coverage_normalize_rel(input, false, rel, sizeof(rel));
+            if (normalized != COVERAGE_PATH_OK) {
+                yyjson_mut_obj_add_str(doc, item, "status",
+                                       normalized == COVERAGE_PATH_OUTSIDE ? "outside_project"
+                                                                           : "invalid_path");
+                yyjson_mut_obj_add_str(doc, item, "freshness", "unavailable");
+                yyjson_mut_obj_add_str(doc, item, "recommended_action",
+                                       "use_project_relative_path");
+                yyjson_mut_arr_add_val(path_results, item);
+                continue;
+            }
+            yyjson_mut_obj_add_strcpy(doc, item, "path", rel);
+            cbm_coverage_row_t *rows = NULL;
+            int row_count = 0;
+            int cov_rc = cbm_store_coverage_get_path(store, project, rel, &rows, &row_count);
+            bool lookup_ok = cov_rc == CBM_STORE_OK || cov_rc == CBM_STORE_NOT_FOUND;
+            if (!lookup_ok) {
+                row_count = 0;
+                yyjson_mut_obj_add_str(doc, item, "coverage_lookup", "error");
+            }
+            bool outside = false;
+            const char *freshness = coverage_path_freshness(
+                store, project, have_project ? proj.root_path : NULL, rel, &outside);
+            const char *status = outside ? "outside_project"
+                                         : coverage_status(rows, row_count, rel, recording_status,
+                                                           generation_matches, lookup_ok);
+            yyjson_mut_obj_add_strcpy(doc, item, "status", status);
+            yyjson_mut_obj_add_strcpy(doc, item, "freshness", freshness);
+            yyjson_mut_obj_add_strcpy(doc, item, "recommended_action",
+                                      coverage_recommended_action(status, freshness));
+            yyjson_mut_val *coverage = yyjson_mut_arr(doc);
+            for (int i = 0; i < row_count; i++) {
+                coverage_add_row_json(doc, coverage, &rows[i], rel);
+            }
+            yyjson_mut_obj_add_val(doc, item, "coverage", coverage);
+            cbm_store_free_coverage(rows, row_count);
+            yyjson_mut_arr_add_val(path_results, item);
+        }
+    }
+    yyjson_mut_obj_add_val(doc, root, "paths", path_results);
+
+    int scope_limit = cbm_mcp_get_int_arg(args, "scope_limit", COVERAGE_SCOPE_DEFAULT_LIMIT);
+    int scope_offset = cbm_mcp_get_int_arg(args, "scope_offset", 0);
+    if (scope_limit < 1) {
+        scope_limit = 1;
+    } else if (scope_limit > COVERAGE_SCOPE_MAX_LIMIT) {
+        scope_limit = COVERAGE_SCOPE_MAX_LIMIT;
+    }
+    if (scope_offset < 0) {
+        scope_offset = 0;
+    }
+    yyjson_mut_val *scope_results = yyjson_mut_arr(doc);
+    if (scopes) {
+        yyjson_arr_foreach(scopes, idx, max, value) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            const char *input = yyjson_is_str(value) ? yyjson_get_str(value) : NULL;
+            yyjson_mut_obj_add_strcpy(doc, item, "requested_scope", input ? input : "");
+            char scope[CBM_SZ_4K];
+            coverage_path_result_t normalized =
+                coverage_normalize_rel(input, true, scope, sizeof(scope));
+            if (normalized != COVERAGE_PATH_OK) {
+                yyjson_mut_obj_add_str(doc, item, "status",
+                                       normalized == COVERAGE_PATH_OUTSIDE ? "outside_project"
+                                                                           : "invalid_path");
+                yyjson_mut_arr_add_val(scope_results, item);
+                continue;
+            }
+            yyjson_mut_obj_add_str(doc, item, "scope", scope[0] ? scope : ".");
+            cbm_coverage_row_t *rows = NULL;
+            int row_count = 0;
+            int cov_rc = cbm_store_coverage_get_scope(store, project, scope, &rows, &row_count);
+            bool lookup_ok = cov_rc == CBM_STORE_OK || cov_rc == CBM_STORE_NOT_FOUND;
+            if (!lookup_ok) {
+                row_count = 0;
+                yyjson_mut_obj_add_str(doc, item, "coverage_lookup", "error");
+            }
+            yyjson_mut_obj_add_int(doc, item, "total", row_count);
+            int start = scope_offset < row_count ? scope_offset : row_count;
+            int end = start + scope_limit < row_count ? start + scope_limit : row_count;
+            yyjson_mut_obj_add_bool(doc, item, "has_more", end < row_count);
+            if (end < row_count) {
+                yyjson_mut_obj_add_int(doc, item, "next_offset", end);
+            }
+            yyjson_mut_val *entries = yyjson_mut_arr(doc);
+            for (int i = start; i < end; i++) {
+                coverage_add_row_json(doc, entries, &rows[i], NULL);
+            }
+            yyjson_mut_obj_add_val(doc, item, "entries", entries);
+            const char *scope_status = !lookup_ok || !generation_matches ? "coverage_unavailable"
+                                       : row_count > 0                   ? "known_gaps"
+                                       : strcmp(recording_status, "complete") == 0
+                                           ? "no_recorded_issue"
+                                           : "coverage_unavailable";
+            yyjson_mut_obj_add_str(doc, item, "status", scope_status);
+            cbm_store_free_coverage(rows, row_count);
+            yyjson_mut_arr_add_val(scope_results, item);
+        }
+    }
+    yyjson_mut_obj_add_val(doc, root, "scopes", scope_results);
+    yyjson_mut_obj_add_str(
+        doc, root, "caveat",
+        "Best-effort signal only. No recorded issue does not prove graph or source completeness; "
+        "read flagged source and qualify claims when metadata is changed or unavailable.");
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    yyjson_doc_free(adoc);
+    if (have_meta) {
+        cbm_store_coverage_meta_clear(&meta);
+    }
+    if (have_project) {
+        safe_str_free(&proj.name);
+        safe_str_free(&proj.indexed_at);
+        safe_str_free(&proj.root_path);
+    }
+    free(project);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
 }
 
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
@@ -5196,7 +6121,8 @@ static void add_snippet_coverage_note(yyjson_mut_doc *doc, yyjson_mut_val *root_
     }
     cbm_coverage_row_t *rows = NULL;
     int count = 0;
-    if (cbm_store_coverage_get(store, node->project, &rows, &count) != CBM_STORE_OK) {
+    if (cbm_store_coverage_get_path(store, node->project, node->file_path, &rows, &count) !=
+        CBM_STORE_OK) {
         return;
     }
     for (int i = 0; i < count; i++) {
@@ -6900,6 +7826,12 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     if (!tool_name) {
         return cbm_mcp_text_result("missing tool name", true);
     }
+    if (srv && !mcp_tool_allowed(srv->tool_profile, tool_name)) {
+        char message[CBM_SZ_256];
+        snprintf(message, sizeof(message), "tool '%s' is not available in the %s tool profile",
+                 tool_name, mcp_tool_profile_name(srv->tool_profile));
+        return cbm_mcp_text_result(message, true);
+    }
 
     if (strcmp(tool_name, "list_projects") == 0) {
         return handle_list_projects(srv, args_json);
@@ -6915,6 +7847,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "index_status") == 0) {
         return handle_index_status(srv, args_json);
+    }
+    if (strcmp(tool_name, "check_index_coverage") == 0) {
+        return handle_check_index_coverage(srv, args_json);
     }
     if (strcmp(tool_name, "delete_project") == 0) {
         return handle_delete_project(srv, args_json);
@@ -7256,27 +8191,31 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     struct timespec req_t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &req_t0);
     char *result_json = NULL;
+    char *request_error_json = NULL;
     bool request_logged = false;
 
     if (strcmp(req.method, "initialize") == 0) {
-        result_json = cbm_mcp_initialize_response(req.params_raw);
-        start_update_check(srv);
+        result_json = cbm_mcp_initialize_response_for_profile(req.params_raw, srv->tool_profile);
         detect_session(srv);
-        maybe_auto_index(srv);
+        if (srv->tool_profile == CBM_MCP_TOOL_PROFILE_ALL) {
+            start_update_check(srv);
+            maybe_auto_index(srv);
+        }
     } else if (strcmp(req.method, "ping") == 0) {
         result_json = heap_strdup("{}");
     } else if (strcmp(req.method, "resources/list") == 0) {
-        /* This server exposes no resources/prompts, but clients (Cline,
-         * others) probe these on connect regardless of declared
-         * capabilities and surface -32601 as a failed connection (#958).
-         * Empty lists are the interoperable answer. */
+        /* This server exposes no resources, but clients probe these on
+         * connect regardless of declared capabilities and surface -32601 as
+         * a failed connection (#958). Empty lists are interoperable. */
         result_json = heap_strdup("{\"resources\":[]}");
     } else if (strcmp(req.method, "resources/templates/list") == 0) {
         result_json = heap_strdup("{\"resourceTemplates\":[]}");
     } else if (strcmp(req.method, "prompts/list") == 0) {
-        result_json = heap_strdup("{\"prompts\":[]}");
+        result_json = cbm_mcp_prompts_list();
+    } else if (strcmp(req.method, "prompts/get") == 0) {
+        result_json = cbm_mcp_prompt_get(req.params_raw, &request_error_json);
     } else if (strcmp(req.method, "tools/list") == 0) {
-        result_json = cbm_mcp_tools_list_page(req.params_raw);
+        result_json = cbm_mcp_tools_list_page(srv->tool_profile, req.params_raw);
     } else if (strcmp(req.method, "tools/call") == 0) {
         char *tool_name = req.params_raw ? cbm_mcp_get_tool_name(req.params_raw) : NULL;
         char *tool_args =
@@ -7321,6 +8260,23 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                            ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
         cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        cbm_jsonrpc_request_free(&req);
+        return err;
+    }
+
+    if (request_error_json) {
+        cbm_jsonrpc_response_t err_resp = {
+            .id = req.id,
+            .id_str = req.id_str,
+            .error_json = request_error_json,
+        };
+        char *err = cbm_jsonrpc_format_response(&err_resp);
+        struct timespec t1;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
+        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
+                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
+        cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        free(request_error_json);
         cbm_jsonrpc_request_free(&req);
         return err;
     }
