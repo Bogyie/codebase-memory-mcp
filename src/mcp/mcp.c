@@ -25,8 +25,10 @@ enum {
     MCP_DEFAULT_DEPTH = 3,
     MCP_DEFAULT_BFS_DEPTH = 2,
     MCP_DEFAULT_LIMIT = 10,
-    MCP_BFS_LIMIT = 100,      /* default per-direction trace budget (limit param raises) */
-    MCP_BFS_LIMIT_MAX = 5000, /* hard ceiling for the limit param (context-bomb guard) */
+    MCP_BFS_LIMIT = 100,            /* default per-direction trace budget (limit param raises) */
+    MCP_BFS_LIMIT_MAX = 5000,       /* hard ceiling for the limit param (context-bomb guard) */
+    MCP_DEFAULT_IMPACT_LIMIT = 200, /* detect_changes per-symbol rows; rollup stays complete */
+    MCP_SNIPPET_MAX_LINES = 500,    /* get_code_snippet line cap (whole-file Module guard) */
     MCP_N_DEFAULTS_2 = 2,
     MCP_URI_PREFIX = 7,      /* strlen("file://") */
     MCP_CONTENT_PREFIX = 15, /* strlen("Content-Length:") */
@@ -519,9 +521,12 @@ static const tool_def_t TOOLS[] = {
      "apps/hoa)\"},"
      "\"aspects\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"all\","
      "\"overview\",\"structure\",\"dependencies\",\"routes\",\"languages\",\"packages\","
-     "\"entry_points\",\"hotspots\",\"boundaries\",\"layers\",\"file_tree\",\"clusters\"]},"
+     "\"entry_points\",\"hotspots\",\"boundaries\",\"layers\",\"file_tree\",\"clusters\","
+     "\"cycles\"]},"
      "\"description\":\"Aspects to include. 'all' = everything; 'overview' = compact summary "
-     "(all except file_tree); omit = all.\"}},\"required\":[\"project\"]}"},
+     "(all except file_tree); omit = all. 'cycles' is opt-in ONLY (never via all/overview): it "
+     "scans the whole call graph for circular CALLS dependencies (SCCs of size > 1).\"}},"
+     "\"required\":[\"project\"]}"},
 
     {"search_code", "Search code",
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
@@ -591,11 +596,28 @@ static const tool_def_t TOOLS[] = {
      "\"required\":[\"project\"],\"anyOf\":[{\"required\":[\"paths\"]},{\"required\":[\"scopes\"]}]"
      "}"},
 
-    {"detect_changes", "Detect changes", "Detect code changes and their impact",
+    {"detect_changes", "Detect changes",
+     "Map a git diff to its BLAST RADIUS. Resolves changed files to the symbols they define, then "
+     "runs ONE multi-source graph traversal to the transitive impact set. RESPONSE: base + "
+     "merge_base SHA, changed_files list, then impacted = prefix-grouped tree rows (name label "
+     "hop; "
+     "full qn = group prefix + dot + name) + an impacted_modules rollup; impacted_total + "
+     "truncated are exact. Seeds (the changed symbols) are excluded from impacted; a changed file "
+     "reached from another changed file is not counted as extra impact. format=\"json\" returns "
+     "the "
+     "same model as structured JSON.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"scope\":{\"type\":"
-     "\"string\"},\"depth\":{\"type\":\"integer\",\"default\":2},\"base_branch\":{\"type\":"
+     "\"string\",\"enum\":[\"files\",\"impact\"],\"description\":\"files: changed files only "
+     "(no traversal). impact (default): files + the transitive impact set.\"},"
+     "\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\",\"both\"],\"default\":"
+     "\"inbound\",\"description\":\"inbound (default) = the blast radius: transitive CALLERS of "
+     "the "
+     "changed symbols. outbound = what the changed code depends on. both = union.\"},"
+     "\"depth\":{\"type\":\"integer\",\"default\":2,\"description\":\"Max traversal hops from the "
+     "changed symbols.\"},\"base_branch\":{\"type\":"
      "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
-     "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Diffs <ref>...HEAD.\"}},"
+     "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Diffs <ref>...HEAD.\"},"
+     "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],\"default\":\"tree\"}},"
      "\"required\":"
      "[\"project\"]}"},
 
@@ -3971,9 +3993,192 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
  * of truth for the server-side validation (authoritative); the JSON-Schema
  * enum in the TOOLS entry above is the advisory client-side mirror — update
  * both together when the aspect set changes. */
-static const char *VALID_ASPECTS[] = {
-    "all",          "overview", "structure",  "dependencies", "routes",    "languages", "packages",
-    "entry_points", "hotspots", "boundaries", "layers",       "file_tree", "clusters",  NULL};
+static const char *VALID_ASPECTS[] = {"all",      "overview",   "structure", "dependencies",
+                                      "routes",   "languages",  "packages",  "entry_points",
+                                      "hotspots", "boundaries", "layers",    "file_tree",
+                                      "clusters", "cycles",     NULL};
+
+/* ── SCC / cycle condensation (get_architecture "cycles") ─────────
+ * Iterative Tarjan over the CALLS call graph. Recursion would overflow on a
+ * large graph, so the DFS state lives on explicit heap stacks. Reports the
+ * strongly-connected components of size > 1 — the circular call dependencies,
+ * the non-trivial content of the condensation quotient. */
+typedef struct {
+    int64_t *ids;  /* sorted unique node ids; index = position */
+    int nverts;    /* |V| */
+    int *adj_head; /* CSR row starts, length nverts+1 */
+    int *adj;      /* CSR column (target vertex indices), length nedges */
+    int nedges;    /* |E| within the vertex set */
+} scc_graph_t;
+
+static int scc_id_index(const int64_t *ids, int n, int64_t id) {
+    int lo = 0;
+    int hi = n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (ids[mid] < id) {
+            lo = mid + 1;
+        } else if (ids[mid] > id) {
+            hi = mid - 1;
+        } else {
+            return mid;
+        }
+    }
+    return -1;
+}
+
+static int cmp_int64(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a;
+    int64_t y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* Build the CSR call graph from parallel (src,tgt) edge arrays. Returns false
+ * on OOM/empty. */
+static bool scc_build(const int64_t *src, const int64_t *tgt, int ecount, scc_graph_t *g) {
+    memset(g, 0, sizeof(*g));
+    if (ecount <= 0) {
+        return false;
+    }
+    int64_t *all = malloc((size_t)ecount * 2 * sizeof(int64_t));
+    if (!all) {
+        return false;
+    }
+    for (int i = 0; i < ecount; i++) {
+        all[2 * i] = src[i];
+        all[2 * i + 1] = tgt[i];
+    }
+    qsort(all, (size_t)ecount * 2, sizeof(int64_t), cmp_int64);
+    int nv = 0;
+    for (int i = 0; i < ecount * 2; i++) {
+        if (i == 0 || all[i] != all[i - 1]) {
+            all[nv++] = all[i];
+        }
+    }
+    g->ids = all;
+    g->nverts = nv;
+    g->adj_head = calloc((size_t)nv + 1, sizeof(int));
+    g->adj = malloc((size_t)ecount * sizeof(int));
+    if (!g->adj_head || !g->adj) {
+        free(g->ids);
+        free(g->adj_head);
+        free(g->adj);
+        memset(g, 0, sizeof(*g));
+        return false;
+    }
+    /* two-pass CSR fill */
+    for (int i = 0; i < ecount; i++) {
+        int u = scc_id_index(g->ids, nv, src[i]);
+        g->adj_head[u + 1]++;
+    }
+    for (int i = 0; i < nv; i++) {
+        g->adj_head[i + 1] += g->adj_head[i];
+    }
+    int *cursor = malloc((size_t)nv * sizeof(int));
+    if (!cursor) {
+        free(g->ids);
+        free(g->adj_head);
+        free(g->adj);
+        memset(g, 0, sizeof(*g));
+        return false;
+    }
+    for (int i = 0; i < nv; i++) {
+        cursor[i] = g->adj_head[i];
+    }
+    for (int i = 0; i < ecount; i++) {
+        int u = scc_id_index(g->ids, nv, src[i]);
+        int v = scc_id_index(g->ids, nv, tgt[i]);
+        g->adj[cursor[u]++] = v;
+    }
+    free(cursor);
+    g->nedges = ecount;
+    return true;
+}
+
+static void scc_free(scc_graph_t *g) {
+    free(g->ids);
+    free(g->adj_head);
+    free(g->adj);
+    memset(g, 0, sizeof(*g));
+}
+
+/* Iterative Tarjan. Fills comp[v] with a component id; components are numbered
+ * in discovery order. Returns the component count, or -1 on OOM. */
+static int scc_tarjan(const scc_graph_t *g, int *comp) {
+    enum { SCC_UNVISITED = -1 };
+    int nv = g->nverts;
+    int *index = malloc((size_t)nv * sizeof(int));
+    int *low = malloc((size_t)nv * sizeof(int));
+    bool *on_stack = calloc((size_t)nv, sizeof(bool));
+    int *tstack = malloc((size_t)nv * sizeof(int)); /* Tarjan's node stack */
+    int *dfs_v = malloc((size_t)nv * sizeof(int));  /* explicit DFS: vertex */
+    int *dfs_i = malloc((size_t)nv * sizeof(int));  /* explicit DFS: adj cursor */
+    if (!index || !low || !on_stack || !tstack || !dfs_v || !dfs_i) {
+        free(index);
+        free(low);
+        free(on_stack);
+        free(tstack);
+        free(dfs_v);
+        free(dfs_i);
+        return -1;
+    }
+    for (int i = 0; i < nv; i++) {
+        index[i] = SCC_UNVISITED;
+        comp[i] = SCC_UNVISITED;
+    }
+    int counter = 0;
+    int tsp = 0;   /* Tarjan stack pointer */
+    int ncomp = 0; /* component id allocator */
+    for (int s = 0; s < nv; s++) {
+        if (index[s] != SCC_UNVISITED) {
+            continue;
+        }
+        int dsp = 0; /* DFS stack pointer */
+        dfs_v[dsp] = s;
+        dfs_i[dsp] = g->adj_head[s];
+        index[s] = low[s] = counter++;
+        tstack[tsp++] = s;
+        on_stack[s] = true;
+        while (dsp >= 0) {
+            int v = dfs_v[dsp];
+            if (dfs_i[dsp] < g->adj_head[v + 1]) {
+                int w = g->adj[dfs_i[dsp]++];
+                if (index[w] == SCC_UNVISITED) {
+                    index[w] = low[w] = counter++;
+                    tstack[tsp++] = w;
+                    on_stack[w] = true;
+                    dsp++;
+                    dfs_v[dsp] = w;
+                    dfs_i[dsp] = g->adj_head[w];
+                } else if (on_stack[w] && index[w] < low[v]) {
+                    low[v] = index[w];
+                }
+            } else {
+                /* v fully explored: it is a root iff low==index -> pop an SCC */
+                if (low[v] == index[v]) {
+                    int w;
+                    do {
+                        w = tstack[--tsp];
+                        on_stack[w] = false;
+                        comp[w] = ncomp;
+                    } while (w != v);
+                    ncomp++;
+                }
+                dsp--;
+                if (dsp >= 0 && low[v] < low[dfs_v[dsp]]) {
+                    low[dfs_v[dsp]] = low[v];
+                }
+            }
+        }
+    }
+    free(index);
+    free(low);
+    free(on_stack);
+    free(tstack);
+    free(dfs_v);
+    free(dfs_i);
+    return ncomp;
+}
 
 static bool aspect_is_valid(const char *name) {
     if (!name) {
@@ -3990,6 +4195,25 @@ static bool aspect_is_valid(const char *name) {
 /* Check if an aspect is requested. NULL aspects = all. The array can contain
  * "all" (everything), "overview" (everything except file_tree — see
  * cbm_store_arch_aspect_in_overview in store.c), or the aspect name itself. */
+/* True ONLY when `name` is explicitly present in the aspects array — never via
+ * the no-filter default, "all", or "overview". For expensive opt-in aspects
+ * (cycles scans the whole call graph) that must not run on a bare call. */
+static bool aspect_explicitly_named(yyjson_val *aspects_arr, const char *name) {
+    if (!aspects_arr) {
+        return false;
+    }
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(aspects_arr, &iter);
+    yyjson_val *val;
+    while ((val = yyjson_arr_iter_next(&iter)) != NULL) {
+        const char *s = yyjson_get_str(val);
+        if (s && strcmp(s, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool aspect_wanted(yyjson_doc *aspects_doc, yyjson_val *aspects_arr, const char *name) {
     if (!aspects_arr) {
         return true; /* no filter = all */
@@ -4053,6 +4277,136 @@ static void arch_join_list(char *buf, size_t sz, const char **items, int n) {
         }
         pos += (size_t)w;
     }
+}
+
+/* Compute the circular-dependency SCCs (size > 1) of the CALLS graph. Returns
+ * a malloc'd array of components, each a malloc'd int64 array of member node
+ * ids, with sizes in *out_sizes and count in *out_ncycles; sets *scanned_edges
+ * and *edges_truncated. Caller frees each component + the arrays. Returns
+ * CBM_STORE_OK, or CBM_STORE_ERR on failure (all outs zeroed). */
+enum { ARCH_SCC_MAX_EDGES = 400000, ARCH_SCC_MAX_CYCLES = 100, ARCH_SCC_MEMBERS_SHOWN = 20 };
+
+static int arch_compute_cycles(cbm_store_t *store, const char *project, int64_t ***out_members,
+                               int **out_sizes, int *out_ncycles, int *scanned_edges,
+                               bool *edges_truncated) {
+    *out_members = NULL;
+    *out_sizes = NULL;
+    *out_ncycles = 0;
+    *scanned_edges = 0;
+    *edges_truncated = false;
+
+    int64_t *src = NULL;
+    int64_t *tgt = NULL;
+    int ecount = 0;
+    if (cbm_store_fetch_call_edges(store, project, ARCH_SCC_MAX_EDGES, &src, &tgt, &ecount,
+                                   edges_truncated) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    *scanned_edges = ecount;
+    scc_graph_t g;
+    if (!scc_build(src, tgt, ecount, &g)) {
+        free(src);
+        free(tgt);
+        return CBM_STORE_OK; /* no edges = no cycles, not an error */
+    }
+    free(src);
+    free(tgt);
+
+    int *comp = malloc((size_t)g.nverts * sizeof(int));
+    if (!comp) {
+        scc_free(&g);
+        return CBM_STORE_ERR;
+    }
+    int ncomp = scc_tarjan(&g, comp);
+    if (ncomp < 0) {
+        free(comp);
+        scc_free(&g);
+        return CBM_STORE_ERR;
+    }
+    /* size per component */
+    int *csize = calloc((size_t)ncomp, sizeof(int));
+    if (!csize) {
+        free(comp);
+        scc_free(&g);
+        return CBM_STORE_ERR;
+    }
+    for (int v = 0; v < g.nverts; v++) {
+        csize[comp[v]]++;
+    }
+    /* collect components with size > 1 (the cycles) */
+    int ncyc = 0;
+    for (int c = 0; c < ncomp; c++) {
+        if (csize[c] > 1) {
+            ncyc++;
+        }
+    }
+    if (ncyc > ARCH_SCC_MAX_CYCLES) {
+        ncyc = ARCH_SCC_MAX_CYCLES;
+    }
+    int64_t **members = ncyc > 0 ? calloc((size_t)ncyc, sizeof(int64_t *)) : NULL;
+    int *sizes = ncyc > 0 ? calloc((size_t)ncyc, sizeof(int)) : NULL;
+    /* map component id -> output slot (only for the first ARCH_SCC_MAX_CYCLES
+     * size>1 comps, in component-id order) */
+    int *slot = malloc((size_t)ncomp * sizeof(int));
+    if ((ncyc > 0 && (!members || !sizes)) || !slot) {
+        free(members);
+        free(sizes);
+        free(slot);
+        free(csize);
+        free(comp);
+        scc_free(&g);
+        return CBM_STORE_ERR;
+    }
+    int next_slot = 0;
+    for (int c = 0; c < ncomp; c++) {
+        if (csize[c] > 1 && next_slot < ncyc) {
+            slot[c] = next_slot;
+            sizes[next_slot] = csize[c];
+            members[next_slot] = malloc((size_t)csize[c] * sizeof(int64_t));
+            next_slot++;
+        } else {
+            slot[c] = -1;
+        }
+    }
+    int *fill = calloc((size_t)ncyc, sizeof(int));
+    if (ncyc > 0 && !fill) {
+        for (int i = 0; i < ncyc; i++) {
+            free(members[i]);
+        }
+        free(members);
+        free(sizes);
+        free(slot);
+        free(csize);
+        free(comp);
+        scc_free(&g);
+        return CBM_STORE_ERR;
+    }
+    for (int v = 0; v < g.nverts; v++) {
+        int sl = slot[comp[v]];
+        if (sl >= 0) {
+            members[sl][fill[sl]++] = g.ids[v];
+        }
+    }
+    free(fill);
+    free(slot);
+    free(csize);
+    free(comp);
+    scc_free(&g);
+    *out_members = members;
+    *out_sizes = sizes;
+    *out_ncycles = ncyc;
+    return CBM_STORE_OK;
+}
+
+/* Fetch the qualified_name for a node id, or a "#<id>" fallback. */
+static void arch_node_qn(cbm_store_t *store, int64_t id, char *out, size_t outsz) {
+    cbm_node_t n = {0};
+    if (cbm_store_find_node_by_id(store, id, &n) == CBM_STORE_OK && n.qualified_name) {
+        snprintf(out, outsz, "%s", n.qualified_name);
+    } else {
+        snprintf(out, outsz, "#%lld", (long long)id);
+    }
+    free_node_contents(&n);
 }
 
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
@@ -4354,6 +4708,49 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
             }
         }
 
+        /* cycles: circular CALLS dependencies (SCCs of size > 1) — opt-in, it
+         * scans the whole call graph. A quotient/condensation view. */
+        if (aspect_explicitly_named(aspects_arr, "cycles")) {
+            int64_t **members = NULL;
+            int *sizes = NULL;
+            int ncyc = 0;
+            int scanned = 0;
+            bool etrunc = false;
+            if (arch_compute_cycles(store, project, &members, &sizes, &ncyc, &scanned, &etrunc) ==
+                CBM_STORE_OK) {
+                cbm_tree_scalar_int(&sb, "call_edges_scanned", scanned);
+                if (etrunc) {
+                    cbm_tree_scalar_bool(&sb, "cycles_partial", true);
+                    cbm_tree_scalar_str(&sb, "cycles_hint",
+                                        "call graph exceeded the scan budget; cycle list may be "
+                                        "incomplete");
+                }
+                char hdr[CBM_SZ_128];
+                snprintf(hdr, sizeof(hdr),
+                         "cycles: %d  (rows: size members; circular CALLS dependencies)\n", ncyc);
+                cbm_sb_append(&sb, hdr);
+                for (int c = 0; c < ncyc; c++) {
+                    char row[CBM_SZ_2K];
+                    int off = snprintf(row, sizeof(row), "  %d ", sizes[c]);
+                    bool clipped = sizes[c] > ARCH_SCC_MEMBERS_SHOWN;
+                    int show = clipped ? ARCH_SCC_MEMBERS_SHOWN : sizes[c];
+                    for (int m = 0; m < show && off < (int)sizeof(row) - 2; m++) {
+                        char qn[CBM_SZ_512];
+                        arch_node_qn(store, members[c][m], qn, sizeof(qn));
+                        off += snprintf(row + off, sizeof(row) - off, "%s%s", m ? ";" : "", qn);
+                    }
+                    if (clipped && off < (int)sizeof(row) - 8) {
+                        snprintf(row + off, sizeof(row) - off, ";+%d", sizes[c] - show);
+                    }
+                    cbm_sb_append(&sb, row);
+                    cbm_sb_append(&sb, "\n");
+                    free(members[c]);
+                }
+                free(members);
+                free(sizes);
+            }
+        }
+
         cbm_store_architecture_free(&arch);
         cbm_store_schema_free(&schema);
         if (aspects_doc) {
@@ -4595,6 +4992,38 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
 
     append_cross_repo_summary(doc, root, &schema);
+
+    /* cycles: SCCs of size > 1 in the CALLS graph (same model as tree). */
+    if (aspect_explicitly_named(aspects_arr, "cycles")) {
+        int64_t **members = NULL;
+        int *sizes = NULL;
+        int ncyc = 0;
+        int scanned = 0;
+        bool etrunc = false;
+        if (arch_compute_cycles(store, project, &members, &sizes, &ncyc, &scanned, &etrunc) ==
+            CBM_STORE_OK) {
+            yyjson_mut_obj_add_int(doc, root, "call_edges_scanned", scanned);
+            yyjson_mut_obj_add_bool(doc, root, "cycles_partial", etrunc);
+            yyjson_mut_val *cyc = yyjson_mut_arr(doc);
+            for (int c = 0; c < ncyc; c++) {
+                yyjson_mut_val *o = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_int(doc, o, "size", sizes[c]);
+                yyjson_mut_val *mem = yyjson_mut_arr(doc);
+                int show = sizes[c] < ARCH_SCC_MEMBERS_SHOWN ? sizes[c] : ARCH_SCC_MEMBERS_SHOWN;
+                for (int m = 0; m < show; m++) {
+                    char qn[CBM_SZ_512];
+                    arch_node_qn(store, members[c][m], qn, sizeof(qn));
+                    yyjson_mut_arr_add_strcpy(doc, mem, qn);
+                }
+                yyjson_mut_obj_add_val(doc, o, "members", mem);
+                yyjson_mut_arr_add_val(cyc, o);
+                free(members[c]);
+            }
+            yyjson_mut_obj_add_val(doc, root, "cycles", cyc);
+            free(members);
+            free(sizes);
+        }
+    }
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
@@ -6798,6 +7227,16 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 
     int start = node->start_line > 0 ? node->start_line : SKIP_ONE;
     int end = node->end_line > start ? node->end_line : start + SNIPPET_DEFAULT_LINES;
+    /* Context-bomb guard: a structural node (Module/File) spans its whole file,
+     * so an unclipped read returned the ENTIRE source — a field-eval agent that
+     * fell back to a Module snippet pulled 400KB in one call. Cap the line span
+     * (far above any real function) and flag it; the exact range is still in
+     * start_line/end_line for a targeted re-read. */
+    bool snippet_clipped = false;
+    if (end - start + 1 > MCP_SNIPPET_MAX_LINES) {
+        end = start + MCP_SNIPPET_MAX_LINES - 1;
+        snippet_clipped = true;
+    }
     char *abs_path = NULL;
     char *source = resolve_snippet_source(root_path, node->file_path, start, end, &abs_path);
 
@@ -6819,6 +7258,10 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_mut_obj_add_str(doc, root_obj, "file_path", display_path);
     yyjson_mut_obj_add_int(doc, root_obj, "start_line", start);
     yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
+    if (snippet_clipped) {
+        yyjson_mut_obj_add_bool(doc, root_obj, "source_clipped", true);
+        yyjson_mut_obj_add_int(doc, root_obj, "clipped_at_lines", MCP_SNIPPET_MAX_LINES);
+    }
 
     if (source) {
         char *safe_source = sanitize_utf8_lossy(source);
@@ -8062,23 +8505,99 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── detect_changes ───────────────────────────────────────────── */
 
-/* Find symbols defined in a file and add them to the impacted array. */
-static void detect_add_impacted_symbols(cbm_store_t *store, const char *project, const char *file,
-                                        yyjson_mut_doc *doc, yyjson_mut_val *impacted) {
+/* Collect BFS seed ids: every symbol DEFINED in a changed file (everything but
+ * the structural container labels — those have no CALLS edges). These anchor
+ * the multi-source impact traversal. */
+static void detect_collect_seeds(cbm_store_t *store, const char *project, const char *file,
+                                 int64_t **seeds, int *n, int *cap) {
     cbm_node_t *nodes = NULL;
     int ncount = 0;
     cbm_store_find_nodes_by_file(store, project, file, &nodes, &ncount);
     for (int i = 0; i < ncount; i++) {
-        if (nodes[i].label && strcmp(nodes[i].label, "File") != 0 &&
-            strcmp(nodes[i].label, "Folder") != 0 && strcmp(nodes[i].label, "Project") != 0) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_strcpy(doc, item, "name", nodes[i].name ? nodes[i].name : "");
-            yyjson_mut_obj_add_strcpy(doc, item, "label", nodes[i].label);
-            yyjson_mut_obj_add_strcpy(doc, item, "file", file);
-            yyjson_mut_arr_add_val(impacted, item);
+        const char *lb = nodes[i].label;
+        if (lb && strcmp(lb, "File") != 0 && strcmp(lb, "Folder") != 0 &&
+            strcmp(lb, "Project") != 0 && strcmp(lb, "Module") != 0 && strcmp(lb, "Package") != 0 &&
+            strcmp(lb, "Section") != 0) {
+            if (*n >= *cap) {
+                *cap = *cap ? *cap * 2 : 16;
+                *seeds = safe_realloc(*seeds, (size_t)*cap * sizeof(int64_t));
+            }
+            (*seeds)[(*n)++] = nodes[i].id;
         }
     }
     cbm_store_free_nodes(nodes, ncount);
+}
+
+/* Module key for the impacted rollup = the first TWO path segments
+ * ("src/mcp/mcp.c" -> "src/mcp"), a quotient of the blast radius coarse enough
+ * to fit yet specific enough to localize (one segment collapses a whole tree
+ * to "src"). Falls back to one segment, then the whole path. */
+static void detect_module_of(const char *file, char *out, size_t outsz) {
+    if (!file || !file[0]) {
+        snprintf(out, outsz, "(root)");
+        return;
+    }
+    const char *s1 = strchr(file, '/');
+    if (!s1) {
+        snprintf(out, outsz, "%s", file);
+        return;
+    }
+    const char *s2 = strchr(s1 + 1, '/');
+    size_t len = s2 ? (size_t)(s2 - file) : strlen(file);
+    if (len >= outsz) {
+        len = outsz - 1;
+    }
+    memcpy(out, file, len);
+    out[len] = '\0';
+}
+
+/* Emit the impacted set as a grouped tree leg: rows grouped under their shared
+ * (qn-prefix, file), `name label hop` per row. At most `limit` rows are listed
+ * (the visited array is hop-ordered, so the closest — highest-signal — impact
+ * shows first); impacted_total always carries the exact full count, and
+ * `impacted_shown < impacted_total` is the honest truncation signal. The
+ * module rollup (emitted by the caller) stays complete regardless. */
+static void detect_emit_impacted_tree(cbm_sb_t *sb, cbm_traverse_result_t *tr, int limit) {
+    cbm_tree_scalar_int(sb, "impacted_total", tr->visited_count);
+    int shown = tr->visited_count < limit ? tr->visited_count : limit;
+    /* qn order for stable grouping, but keep hop-closeness: sort by (hop) is
+     * lost under qn sort, so group AFTER selecting the nearest `shown` rows —
+     * the visited array is already (hop,id)-ordered from the BFS. */
+    char hdr[CBM_SZ_128];
+    snprintf(hdr, sizeof(hdr),
+             "impacted_shown: %d\nimpacted: %d  (rows: name label hop; qn = group prefix + \".\" "
+             "+ name; nearest hops first)\n",
+             shown, shown);
+    cbm_sb_append(sb, hdr);
+    if (shown > 1) {
+        qsort(tr->visited, (size_t)shown, sizeof(cbm_node_hop_t), tree_hop_cmp_qn);
+    }
+    char cur_group[CBM_SZ_1K] = "";
+    for (int i = 0; i < shown; i++) {
+        const char *qn =
+            tr->visited[i].node.qualified_name ? tr->visited[i].node.qualified_name : "";
+        const char *file = tr->visited[i].node.file_path ? tr->visited[i].node.file_path : "";
+        size_t plen = sg_qn_prefix_len(qn);
+        char group[CBM_SZ_1K];
+        snprintf(group, sizeof(group), "%.*s (%s)", (int)plen, qn, file);
+        if (strcmp(group, cur_group) != 0) {
+            snprintf(cur_group, sizeof(cur_group), "%s", group);
+            cbm_sb_append(sb, group);
+            cbm_sb_append(sb, ":\n");
+        }
+        char row[CBM_SZ_512];
+        snprintf(row, sizeof(row), "  %s %s %d\n", plen ? qn + plen + 1 : qn,
+                 tr->visited[i].node.label ? tr->visited[i].node.label : "", tr->visited[i].hop);
+        cbm_sb_append(sb, row);
+    }
+    if (shown < tr->visited_count) {
+        char more[CBM_SZ_256];
+        snprintf(more, sizeof(more),
+                 "impacted_omitted: %d  (see impacted_modules for the full rollup; raise 'limit' "
+                 "or lower 'depth' to see specifics)\n",
+                 tr->visited_count - shown);
+        cbm_sb_append(sb, more);
+    }
 }
 
 static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
@@ -8178,19 +8697,45 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result(errmsg, true);
     }
 
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root_obj);
-
-    yyjson_mut_val *changed = yyjson_mut_arr(doc);
-    yyjson_mut_val *impacted = yyjson_mut_arr(doc);
-
     /* resolve_store already called via get_project_root above */
     cbm_store_t *store = srv->store;
 
-    char line[CBM_SZ_1K];
-    int file_count = 0;
+    /* Direction of impact. Default inbound = the BLAST RADIUS: the transitive
+     * CALLERS of the changed symbols, which may need review. outbound = what
+     * the changed code depends on; both = union. */
+    char *direction = cbm_mcp_get_string_arg(args, "direction");
+    if (!direction) {
+        direction = heap_strdup("inbound");
+    }
+    if (strcmp(direction, "inbound") != 0 && strcmp(direction, "outbound") != 0 &&
+        strcmp(direction, "both") != 0) {
+        free(direction);
+        direction = heap_strdup("inbound");
+    }
+    char *fmt = cbm_mcp_get_string_arg(args, "format");
+    bool legacy_json = fmt && strcmp(fmt, "json") == 0;
+    free(fmt);
 
+    /* Per-symbol impacted-row display cap (the module rollup stays complete).
+     * impacted_total always reports the true count, so this never hides scale. */
+    int imp_limit = cbm_mcp_get_int_arg(args, "limit", MCP_DEFAULT_IMPACT_LIMIT);
+    if (imp_limit < 1) {
+        imp_limit = 1;
+    }
+    if (imp_limit > MCP_BFS_LIMIT_MAX) {
+        imp_limit = MCP_BFS_LIMIT_MAX;
+    }
+
+    /* Collect changed file paths into a C array (drives seeds, the rollup, and
+     * both output encodings). */
+    char **files = NULL;
+    int file_count = 0;
+    int file_cap = 0;
+    int64_t *seeds = NULL;
+    int seed_count = 0;
+    int seed_cap = 0;
+
+    char line[CBM_SZ_1K];
     while (fgets(line, sizeof(line), fp)) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
@@ -8199,59 +8744,213 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         if (len == 0) {
             continue;
         }
-
-        /* `git status --porcelain` prefixes each path with a two-character
-         * status code and a space ("?? path", "A  path", " M path"). The two
-         * `git diff --name-only` sources emit bare paths. Strip the porcelain
-         * prefix when present so all three sources yield clean paths; for a
-         * rename ("R  old -> new") keep the post-arrow destination path. */
+        /* Strip the `git status --porcelain` 2-char code + space; for a rename
+         * ("R  old -> new") keep the destination path. */
         char *path_line = line;
         if (len > PAIR_LEN && line[PAIR_LEN] == ' ' && strchr(" MADRCU?!", line[0]) &&
             strchr(" MADRCU?!", line[1])) {
             path_line = line + PAIR_LEN + SKIP_ONE;
             char *arrow = strstr(path_line, " -> ");
             if (arrow) {
-                enum { ARROW_LEN = 4 }; /* length of " -> " */
+                enum { ARROW_LEN = 4 };
                 path_line = arrow + ARROW_LEN;
             }
         }
         if (path_line[0] == '\0') {
             continue;
         }
-
-        yyjson_mut_arr_add_strcpy(doc, changed, path_line);
-        file_count++;
-
+        /* Dedup: the three git sources are sorted+unioned on POSIX but not on
+         * Windows (separate commands), and a path can repeat. */
+        bool dup = false;
+        for (int i = 0; i < file_count; i++) {
+            if (strcmp(files[i], path_line) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        if (file_count >= file_cap) {
+            file_cap = file_cap ? file_cap * 2 : 16;
+            files = safe_realloc(files, (size_t)file_cap * sizeof(char *));
+        }
+        files[file_count++] = heap_strdup(path_line);
         if (want_symbols) {
-            detect_add_impacted_symbols(store, project, path_line, doc, impacted);
+            detect_collect_seeds(store, project, path_line, &seeds, &seed_count, &seed_cap);
         }
     }
     int git_status = cbm_pclose(fp);
 
-    bool is_error = false;
-    if (git_status != 0 && file_count == 0) {
-        char hint_buf[CBM_SZ_256];
-        snprintf(hint_buf, sizeof(hint_buf),
-                 "git diff exited with status %d. Check that branch '%s' exists.", git_status,
+    /* merge-base SHA: the exact commit the diff is measured against, so the
+     * result is reproducible even as base_branch advances. Best-effort. */
+    char merge_base[64] = "";
+    {
+        char mbcmd[CBM_SZ_2K];
+#ifdef _WIN32
+        snprintf(mbcmd, sizeof(mbcmd), "git -C \"%s\" merge-base \"%s\" HEAD 2>NUL", root_path,
                  base_branch);
-        yyjson_mut_obj_add_strcpy(doc, root_obj, "hint", hint_buf);
-        is_error = true;
+#else
+        snprintf(mbcmd, sizeof(mbcmd), "git -C '%s' merge-base '%s' HEAD 2>/dev/null", root_path,
+                 base_branch);
+#endif
+        FILE *mbfp = cbm_popen(mbcmd, "r");
+        if (mbfp) {
+            if (fgets(merge_base, sizeof(merge_base), mbfp)) {
+                size_t l = strlen(merge_base);
+                while (l > 0 && (merge_base[l - 1] == '\n' || merge_base[l - 1] == '\r')) {
+                    merge_base[--l] = '\0';
+                }
+            }
+            (void)cbm_pclose(mbfp);
+        }
     }
 
-    yyjson_mut_obj_add_val(doc, root_obj, "changed_files", changed);
-    yyjson_mut_obj_add_int(doc, root_obj, "changed_count", file_count);
-    yyjson_mut_obj_add_val(doc, root_obj, "impacted_symbols", impacted);
-    yyjson_mut_obj_add_int(doc, root_obj, "depth", depth);
+    /* The impact traversal: ONE multi-source BFS over all seeds. */
+    cbm_traverse_result_t impact = {0};
+    bool truncated = false;
+    if (want_symbols && seed_count > 0) {
+        (void)cbm_store_bfs_multi(store, seeds, seed_count, direction, NULL, 0, depth,
+                                  MCP_BFS_LIMIT_MAX, &impact, &truncated);
+    }
 
-    char *json = yy_doc_to_str(doc);
-    yyjson_mut_doc_free(doc);
+    bool is_error = (git_status != 0 && file_count == 0);
+    char *out_str = NULL;
+
+    if (!legacy_json) {
+        cbm_sb_t sb;
+        cbm_sb_init(&sb);
+        cbm_tree_scalar_str(&sb, "base", base_branch);
+        if (merge_base[0]) {
+            cbm_tree_scalar_str(&sb, "merge_base", merge_base);
+        }
+        cbm_tree_scalar_str(&sb, "direction", direction);
+        if (is_error) {
+            char hint_buf[CBM_SZ_256];
+            snprintf(hint_buf, sizeof(hint_buf),
+                     "git diff exited with status %d. Check that branch '%s' exists.", git_status,
+                     base_branch);
+            cbm_tree_scalar_str(&sb, "hint", hint_buf);
+        }
+        /* changed files (the git result) */
+        char cf[CBM_SZ_64];
+        snprintf(cf, sizeof(cf), "changed_files: %d\n", file_count);
+        cbm_sb_append(&sb, cf);
+        for (int i = 0; i < file_count; i++) {
+            cbm_sb_append(&sb, "  ");
+            cbm_sb_append(&sb, files[i]);
+            cbm_sb_append(&sb, "\n");
+        }
+        cbm_tree_scalar_int(&sb, "seed_symbols", seed_count);
+        if (want_symbols) {
+            detect_emit_impacted_tree(&sb, &impact, imp_limit);
+            /* module rollup: a quotient view of the blast radius */
+            if (impact.visited_count > 0) {
+                cbm_sb_append(&sb, "impacted_modules: (rows: module count)\n");
+                enum { MODCAP = 256 };
+                char mods[MODCAP][CBM_SZ_128];
+                int mcnt[MODCAP];
+                int nmods = 0;
+                int overflow = 0; /* symbols whose module didn't fit MODCAP */
+                for (int i = 0; i < impact.visited_count; i++) {
+                    char m[CBM_SZ_128];
+                    detect_module_of(impact.visited[i].node.file_path, m, sizeof(m));
+                    int j = 0;
+                    for (; j < nmods; j++) {
+                        if (strcmp(mods[j], m) == 0) {
+                            mcnt[j]++;
+                            break;
+                        }
+                    }
+                    if (j == nmods) {
+                        if (nmods < MODCAP) {
+                            snprintf(mods[nmods], sizeof(mods[nmods]), "%s", m);
+                            mcnt[nmods] = 1;
+                            nmods++;
+                        } else {
+                            overflow++; /* never silently dropped — surfaced below */
+                        }
+                    }
+                }
+                for (int j = 0; j < nmods; j++) {
+                    char mrow[CBM_SZ_256];
+                    snprintf(mrow, sizeof(mrow), "  %s %d\n", mods[j], mcnt[j]);
+                    cbm_sb_append(&sb, mrow);
+                }
+                if (overflow > 0) {
+                    char orow[CBM_SZ_128];
+                    snprintf(orow, sizeof(orow), "  (other) %d\n", overflow);
+                    cbm_sb_append(&sb, orow);
+                }
+            }
+            if (truncated) {
+                cbm_tree_scalar_bool(&sb, "truncated", true);
+                cbm_tree_scalar_str(&sb, "hint",
+                                    "impact hit the safety ceiling — narrow with a lower "
+                                    "'depth' or a smaller diff");
+            }
+        }
+        out_str = cbm_sb_finish(&sb);
+    } else {
+        /* format:"json" = json-stringified tree: same model, structured. */
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root_obj);
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "base", base_branch);
+        if (merge_base[0]) {
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "merge_base", merge_base);
+        }
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "direction", direction);
+        yyjson_mut_val *cf = yyjson_mut_arr(doc);
+        for (int i = 0; i < file_count; i++) {
+            yyjson_mut_arr_add_strcpy(doc, cf, files[i]);
+        }
+        yyjson_mut_obj_add_val(doc, root_obj, "changed_files", cf);
+        yyjson_mut_obj_add_int(doc, root_obj, "seed_symbols", seed_count);
+        yyjson_mut_obj_add_int(doc, root_obj, "impacted_total", impact.visited_count);
+        int imp_shown = impact.visited_count < imp_limit ? impact.visited_count : imp_limit;
+        yyjson_mut_obj_add_int(doc, root_obj, "impacted_shown", imp_shown);
+        yyjson_mut_val *imp = yyjson_mut_arr(doc);
+        for (int i = 0; i < imp_shown; i++) {
+            yyjson_mut_val *o = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(
+                doc, o, "qn",
+                impact.visited[i].node.qualified_name ? impact.visited[i].node.qualified_name : "");
+            yyjson_mut_obj_add_strcpy(
+                doc, o, "label", impact.visited[i].node.label ? impact.visited[i].node.label : "");
+            yyjson_mut_obj_add_strcpy(
+                doc, o, "file",
+                impact.visited[i].node.file_path ? impact.visited[i].node.file_path : "");
+            yyjson_mut_obj_add_int(doc, o, "hop", impact.visited[i].hop);
+            yyjson_mut_arr_add_val(imp, o);
+        }
+        yyjson_mut_obj_add_val(doc, root_obj, "impacted", imp);
+        yyjson_mut_obj_add_bool(doc, root_obj, "truncated", truncated);
+        if (is_error) {
+            char hint_buf[CBM_SZ_256];
+            snprintf(hint_buf, sizeof(hint_buf),
+                     "git diff exited with status %d. Check that branch '%s' exists.", git_status,
+                     base_branch);
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "hint", hint_buf);
+        }
+        out_str = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+    }
+
+    cbm_store_traverse_free(&impact);
+    for (int i = 0; i < file_count; i++) {
+        free(files[i]);
+    }
+    free(files);
+    free(seeds);
+    free(direction);
     free(root_path);
     free(project);
     free(base_branch);
     free(scope);
 
-    char *result = cbm_mcp_text_result(json, is_error);
-    free(json);
+    char *result = cbm_mcp_text_result(out_str, is_error);
+    free(out_str);
     return result;
 }
 
