@@ -1018,19 +1018,52 @@ static bool main_resolve_executable(const char *argv0, char out[MAIN_PATH_CAP]) 
            cbm_canonical_path(resolved, out, MAIN_PATH_CAP);
 }
 
-static bool main_build_identity(cbm_daemon_build_identity_t *identity) {
-    if (!identity || !cbm_index_supervisor_capture_build_fingerprint()) {
-        return false;
+typedef enum {
+    MAIN_BUILD_IDENTITY_OK = 0,
+    MAIN_BUILD_IDENTITY_INVALID_OUTPUT,
+    MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT,
+    MAIN_BUILD_IDENTITY_CACHE_RESOLVE,
+    MAIN_BUILD_IDENTITY_CACHE_CANONICALIZE,
+    MAIN_BUILD_IDENTITY_CACHE_PRIVATE,
+    MAIN_BUILD_IDENTITY_CACHE_ENVIRONMENT,
+} main_build_identity_status_t;
+
+static const char *main_build_identity_status_name(main_build_identity_status_t status) {
+    switch (status) {
+    case MAIN_BUILD_IDENTITY_OK:
+        return "ok";
+    case MAIN_BUILD_IDENTITY_INVALID_OUTPUT:
+        return "identity-output";
+    case MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT:
+        return "process-fingerprint";
+    case MAIN_BUILD_IDENTITY_CACHE_RESOLVE:
+        return "cache-resolve";
+    case MAIN_BUILD_IDENTITY_CACHE_CANONICALIZE:
+        return "cache-canonicalize";
+    case MAIN_BUILD_IDENTITY_CACHE_PRIVATE:
+        return "cache-private";
+    case MAIN_BUILD_IDENTITY_CACHE_ENVIRONMENT:
+        return "cache-environment";
+    }
+    return "identity-unknown";
+}
+
+static main_build_identity_status_t main_build_identity(cbm_daemon_build_identity_t *identity) {
+    if (!identity) {
+        return MAIN_BUILD_IDENTITY_INVALID_OUTPUT;
+    }
+    if (!cbm_index_supervisor_capture_build_fingerprint()) {
+        return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
     }
     const char *fingerprint = cbm_index_supervisor_build_fingerprint();
     if (!fingerprint) {
-        return false;
+        return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
     }
     const char *cache = cbm_resolve_cache_dir();
     char canonical_cache[MAIN_PATH_CAP];
     static char cache_fingerprint[CBM_SHA256_HEX_LEN + 1];
     if (!cache || !cache[0]) {
-        return false;
+        return MAIN_BUILD_IDENTITY_CACHE_RESOLVE;
     }
     /* Preserve one intentional alias spelling at the process boundary: an
      * existing directory (including a symlink supplied by the user) is
@@ -1043,7 +1076,7 @@ static bool main_build_identity(cbm_daemon_build_identity_t *identity) {
         cache_ready = cbm_canonical_path(cache, canonical_cache, sizeof(canonical_cache));
     }
     if (!cache_ready || !cbm_is_dir(canonical_cache)) {
-        return false;
+        return MAIN_BUILD_IDENTITY_CACHE_CANONICALIZE;
     }
     cbm_normalize_path_sep(canonical_cache);
     /* Admission is account-scoped, so its storage authority must be too.
@@ -1052,14 +1085,14 @@ static bool main_build_identity(cbm_daemon_build_identity_t *identity) {
      * the v1 threat boundary; cross-account and unsafe filesystem states fail
      * here before any daemon/cohort state is opened. */
     if (!cbm_daemon_ipc_private_directory_secure(canonical_cache)) {
-        return false;
+        return MAIN_BUILD_IDENTITY_CACHE_PRIVATE;
     }
     /* Every cache consumer in this process must use the exact path whose
      * fingerprint joins the account-wide cohort. Keeping an original symlink
      * spelling in the environment would let a later retarget move storage
      * while the process still advertises the old canonical root. */
     if (cbm_setenv("CBM_CACHE_DIR", canonical_cache, 1) != 0) {
-        return false;
+        return MAIN_BUILD_IDENTITY_CACHE_ENVIRONMENT;
     }
     cbm_sha256_hex(canonical_cache, strlen(canonical_cache), cache_fingerprint);
     *identity = (cbm_daemon_build_identity_t){
@@ -1070,7 +1103,7 @@ static bool main_build_identity(cbm_daemon_build_identity_t *identity) {
         .store_abi = 1,
         .feature_abi = 1,
     };
-    return true;
+    return MAIN_BUILD_IDENTITY_OK;
 }
 
 static uint64_t main_deadline_after(uint32_t timeout_ms) {
@@ -1378,14 +1411,27 @@ int main(int argc, char **argv) {
         cbm_daemon_maintenance_monitor_t *maintenance_monitor = NULL;
         cbm_daemon_conflict_t cohort_conflict;
         cbm_version_cohort_status_t cohort_status = CBM_VERSION_COHORT_IO;
+        main_build_identity_status_t local_identity_status = MAIN_BUILD_IDENTITY_OK;
         int result = CBM_NOT_FOUND;
         int exit_code = EXIT_FAILURE;
         bool cleanup_ok = true;
-        if (!local_endpoint || !project_locks || !cohort_manager ||
-            !main_resolve_executable(argv[0], local_executable) ||
-            !main_build_identity(&local_identity)) {
-            (void)fprintf(stderr,
-                          "codebase-memory-mcp: secure CLI coordination could not be created\n");
+        const char *coordination_failure = NULL;
+        if (!local_endpoint) {
+            coordination_failure = "endpoint";
+        } else if (!project_locks) {
+            coordination_failure = "project-locks";
+        } else if (!cohort_manager) {
+            coordination_failure = "version-cohort";
+        } else if (!main_resolve_executable(argv[0], local_executable)) {
+            coordination_failure = "executable-path";
+        } else if ((local_identity_status = main_build_identity(&local_identity)) !=
+                   MAIN_BUILD_IDENTITY_OK) {
+            coordination_failure = main_build_identity_status_name(local_identity_status);
+        }
+        if (coordination_failure) {
+            (void)fprintf(
+                stderr, "codebase-memory-mcp: secure CLI coordination could not be created (%s)\n",
+                coordination_failure);
             goto local_cli_cleanup;
         }
         cbm_http_server_set_binary_path(local_executable);
@@ -1484,9 +1530,18 @@ int main(int argc, char **argv) {
 
     char executable_path[MAIN_PATH_CAP];
     cbm_daemon_build_identity_t identity;
-    if (!main_resolve_executable(argv[0], executable_path) || !main_build_identity(&identity)) {
+    if (!main_resolve_executable(argv[0], executable_path)) {
         (void)fprintf(stderr,
-                      "codebase-memory-mcp: exact executable identity could not be verified\n");
+                      "codebase-memory-mcp: exact executable identity could not be verified "
+                      "(executable-path)\n");
+        return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    main_build_identity_status_t identity_status = main_build_identity(&identity);
+    if (identity_status != MAIN_BUILD_IDENTITY_OK) {
+        (void)fprintf(stderr,
+                      "codebase-memory-mcp: exact executable identity could not be verified "
+                      "(%s)\n",
+                      main_build_identity_status_name(identity_status));
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     cbm_http_server_set_binary_path(executable_path);

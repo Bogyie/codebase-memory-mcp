@@ -508,6 +508,7 @@ require(
             'PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"',
             'SMOKE_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-release-smoke.XXXXXX")"',
             'cp codebase-memory-mcp.exe codebase-memory-mcp.payload.exe "$SMOKE_DIR/"',
+            'CBM_CACHE_DIR="$(cygpath -m "$SMOKE_DIR/cache")" '
             'SMOKE_TEMP_ROOT="$SMOKE_DIR" '
             'scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"',
         )
@@ -655,6 +656,7 @@ if pr_windows_blocks:
         '"$SMOKE_DIR/codebase-memory-mcp.exe"',
         'cp build/c/codebase-memory-mcp.exe '
         '"$SMOKE_DIR/codebase-memory-mcp.payload.exe"',
+        'CBM_CACHE_DIR="$(cygpath -m "$SMOKE_DIR/cache")" '
         'SMOKE_TEMP_ROOT="$SMOKE_DIR" '
         'scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"',
     )

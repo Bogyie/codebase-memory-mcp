@@ -65,6 +65,7 @@ static cbm_private_lock_directory_t *lock_registry_test_directory_open(const cha
 }
 #endif
 
+#ifndef _WIN32
 static bool lock_registry_fixture_start(lock_registry_fixture_t *fixture) {
     memset(fixture, 0, sizeof(*fixture));
 #ifdef _WIN32
@@ -109,6 +110,7 @@ static void lock_registry_fixture_finish(lock_registry_fixture_t *fixture) {
 #endif
     memset(fixture, 0, sizeof(*fixture));
 }
+#endif
 
 typedef struct {
     cbm_lock_registry_t *registry;
@@ -120,6 +122,7 @@ typedef struct {
     cbm_lock_lease_t *lease;
 } lock_registry_waiter_t;
 
+#ifndef _WIN32
 static void *lock_registry_waiter_run(void *opaque) {
     lock_registry_waiter_t *waiter = opaque;
     waiter->status = cbm_lock_registry_acquire(waiter->registry, waiter->resource_key, waiter->mode,
@@ -142,6 +145,7 @@ static void lock_registry_cancel_at_native_ready(void *opaque, cbm_private_file_
         atomic_store_explicit(&fault->cancel_token, true, memory_order_release);
     }
 }
+#endif
 
 TEST(lock_registry_cancelled_wait_rolls_back_and_does_not_barge) {
 #ifdef _WIN32
@@ -1023,6 +1027,7 @@ typedef struct {
     cbm_lock_lease_t *lease;
 } lock_registry_deadline_waiter_t;
 
+#ifndef _WIN32
 static void *lock_registry_deadline_waiter_run(void *opaque) {
     lock_registry_deadline_waiter_t *waiter = opaque;
     atomic_store_explicit(&waiter->ready, true, memory_order_release);
@@ -1036,6 +1041,7 @@ static void *lock_registry_deadline_waiter_run(void *opaque) {
     atomic_store_explicit(&waiter->finished, true, memory_order_release);
     return NULL;
 }
+#endif
 
 TEST(lock_registry_absolute_deadline_survives_repeated_wakes) {
 #ifdef _WIN32
@@ -1169,6 +1175,7 @@ typedef struct {
     atomic_int *violations;
 } lock_registry_stress_worker_t;
 
+#ifndef _WIN32
 static void *lock_registry_stress_run(void *opaque) {
     lock_registry_stress_worker_t *worker = opaque;
     (void)atomic_fetch_add_explicit(worker->ready, 1, memory_order_acq_rel);
@@ -1215,6 +1222,7 @@ static void *lock_registry_stress_run(void *opaque) {
     }
     return NULL;
 }
+#endif
 
 TEST(lock_registry_concurrent_shared_exclusive_stress) {
 #ifdef _WIN32

@@ -124,7 +124,8 @@ jobs:
             "$SMOKE_DIR/codebase-memory-mcp.exe"
           cp build/c/codebase-memory-mcp.exe \
             "$SMOKE_DIR/codebase-memory-mcp.payload.exe"
-          SMOKE_TEMP_ROOT="$SMOKE_DIR" \
+          CBM_CACHE_DIR="$(cygpath -m "$SMOKE_DIR/cache")" \
+            SMOKE_TEMP_ROOT="$SMOKE_DIR" \
             scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"
 
   ci-ok:
