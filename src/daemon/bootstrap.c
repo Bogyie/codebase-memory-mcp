@@ -30,6 +30,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #ifdef __APPLE__
+#include <pthread.h>
 #include <spawn.h>
 extern char **environ;
 #endif
@@ -519,6 +520,9 @@ typedef struct bootstrap_production_cohort {
 
 typedef struct {
     bootstrap_production_cohort_t *cohort;
+#ifdef __APPLE__
+    int spawn_error;
+#endif
 } bootstrap_production_context_t;
 
 static cbm_daemon_bootstrap_probe_status_t bootstrap_production_probe(
@@ -737,7 +741,7 @@ static bool bootstrap_darwin_spawn_state_init(posix_spawn_file_actions_t *action
     }
     sigset_t empty;
     (void)sigemptyset(&empty);
-    short flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_CLOEXEC_DEFAULT;
+    short flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT;
     if (posix_spawnattr_setsigmask(attributes, &empty) != 0 ||
         posix_spawnattr_setflags(attributes, flags) != 0) {
         (void)posix_spawnattr_destroy(attributes);
@@ -747,19 +751,50 @@ static bool bootstrap_darwin_spawn_state_init(posix_spawn_file_actions_t *action
     return true;
 }
 
-static void bootstrap_daemon_grandchild(const cbm_daemon_bootstrap_launch_spec_t *spec,
-                                        const posix_spawn_file_actions_t *actions,
-                                        const posix_spawnattr_t *attributes) {
-    (void)umask(077);
-    pid_t daemon = 0;
-    int status = posix_spawn(&daemon, spec->executable_path, actions, attributes,
-                             (char *const *)spec->argv, environ);
-    _exit(status == 0 ? 0 : 127);
+typedef struct {
+    pid_t pid;
+} bootstrap_darwin_reaper_t;
+
+static void *bootstrap_darwin_reap(void *opaque) {
+    bootstrap_darwin_reaper_t *reaper = opaque;
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(reaper->pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    free(reaper);
+    return NULL;
+}
+
+static bool bootstrap_darwin_reaper_start(pid_t daemon) {
+    bootstrap_darwin_reaper_t *reaper = malloc(sizeof(*reaper));
+    if (!reaper) {
+        return false;
+    }
+    reaper->pid = daemon;
+    pthread_attr_t attributes;
+    bool attributes_ready = pthread_attr_init(&attributes) == 0;
+    bool detached =
+        attributes_ready && pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED) == 0;
+    pthread_t thread;
+    int thread_status =
+        detached ? pthread_create(&thread, &attributes, bootstrap_darwin_reap, reaper) : -1;
+    if (attributes_ready) {
+        (void)pthread_attr_destroy(&attributes);
+    }
+    if (thread_status != 0) {
+        free(reaper);
+        return false;
+    }
+    return true;
 }
 
 static bool bootstrap_production_spawn(void *context,
                                        const cbm_daemon_bootstrap_launch_spec_t *spec) {
-    (void)context;
+    bootstrap_production_context_t *production = context;
+    if (production) {
+        production->spawn_error = 0;
+    }
     if (!spec || !spec->detached || spec->inherit_standard_handles || spec->use_shell) {
         return false;
     }
@@ -768,38 +803,33 @@ static bool bootstrap_production_spawn(void *context,
     if (!bootstrap_darwin_spawn_state_init(&actions, &attributes)) {
         return false;
     }
-    pid_t first = fork();
-    if (first < 0) {
-        (void)posix_spawnattr_destroy(&attributes);
-        (void)posix_spawn_file_actions_destroy(&actions);
-        return false;
-    }
-    if (first == 0) {
-        if (setsid() < 0) {
-            _exit(127);
-        }
-        pid_t grandchild = fork();
-        if (grandchild < 0) {
-            _exit(127);
-        }
-        if (grandchild > 0) {
-            _exit(0);
-        }
-        /* Darwin commonly reports OPEN_MAX near one million. Iterating every
-         * possible descriptor after fork can consume the entire cold-start
-         * budget. CLOEXEC_DEFAULT closes the actual inherited set in the
-         * kernel while the double fork still provides daemon detachment. */
-        bootstrap_daemon_grandchild(spec, &actions, &attributes);
-    }
-
-    int status = 0;
-    pid_t waited;
-    do {
-        waited = waitpid(first, &status, 0);
-    } while (waited < 0 && errno == EINTR);
+    /* Calling library-heavy process creation between fork() and exec is not a
+     * safe boundary once another thread may own libc state. Darwin's spawn
+     * primitive can create the detached session and close inherited FDs in
+     * one operation, so launch it from the original process and retain only a
+     * tiny detached waiter to prevent a crashed daemon from becoming a
+     * long-lived zombie owned by the first frontend. */
+    pid_t daemon = 0;
+    int spawn_status = posix_spawn(&daemon, spec->executable_path, &actions, &attributes,
+                                   (char *const *)spec->argv, environ);
     (void)posix_spawnattr_destroy(&attributes);
     (void)posix_spawn_file_actions_destroy(&actions);
-    return waited == first && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (production) {
+        production->spawn_error = spawn_status;
+    }
+    if (spawn_status != 0) {
+        return false;
+    }
+    if (!bootstrap_darwin_reaper_start(daemon)) {
+        (void)kill(daemon, SIGKILL);
+        int status = 0;
+        while (waitpid(daemon, &status, 0) < 0 && errno == EINTR) {}
+        if (production) {
+            production->spawn_error = EAGAIN;
+        }
+        return false;
+    }
+    return true;
 }
 #else
 static void bootstrap_child_close_fds(void) {
@@ -864,7 +894,18 @@ static bool bootstrap_production_spawn(void *context,
 #endif
 
 static void bootstrap_production_diagnostic(void *context, const char *message) {
-    (void)context;
+    bootstrap_production_context_t *production = context;
+#ifdef __APPLE__
+    if (production && production->spawn_error != 0) {
+        (void)fprintf(stderr, "codebase-memory-mcp: %s (daemon launch: %s)\n",
+                      message ? message : "daemon startup failed",
+                      strerror(production->spawn_error));
+        (void)fflush(stderr);
+        return;
+    }
+#else
+    (void)production;
+#endif
     (void)fprintf(stderr, "codebase-memory-mcp: %s\n", message ? message : "daemon startup failed");
     (void)fflush(stderr);
 }

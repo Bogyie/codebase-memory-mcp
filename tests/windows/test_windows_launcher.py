@@ -335,6 +335,13 @@ def assert_untrusted_ancestor_acl_rejected(
         run([launcher, "--version"], env).returncode == 0,
         "portable launcher ACL control failed before the unsafe ACE was added",
     )
+    extended_launcher = "\\\\?\\" + str(launcher.resolve())
+    extended_result = run([extended_launcher, "--version"], env)
+    require(
+        extended_result.returncode == 0,
+        "launcher rejected its documented extended DOS module path: %s"
+        % output_text(extended_result)[-600:],
+    )
 
     grant = run(
         ["icacls", unsafe_ancestor, "/grant", "*S-1-1-0:(M)"], env
@@ -345,19 +352,31 @@ def assert_untrusted_ancestor_acl_rejected(
         % output_text(grant)[-600:],
     )
     try:
-        result = run([launcher, "--version"], env)
-        diagnostic = output_text(result).lower()
-        require(
-            result.returncode != 0,
-            "launcher accepted an ancestor granting cross-account modify access",
-        )
-        require(
-            any(
-                word in diagnostic
-                for word in ("unsafe", "security", "ownership", "access", "resolve")
-            ),
-            "unsafe ancestor ACL refusal was not explicit",
-        )
+        for candidate, spelling in (
+            (launcher, "normal"),
+            (extended_launcher, "extended DOS"),
+        ):
+            result = run([candidate, "--version"], env)
+            diagnostic = output_text(result).lower()
+            require(
+                result.returncode != 0,
+                "%s launcher path accepted an ancestor granting cross-account modify access"
+                % spelling,
+            )
+            require(
+                any(
+                    word in diagnostic
+                    for word in (
+                        "unsafe",
+                        "security",
+                        "ownership",
+                        "access",
+                        "resolve",
+                    )
+                ),
+                "%s launcher path unsafe-ancestor refusal was not explicit"
+                % spelling,
+            )
     finally:
         remove = run(
             ["icacls", unsafe_ancestor, "/remove:g", "*S-1-1-0"], env
@@ -366,10 +385,15 @@ def assert_untrusted_ancestor_acl_rejected(
             remove.returncode == 0,
             "could not remove native Everyone-modify ancestor fixture",
         )
-    require(
-        run([launcher, "--version"], env).returncode == 0,
-        "launcher did not recover after unsafe ancestor ACE removal",
-    )
+    for candidate, spelling in (
+        (launcher, "normal"),
+        (extended_launcher, "extended DOS"),
+    ):
+        require(
+            run([candidate, "--version"], env).returncode == 0,
+            "%s launcher path did not recover after unsafe ancestor ACE removal"
+            % spelling,
+        )
     print("PASS: launcher rejected an untrusted mutation ACE on an ancestor")
 
 

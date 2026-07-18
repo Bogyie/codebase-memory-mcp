@@ -650,6 +650,35 @@ TEST(daemon_bootstrap_concurrent_first_clients_spawn_one_daemon) {
     PASS();
 }
 
+#ifdef __APPLE__
+/* RED: the old double-fork returned success before its grandchild attempted
+ * posix_spawn, hiding an immediate launch error behind the full timeout. */
+TEST(daemon_bootstrap_darwin_launch_failure_is_synchronous) {
+    bootstrap_endpoint_fixture_t fixture;
+    ASSERT_TRUE(bootstrap_endpoint_fixture_start(&fixture, "darwin-missing"));
+    cbm_daemon_build_identity_t identity = bootstrap_identity("2.4.0", BOOTSTRAP_BUILD_A);
+    char missing[BOOTSTRAP_TEST_PATH_CAP];
+    int written = snprintf(missing, sizeof(missing), "%s/definitely-missing-cbm", fixture.parent);
+    ASSERT(written > 0 && written < (int)sizeof(missing));
+    cbm_daemon_bootstrap_config_t config = {
+        .role = CBM_DAEMON_PROCESS_MCP_CLIENT,
+        .endpoint = fixture.endpoint,
+        .identity = &identity,
+        .executable_path = missing,
+        .connect_timeout_ms = 1,
+        .startup_timeout_ms = BOOTSTRAP_TEST_TIMEOUT_MS,
+    };
+    cbm_daemon_bootstrap_result_t result;
+    uint64_t started = cbm_now_ms();
+    ASSERT_EQ(cbm_daemon_bootstrap_execute(&config, &result), CBM_DAEMON_BOOTSTRAP_FAILED);
+    uint64_t elapsed = cbm_now_ms() - started;
+    ASSERT_FALSE(result.daemon_spawned);
+    ASSERT(elapsed < BOOTSTRAP_TEST_TIMEOUT_MS / 2U);
+    bootstrap_endpoint_fixture_finish(&fixture);
+    PASS();
+}
+#endif
+
 SUITE(daemon_bootstrap) {
     RUN_TEST(daemon_bootstrap_classifies_default_and_ui_as_mcp_clients);
     RUN_TEST(daemon_bootstrap_classifies_stateless_commands_without_client);
@@ -670,4 +699,7 @@ SUITE(daemon_bootstrap) {
     RUN_TEST(daemon_bootstrap_reserved_then_absent_spawns_replacement);
     RUN_TEST(daemon_bootstrap_rejected_connect_is_reserved_and_never_unavailable);
     RUN_TEST(daemon_bootstrap_concurrent_first_clients_spawn_one_daemon);
+#ifdef __APPLE__
+    RUN_TEST(daemon_bootstrap_darwin_launch_failure_is_synchronous);
+#endif
 }

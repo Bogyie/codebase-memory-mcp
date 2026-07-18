@@ -74,6 +74,7 @@ enum {
 #include <stdatomic.h>
 #ifndef _WIN32
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -1315,6 +1316,11 @@ int main(int argc, char **argv) {
         (void)fprintf(stderr, "codebase-memory-mcp: invalid internal process arguments\n");
         return EXIT_FAILURE;
     }
+#ifndef _WIN32
+    if (role == CBM_DAEMON_PROCESS_DAEMON) {
+        (void)umask(077);
+    }
+#endif
 
     cbm_cli_set_version(CBM_VERSION);
     cbm_profile_init();

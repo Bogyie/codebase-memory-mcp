@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -27,6 +29,23 @@ INITIALIZE_PARAMS = {
 
 class SmokeFailure(RuntimeError):
     pass
+
+
+def mcp_command(binary: str) -> list[str]:
+    """Select a direct product launch or an explicit Windows shebang runner."""
+    if os.name != "nt":
+        return [binary]
+    try:
+        with open(binary, "rb") as stream:
+            shebang = stream.read(2) == b"#!"
+    except OSError:
+        return [binary]
+    if not shebang:
+        return [binary]
+    bash = shutil.which("bash")
+    if not bash:
+        raise SmokeFailure("Windows shebang MCP fixture requires bash on PATH")
+    return [bash, binary]
 
 
 def read_json_lines(
@@ -275,13 +294,18 @@ def main() -> int:
     parser.add_argument("--exit-timeout", type=float, default=15.0)
     args = parser.parse_args()
 
-    process = subprocess.Popen(
-        [args.binary],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=0,
-    )
+    try:
+        command = mcp_command(args.binary)
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+    except (OSError, SmokeFailure) as error:
+        print(f"FAIL: could not start MCP server: {error}", file=sys.stderr)
+        return 1
     assert process.stdout is not None
     assert process.stderr is not None
     responses: "queue.Queue[dict[str, Any]]" = queue.Queue()

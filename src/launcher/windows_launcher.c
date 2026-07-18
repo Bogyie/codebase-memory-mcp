@@ -279,8 +279,18 @@ static HANDLE launcher_open_directory_private(const wchar_t *path) {
 
 static bool launcher_path_tree_plain(const wchar_t *file_path) {
     size_t length = wcslen(file_path);
-    if (length < 4U || length >= CBM_WINDOWS_LAUNCHER_PATH_CAP || file_path[1] != L':' ||
-        (file_path[2] != L'\\' && file_path[2] != L'/')) {
+    size_t root_length = 0U;
+    if (length >= 4U && file_path[1] == L':' && (file_path[2] == L'\\' || file_path[2] == L'/')) {
+        root_length = 3U;
+    } else if (length >= 8U && file_path[0] == L'\\' && file_path[1] == L'\\' &&
+               file_path[2] == L'?' && file_path[3] == L'\\' && file_path[5] == L':' &&
+               (file_path[6] == L'\\' || file_path[6] == L'/')) {
+        /* GetModuleFileNameW preserves the path format used to launch the
+         * process.  Keep an extended DOS path extended while walking it so
+         * every ACL/reparse check names the exact object that was executed. */
+        root_length = 7U;
+    }
+    if (root_length == 0U || length <= root_length || length >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
         return false;
     }
     wchar_t *path = malloc((length + 1U) * sizeof(*path));
@@ -292,14 +302,14 @@ static bool launcher_path_tree_plain(const wchar_t *file_path) {
             path[index] = L'\\';
     }
     wchar_t *last = wcsrchr(path, L'\\');
-    if (!last || last <= path + 2) {
+    if (!last || last < path + root_length) {
         free(path);
         return false;
     }
     *last = L'\0';
     size_t directory_length = wcslen(path);
     bool valid = true;
-    for (size_t index = 3U; valid && index <= directory_length; index++) {
+    for (size_t index = root_length; valid && index <= directory_length; index++) {
         if (index < directory_length && path[index] != L'\\')
             continue;
         wchar_t saved = path[index];

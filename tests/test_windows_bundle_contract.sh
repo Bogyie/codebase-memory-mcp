@@ -327,12 +327,42 @@ require(
     "test_cli_activation_helper.py" not in windows_test_driver,
     "scripts/test-windows.ps1 must not run the legacy transient activation-helper test",
 )
+require(
+    all(
+        needle in windows_test_driver
+        for needle in (
+            'Copy-Item -LiteralPath $launcherBin -Destination $guardBin',
+            'Copy-Item -LiteralPath $bin -Destination $guardPayload',
+            '& $py $t $guardBin',
+            '& $py $t $guardBin $guardPayload $abiMismatchLauncher',
+        )
+    ),
+    "ordinary native Windows guards must execute a staged launcher/payload release pair",
+)
+require(
+    windows_test_driver.count("| Out-Host") >= 3
+    and windows_test_driver.count("$buildExit = $LASTEXITCODE") >= 3,
+    "Windows build helpers must not leak compiler output into returned artifact paths",
+)
+require(
+    '$code -eq 1 -or $t -eq "tests\\windows\\test_windows_launcher.py"'
+    in windows_test_driver,
+    "the permanent-launcher guard must fail instead of skip on driver/precondition errors",
+)
 
 # Launcher supervision has two distinct failure directions: killing the
 # launcher must kill its payload job, and killing only the launcher's immediate
 # parent must terminate the launcher plus every descendant. Require the native
 # test to invoke both probes, not merely define helpers that never run.
 windows_launcher_test = read("tests/windows/test_windows_launcher.py")
+unsafe_acl_test = windows_launcher_test[
+    windows_launcher_test.find("def assert_untrusted_ancestor_acl_rejected(") :
+    windows_launcher_test.find("\ndef process_entries()")
+]
+require(
+    unsafe_acl_test.count('(extended_launcher, "extended DOS")') >= 2,
+    "native Windows coverage must reject unsafe ancestor ACLs through extended DOS paths",
+)
 require(
     windows_launcher_test.count("assert_launcher_death_contains_payload(") >= 2
     and "server.proc.kill()" in windows_launcher_test

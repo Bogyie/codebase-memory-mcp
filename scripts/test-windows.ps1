@@ -3,10 +3,10 @@
     Run the native-Windows product-surface test suite for codebase-memory-mcp.
 
 .DESCRIPTION
-    Builds the product binary (build/c/codebase-memory-mcp.exe) if it is not
-    already present, then runs the deterministic Windows integration tests under
-    tests/windows/ against a real codebase-memory-mcp.exe (real stdio / CLI /
-    HTTP UI, real SQLite DB).
+    Builds the payload and permanent launcher if they are not already present,
+    stages them under their release names, then runs the deterministic Windows
+    integration tests under tests/windows/ through the launcher (real stdio /
+    CLI / HTTP UI, real SQLite DB).
 
     Two categories of test:
 
@@ -95,8 +95,9 @@ function Resolve-Binary {
     $built = Join-Path $repoRoot "build\c\codebase-memory-mcp.exe"
     if (Test-Path $built) { return $built }
     Write-Host "Building $Target via Makefile.cbm ..." -ForegroundColor Cyan
-    & $Make "-j" "-f" "Makefile.cbm" $Target "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp"
-    if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
+    & $Make "-j" "-f" "Makefile.cbm" $Target "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp" | Out-Host
+    $buildExit = $LASTEXITCODE
+    if ($buildExit -ne 0) { throw "build failed (exit $buildExit)" }
     if (-not (Test-Path $built)) { throw "binary not produced at $built" }
     return $built
 }
@@ -107,8 +108,9 @@ function Resolve-Launcher {
     $built = Join-Path $repoRoot "build\c\codebase-memory-mcp-launcher.exe"
     if (Test-Path $built) { return $built }
     Write-Host "Building permanent launcher via Makefile.cbm ..." -ForegroundColor Cyan
-    & $Make "-j" "-f" "Makefile.cbm" "cbm-launcher" "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp"
-    if ($LASTEXITCODE -ne 0) { throw "launcher build failed (exit $LASTEXITCODE)" }
+    & $Make "-j" "-f" "Makefile.cbm" "cbm-launcher" "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp" | Out-Host
+    $buildExit = $LASTEXITCODE
+    if ($buildExit -ne 0) { throw "launcher build failed (exit $buildExit)" }
     if (-not (Test-Path $built)) { throw "launcher not produced at $built" }
     return $built
 }
@@ -117,8 +119,9 @@ function Resolve-AbiMismatchLauncher {
     $built = Join-Path $repoRoot "build\c\codebase-memory-mcp-launcher-abi2.exe"
     if (Test-Path $built) { return $built }
     Write-Host "Building launcher ABI mismatch fixture via Makefile.cbm ..." -ForegroundColor Cyan
-    & $Make "-j" "-f" "Makefile.cbm" "build/c/codebase-memory-mcp-launcher-abi2.exe" "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp"
-    if ($LASTEXITCODE -ne 0) { throw "launcher ABI fixture build failed (exit $LASTEXITCODE)" }
+    & $Make "-j" "-f" "Makefile.cbm" "build/c/codebase-memory-mcp-launcher-abi2.exe" "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp" | Out-Host
+    $buildExit = $LASTEXITCODE
+    if ($buildExit -ne 0) { throw "launcher ABI fixture build failed (exit $buildExit)" }
     if (-not (Test-Path $built)) { throw "launcher ABI fixture not produced at $built" }
     return $built
 }
@@ -130,8 +133,17 @@ Write-Host "Payload: $bin" -ForegroundColor Green
 Write-Host "Launcher: $launcherBin" -ForegroundColor Green
 Write-Host "ABI mismatch fixture: $abiMismatchLauncher" -ForegroundColor Green
 
-$env:PYTHONUTF8 = "1"           # encode argv/stdio as UTF-8
-$env:CBM_INDEX_SUPERVISOR = "0" # in-process indexing (see .DESCRIPTION)
+$guardBundle = Join-Path $tmp ("cbm-windows-guards-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $guardBundle | Out-Null
+$guardBin = Join-Path $guardBundle "codebase-memory-mcp.exe"
+$guardPayload = Join-Path $guardBundle "codebase-memory-mcp.payload.exe"
+Copy-Item -LiteralPath $launcherBin -Destination $guardBin
+Copy-Item -LiteralPath $bin -Destination $guardPayload
+Write-Host "Guard bundle: $guardBin" -ForegroundColor Green
+
+try {
+    $env:PYTHONUTF8 = "1"           # encode argv/stdio as UTF-8
+    $env:CBM_INDEX_SUPERVISOR = "0" # in-process indexing (see .DESCRIPTION)
 
 # Green regression guards - must stay GREEN (exit 0). RED (exit 1) = the fix for
 # the referenced issue regressed. The drive-picker guard needs the embedded HTTP
@@ -158,14 +170,14 @@ Write-Host "`n--- Green guards ---" -ForegroundColor Cyan
 foreach ($t in $guards) {
     Write-Host "`n=== $t ===" -ForegroundColor Cyan
     if ($t -eq "tests\windows\test_windows_launcher.py") {
-        & $py $t $launcherBin $bin $abiMismatchLauncher
+        & $py $t $guardBin $guardPayload $abiMismatchLauncher
     } else {
-        & $py $t $bin
+        & $py $t $guardBin
     }
     $code = $LASTEXITCODE
     if ($code -eq 0) {
         Write-Host "GREEN ($t)" -ForegroundColor Green
-    } elseif ($code -eq 1) {
+    } elseif ($code -eq 1 -or $t -eq "tests\windows\test_windows_launcher.py") {
         Write-Host "RED ($t) - REGRESSION: a fixed Windows bug is broken again" -ForegroundColor Red
         $guardFailures += $t
     } else {
@@ -178,7 +190,7 @@ if (-not $GuardsOnly) {
     Write-Host "`n--- Known reds (opt-in, expected red) ---" -ForegroundColor Cyan
     foreach ($t in $knownReds) {
         Write-Host "`n=== $t ===" -ForegroundColor Cyan
-        & $py $t $bin
+        & $py $t $guardBin
         $code = $LASTEXITCODE
         if ($code -eq 1) {
             Write-Host "RED ($t) - expected; the underlying Windows bug is still open" -ForegroundColor DarkYellow
@@ -189,6 +201,9 @@ if (-not $GuardsOnly) {
             Write-Host "PRECONDITION ($t) exit=$code - skipped (see message above)" -ForegroundColor Yellow
         }
     }
+}
+} finally {
+    Remove-Item -LiteralPath $guardBundle -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host ""
