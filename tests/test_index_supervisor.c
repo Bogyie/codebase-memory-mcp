@@ -19,7 +19,16 @@
 
 enum {
     INDEX_SUPERVISOR_TEST_PATH_CAP = 1024,
-    INDEX_SUPERVISOR_TEST_TERMINAL_MS = 5000,
+    /* Worker startup re-hashes the entire executable image for the
+     * exact-build fingerprint before its first write. For the ASan
+     * test-runner that is a multi-hundred-MB read+SHA-256, which on the
+     * 3-core CI runner VMs with cold IO takes several seconds — the CI
+     * macOS legs showed workers alive with created-but-EMPTY logs at the
+     * old 5 s/3 s deadlines. These are hang guards, not benchmarks: a
+     * genuinely wedged worker still fails loudly here, and the failure
+     * dumps the (empty) worker log as proof.  */
+    INDEX_SUPERVISOR_TEST_TERMINAL_MS = 20000,
+    INDEX_SUPERVISOR_TEST_READY_MS = 15000,
     INDEX_SUPERVISOR_TEST_BACKLOG_LINES = 1024,
 };
 
@@ -47,7 +56,7 @@ static bool index_supervisor_test_poll_terminal(cbm_index_worker_handle_t *handl
 
 static bool index_supervisor_test_wait_file(cbm_index_worker_handle_t *handle, const char *path,
                                             char *out, size_t out_size) {
-    uint64_t deadline = cbm_now_ms() + 3000;
+    uint64_t deadline = cbm_now_ms() + INDEX_SUPERVISOR_TEST_READY_MS;
     do {
         FILE *file = cbm_fopen(path, "rb");
         if (file) {
@@ -421,8 +430,10 @@ TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached) {
                             strcmp(getenv("CBM_INDEX_QUARANTINE_FILE"), "parent-quarantine") == 0;
 
     bool worker_logs_ready =
-        index_supervisor_test_wait_file_text(log_a, "async worker hang-tree probe", 3000) &&
-        index_supervisor_test_wait_file_text(log_b, "async worker hang-tree probe", 3000);
+        index_supervisor_test_wait_file_text(log_a, "async worker hang-tree probe",
+                                             INDEX_SUPERVISOR_TEST_READY_MS) &&
+        index_supervisor_test_wait_file_text(log_b, "async worker hang-tree probe",
+                                             INDEX_SUPERVISOR_TEST_READY_MS);
     bool callback_lines_injected = worker_logs_ready &&
                                    index_supervisor_test_append_log(log_a, "request-a-only\n") &&
                                    index_supervisor_test_append_log(log_b, "request-b-only\n");
@@ -652,8 +663,9 @@ TEST(index_supervisor_drains_terminal_backlog_into_request_progress_callback) {
     if (handle) {
         (void)snprintf(log_path, sizeof(log_path), "%s", cbm_index_worker_log_path(handle));
     }
-    bool worker_logged = log_path[0] && index_supervisor_test_wait_file_text(
-                                            log_path, "async worker clean probe", 3000);
+    bool worker_logged =
+        log_path[0] && index_supervisor_test_wait_file_text(log_path, "async worker clean probe",
+                                                            INDEX_SUPERVISOR_TEST_READY_MS);
     if (worker_logged) {
         /* Seeing the flushed probe places the child immediately before _Exit.
          * Give it time to become waitable without polling: the regression is a
