@@ -3364,6 +3364,14 @@ struct cbm_daemon_ipc_connection {
     HANDLE handle;
     atomic_bool poisoned;
     cbm_daemon_ipc_pipe_role_t role;
+    /* First frame header, read by the accept path BEFORE impersonating the
+     * client: ImpersonateNamedPipeClient needs a COMPLETED read on the pipe,
+     * not merely buffered data (PeekNamedPipe is insufficient). connection_
+     * read_full drains these bytes before touching the pipe again, so the
+     * runtime's frame parser still sees an intact HELLO. Server role only. */
+    unsigned char prime[CBM_DAEMON_FRAME_HEADER_SIZE];
+    size_t prime_len;
+    size_t prime_off;
 };
 
 struct cbm_daemon_ipc_startup_lock {
@@ -5135,26 +5143,6 @@ static int win_overlapped_wait(HANDLE handle, OVERLAPPED *overlapped, DWORD time
     return result;
 }
 
-/* Wait until the connected client has placed its first bytes in the pipe.
- * PeekNamedPipe inspects the buffer without consuming it, so the client's
- * HELLO frame stays intact for the runtime's own read; we only gate on its
- * PRESENCE, which is the precondition ImpersonateNamedPipeClient requires.
- * Returns false on a broken pipe or if the deadline passes with no data. */
-static bool win_pipe_wait_for_client_data(HANDLE pipe, uint64_t deadline_ms) {
-    for (;;) {
-        DWORD available = 0;
-        if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL)) {
-            return false;
-        }
-        if (available > 0) {
-            return true;
-        }
-        if (!win_retry_pause(deadline_ms)) {
-            return false;
-        }
-    }
-}
-
 static bool win_pipe_client_is_current_user(HANDLE pipe) {
     win_security_t security;
     if (!win_security_init(&security)) {
@@ -5210,6 +5198,10 @@ static bool win_pipe_client_is_current_user(HANDLE pipe) {
     return same_user;
 }
 
+/* Defined below; the accept path pre-reads the first frame header through it. */
+static int connection_read_full(cbm_daemon_ipc_connection_t *connection, void *buffer,
+                                size_t length, uint64_t deadline_ms);
+
 int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_ms,
                           cbm_daemon_ipc_connection_t **connection_out) {
     if (connection_out) {
@@ -5250,28 +5242,6 @@ int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_
         listener->pipe = INVALID_HANDLE_VALUE;
         return result;
     }
-    /* The client sends its HELLO immediately after connecting; wait for those
-     * bytes before impersonating, or ImpersonateNamedPipeClient fails with
-     * ERROR_CANNOT_IMPERSONATE (1368) and every client is refused. */
-    if (!win_pipe_wait_for_client_data(listener->pipe,
-                                       ipc_deadline_after(CBM_DAEMON_IPC_FIRST_FRAME_TIMEOUT_MS))) {
-        cbm_log_warn("daemon.accept.client_rejected", "stage", "first_frame");
-        (void)DisconnectNamedPipe(listener->pipe);
-        (void)CloseHandle(listener->pipe);
-        listener->pipe = INVALID_HANDLE_VALUE;
-        return -1;
-    }
-    if (!win_pipe_client_is_current_user(listener->pipe)) {
-        /* The daemon-side twin of the client's server_identity log: without
-         * it a server-initiated disconnect is indistinguishable from a
-         * client-side failure in the field. */
-        cbm_log_warn("daemon.accept.client_rejected", "stage", "client_identity");
-        (void)DisconnectNamedPipe(listener->pipe);
-        (void)CloseHandle(listener->pipe);
-        listener->pipe = INVALID_HANDLE_VALUE;
-        return -1;
-    }
-
     cbm_daemon_ipc_connection_t *connection = malloc(sizeof(*connection));
     if (!connection) {
         (void)DisconnectNamedPipe(listener->pipe);
@@ -5282,6 +5252,35 @@ int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_
     connection->handle = listener->pipe;
     atomic_init(&connection->poisoned, false);
     connection->role = CBM_DAEMON_IPC_PIPE_ROLE_ACCEPTED_SERVER;
+    connection->prime_len = 0;
+    connection->prime_off = 0;
+    /* Read the client's first frame header before impersonating: the client
+     * sends its HELLO immediately after connecting, and a COMPLETED read is
+     * what ImpersonateNamedPipeClient requires (ERROR_CANNOT_IMPERSONATE
+     * otherwise - PeekNamedPipe availability alone is not enough). The header
+     * is retained in the connection prime buffer and drained by
+     * connection_read_full before the runtime's own read. */
+    if (connection_read_full(connection, connection->prime, CBM_DAEMON_FRAME_HEADER_SIZE,
+                             ipc_deadline_after(CBM_DAEMON_IPC_FIRST_FRAME_TIMEOUT_MS)) != 1) {
+        cbm_log_warn("daemon.accept.client_rejected", "stage", "first_frame");
+        free(connection);
+        (void)DisconnectNamedPipe(listener->pipe);
+        (void)CloseHandle(listener->pipe);
+        listener->pipe = INVALID_HANDLE_VALUE;
+        return -1;
+    }
+    connection->prime_len = CBM_DAEMON_FRAME_HEADER_SIZE;
+    if (!win_pipe_client_is_current_user(listener->pipe)) {
+        /* The daemon-side twin of the client's server_identity log: without
+         * it a server-initiated disconnect is indistinguishable from a
+         * client-side failure in the field. */
+        cbm_log_warn("daemon.accept.client_rejected", "stage", "client_identity");
+        free(connection);
+        (void)DisconnectNamedPipe(listener->pipe);
+        (void)CloseHandle(listener->pipe);
+        listener->pipe = INVALID_HANDLE_VALUE;
+        return -1;
+    }
     listener->pipe = INVALID_HANDLE_VALUE;
     *connection_out = connection;
     return 1;
@@ -5523,6 +5522,8 @@ cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoin
     connection->handle = pipe;
     atomic_init(&connection->poisoned, false);
     connection->role = CBM_DAEMON_IPC_PIPE_ROLE_CONNECTED_CLIENT;
+    connection->prime_len = 0;
+    connection->prime_off = 0;
     return connection;
 }
 
@@ -5610,6 +5611,15 @@ static int connection_read_full(cbm_daemon_ipc_connection_t *connection, void *b
         return -1;
     }
     size_t offset = 0;
+    /* Drain any bytes pre-read before impersonation (the first frame header)
+     * ahead of the pipe, so the runtime's frame parser sees an intact stream. */
+    if (connection->prime_off < connection->prime_len) {
+        size_t available = connection->prime_len - connection->prime_off;
+        size_t take = available < length ? available : length;
+        memcpy(buffer, connection->prime + connection->prime_off, take);
+        connection->prime_off += take;
+        offset = take;
+    }
     while (offset < length) {
         DWORD chunk = length - offset > MAXDWORD ? MAXDWORD : (DWORD)(length - offset);
         DWORD transferred = 0;
