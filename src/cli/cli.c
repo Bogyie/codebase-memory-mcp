@@ -9658,7 +9658,8 @@ static int cli_windows_managed_install_activate(void *opaque) {
     }
     int activation_status = CLI_OK;
     if (activation->dry_run) {
-        printf("Would install managed launcher -> %s\n\n", activation->bin_target);
+        printf("Would install managed launcher -> %s\n(dry-run — no files were modified)\n\n",
+               activation->bin_target);
     } else {
         bool generation_created = false;
         bool launcher_committed = false;
