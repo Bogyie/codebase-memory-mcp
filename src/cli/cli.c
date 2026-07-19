@@ -9556,11 +9556,38 @@ static const char *cli_windows_staging_root(char root_out[CLI_BUF_1K]) {
             return cbm_tmpdir();
         }
     }
+    /* msys/CI harnesses export profile variables in POSIX drive form
+     * ("/c/Users/..."); the CRT cannot resolve that, so rewrite it to the
+     * native "C:/Users/..." form before building the root. */
+    if (base[0] == '/' &&
+        ((base[1] >= 'a' && base[1] <= 'z') || (base[1] >= 'A' && base[1] <= 'Z')) &&
+        (base[2] == '/' || base[2] == '\0')) {
+        char drive = base[1];
+        char rest[CLI_BUF_1K];
+        (void)snprintf(rest, sizeof(rest), "%s", base + 2);
+        (void)snprintf(base, sizeof(base), "%c:%s", drive, rest[0] ? rest : "/");
+    }
     int written = snprintf(root_out, CLI_BUF_1K, "%s/codebase-memory-mcp", base);
     if (written <= 0 || written >= CLI_BUF_1K) {
         return cbm_tmpdir();
     }
+    /* Create the whole chain: harness environments point LOCALAPPDATA at a
+     * fake profile whose AppData\Local ancestors do not exist on disk yet,
+     * and a single-level mkdir silently leaves the root missing. */
+    for (int index = 3; root_out[index] != '\0'; index++) {
+        if (root_out[index] != '/' && root_out[index] != '\\') {
+            continue;
+        }
+        char saved = root_out[index];
+        root_out[index] = '\0';
+        (void)_mkdir(root_out);
+        root_out[index] = saved;
+    }
     (void)_mkdir(root_out);
+    DWORD attributes = GetFileAttributesA(root_out);
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        return cbm_tmpdir();
+    }
     return root_out;
 }
 
@@ -9577,6 +9604,10 @@ static bool cli_windows_prepare_install_pair(const wchar_t *launcher_source,
                                     cli_windows_staging_root(staging_root));
     bool ready = launcher_source_utf8 && payload_source_utf8 && directory_length > 0 &&
                  directory_length < CLI_BUF_1K && cbm_mkdtemp(directory_out);
+    if (!ready) {
+        (void)fprintf(stderr, "error: could not create the private staging directory (%s)\n",
+                      directory_out);
+    }
     char launcher_target[CLI_BUF_1K];
     char payload_target[CLI_BUF_1K];
     int launcher_length = ready ? snprintf(launcher_target, sizeof(launcher_target),
@@ -9679,6 +9710,10 @@ static bool cli_windows_prepare_update_pair(const cbm_windows_release_pair_t *pa
                                     cli_windows_staging_root(staging_root));
     bool ready =
         directory_length > 0 && directory_length < CLI_BUF_1K && cbm_mkdtemp(directory_out);
+    if (!ready) {
+        (void)fprintf(stderr, "error: could not create the private staging directory (%s)\n",
+                      directory_out);
+    }
     char launcher_target[CLI_BUF_1K];
     char payload_target[CLI_BUF_1K];
     int launcher_length = ready ? snprintf(launcher_target, sizeof(launcher_target),
