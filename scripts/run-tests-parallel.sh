@@ -52,10 +52,21 @@ case "$(uname -s 2>/dev/null)" in
 MINGW* | MSYS*)
     runner_dir_w="$(cygpath -w "$(dirname "$RUNNER")")"
     me="$(whoami | tr -d '\r')"
-    MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /inheritance:r \
+    stamp_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /inheritance:r \
         /grant:r "${me}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \
-        /Q >/dev/null 2>&1 || true
-    MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" /reset /T /C /Q >/dev/null 2>&1 || true
+        /Q 2>&1) || echo "WARN: build-dir DACL stamp failed (user=$me dir=$runner_dir_w): $stamp_out"
+    reset_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" /reset /T /C /Q 2>&1) ||
+        echo "WARN: build-dir child DACL reset failed: $(printf '%s' "$reset_out" | tail -2)"
+    # The stamp is load-bearing for the install-flow suites: verify it and say
+    # so, in either direction — a silent stamp once cost a full CI round to
+    # even see WHETHER it had run.
+    if MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" 2>/dev/null |
+        grep -qE 'Authenticated Users|CREATOR OWNER'; then
+        echo "WARN: build-dir DACL still grants cross-account mutation after stamp:"
+        MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" 2>&1 | head -8
+    else
+        echo "build-dir DACL stamped clean ($runner_dir_w, user=$me)"
+    fi
     ;;
 esac
 
